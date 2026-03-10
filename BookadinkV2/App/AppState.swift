@@ -2375,7 +2375,7 @@ final class AppState: ObservableObject {
         profileSaveErrorMessage = nil
         defer { isSavingProfile = false }
         do {
-            let updated = try await withAuthRetry { try await self.dataProvider.upsertProfile(current) }
+            let updated = try await withAuthRetry { try await self.dataProvider.patchProfile(current) }
             profile = updated
             if let rating = duprRating {
                 appendDUPREntry(rating: rating, context: "Manual update")
@@ -2393,7 +2393,7 @@ final class AppState: ObservableObject {
         profileSaveErrorMessage = nil
         defer { isSavingProfile = false }
         do {
-            let updated = try await withAuthRetry { try await self.dataProvider.upsertProfile(current) }
+            let updated = try await withAuthRetry { try await self.dataProvider.patchProfile(current) }
             profile = updated
         } catch {
             profileSaveErrorMessage = AppCopy.friendlyError(error.localizedDescription)

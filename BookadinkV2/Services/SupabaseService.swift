@@ -56,6 +56,7 @@ protocol ClubDataProviding {
     func markAllNotificationsRead(userID: UUID) async throws
     func updateProfilePushToken(userID: UUID, pushToken: String?) async throws
     func upsertProfile(_ profile: UserProfile) async throws -> UserProfile
+    func patchProfile(_ profile: UserProfile) async throws -> UserProfile
     func updatePassword(_ newPassword: String) async throws
 }
 
@@ -1685,6 +1686,54 @@ final class SupabaseService: ClubDataProviding {
             authBearerToken: authToken,
             extraHeaders: [
                 "Prefer": "resolution=merge-duplicates,return=representation",
+                "Content-Type": "application/json"
+            ]
+        )
+
+        guard let row = rows.first else { return profile }
+        return UserProfile(
+            id: row.id,
+            fullName: row.fullName ?? profile.fullName,
+            email: row.email,
+            phone: row.phone,
+            dateOfBirth: row.dateOfBirth.flatMap { Self.isoDateFormatter.date(from: $0) },
+            emergencyContactName: row.emergencyContactName,
+            emergencyContactPhone: row.emergencyContactPhone,
+            duprRating: row.duprRating,
+            favoriteClubName: profile.favoriteClubName,
+            skillLevel: profile.skillLevel
+        )
+    }
+
+    /// PATCH (UPDATE) an existing profile row. Requires only the UPDATE RLS policy.
+    /// Use this for editing existing profiles — avoids triggering INSERT RLS evaluation.
+    func patchProfile(_ profile: UserProfile) async throws -> UserProfile {
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        let payload = ProfileUpsertRow(
+            id: profile.id,
+            email: profile.email,
+            fullName: profile.fullName,
+            phone: profile.phone,
+            dateOfBirth: profile.dateOfBirth.map { Self.isoDateFormatter.string(from: $0) },
+            emergencyContactName: profile.emergencyContactName,
+            emergencyContactPhone: profile.emergencyContactPhone,
+            duprRating: profile.duprRating
+        )
+
+        let rows: [ProfileRow] = try await send(
+            path: "profiles",
+            queryItems: [
+                .init(name: "id", value: "eq.\(profile.id.uuidString)"),
+                .init(name: "select", value: "id,email,full_name,phone,date_of_birth,emergency_contact_name,emergency_contact_phone,dupr_rating")
+            ],
+            method: "PATCH",
+            body: try JSONEncoder().encode(payload),
+            authBearerToken: authToken,
+            extraHeaders: [
+                "Prefer": "return=representation",
                 "Content-Type": "application/json"
             ]
         )
