@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Book a Dink — Next Steps</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0d1117; --surface: #161b22; --surface2: #1c2330; --border: #30363d;
+    --teal: #2ec4a9; --teal-dim: rgba(46,196,169,0.12);
+    --yellow: #f7c948; --yellow-dim: rgba(247,201,72,0.12);
+    --red: #f06449; --red-dim: rgba(240,100,73,0.12);
+    --blue: #4fa3e0; --blue-dim: rgba(79,163,224,0.12);
+    --purple: #a78bfa; --purple-dim: rgba(167,139,250,0.12);
+    --green: #3fb950; --green-dim: rgba(63,185,80,0.12);
+    --orange: #f0883e; --orange-dim: rgba(240,136,62,0.12);
+    --text: #e6edf3; --muted: #7d8590;
+  }
+  body { background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; padding-bottom: 60px; }
+
+  .hero {
+    background: linear-gradient(135deg, #0f1923, #0d2233, #0b1a2e);
+    border-bottom: 1px solid var(--border);
+    padding: 36px 28px 28px; position: relative; overflow: hidden;
+  }
+  .hero::before {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(ellipse 50% 70% at 75% 50%, rgba(46,196,169,0.07), transparent 70%);
+    pointer-events: none;
+  }
+  .hero-tag {
+    font-family: 'DM Mono', monospace; font-size: 11px; color: var(--teal);
+    background: var(--teal-dim); border: 1px solid rgba(46,196,169,0.25);
+    border-radius: 20px; padding: 4px 12px; margin-bottom: 12px;
+    display: inline-block; letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .hero h1 { font-family: 'Syne', sans-serif; font-size: clamp(22px,4vw,32px); font-weight: 800; letter-spacing: -0.02em; margin-bottom: 6px; }
+  .hero h1 span { color: var(--teal); }
+  .hero-sub { color: var(--muted); font-size: 14px; }
+
+  .main { max-width: 860px; margin: 0 auto; padding: 28px 18px 0; }
+
+  .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 28px; }
+  @media(max-width:560px){ .status-grid { grid-template-columns: 1fr; } }
+
+  .status-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 14px 16px; position: relative; overflow: hidden;
+  }
+  .status-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; border-radius: 14px 14px 0 0;
+  }
+  .sc-done::before { background: var(--green); }
+  .sc-warn::before { background: var(--orange); }
+  .sc-todo::before { background: var(--blue); }
+  .sc-block::before { background: var(--red); }
+
+  .status-label {
+    font-family: 'DM Mono', monospace; font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.07em; margin-bottom: 8px;
+  }
+  .sc-done .status-label { color: var(--green); }
+  .sc-warn .status-label { color: var(--orange); }
+  .sc-todo .status-label { color: var(--blue); }
+  .sc-block .status-label { color: var(--red); }
+
+  .status-items { list-style: none; }
+  .status-items li { font-size: 13px; color: #b0bac5; padding: 3px 0; display: flex; gap: 8px; align-items: flex-start; line-height: 1.5; }
+  .status-items li span { flex-shrink: 0; margin-top: 1px; }
+
+  .section-label {
+    font-family: 'Syne', sans-serif; font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 28px 0 14px;
+  }
+
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 18px; }
+  .tab {
+    font-family: 'DM Mono', monospace; font-size: 11px; padding: 6px 14px;
+    border-radius: 20px; border: 1px solid var(--border); background: transparent;
+    color: var(--muted); cursor: pointer; transition: all 0.15s; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .tab:hover { border-color: var(--text); color: var(--text); }
+  .tab.active { border-color: var(--teal); color: var(--teal); background: var(--teal-dim); }
+
+  .priority-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; margin-bottom: 10px; overflow: hidden; transition: border-color 0.2s;
+  }
+  .priority-card:hover { border-color: #444c56; }
+  .pc-header {
+    display: flex; align-items: center; gap: 12px; padding: 14px 18px;
+    cursor: pointer; user-select: none;
+  }
+  .pc-badge {
+    font-family: 'DM Mono', monospace; font-size: 10px; padding: 3px 9px;
+    border-radius: 20px; text-transform: uppercase; letter-spacing: 0.06em; flex-shrink: 0;
+  }
+  .badge-now  { background: var(--red-dim);    color: var(--red);    border: 1px solid rgba(240,100,73,0.3); }
+  .badge-next { background: var(--yellow-dim); color: var(--yellow); border: 1px solid rgba(247,201,72,0.3); }
+  .badge-soon { background: var(--blue-dim);   color: var(--blue);   border: 1px solid rgba(79,163,224,0.3); }
+  .badge-nice { background: var(--purple-dim); color: var(--purple); border: 1px solid rgba(167,139,250,0.3); }
+  .badge-block { background: var(--orange-dim); color: var(--orange); border: 1px solid rgba(240,136,62,0.3); }
+
+  .pc-title { font-weight: 600; font-size: 15px; flex: 1; }
+  .pc-effort { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); flex-shrink: 0; }
+  .chevron { color: var(--muted); font-size: 12px; transition: transform 0.2s; flex-shrink: 0; }
+  .priority-card.open .chevron { transform: rotate(180deg); }
+
+  .pc-body {
+    display: none; padding: 0 18px 16px; border-top: 1px solid var(--border);
+    animation: fadeIn 0.18s ease;
+  }
+  .priority-card.open .pc-body { display: block; }
+  @keyframes fadeIn { from { opacity:0; transform: translateY(-4px); } to { opacity:1; transform: translateY(0); } }
+
+  .pc-desc { color: #a0b0be; font-size: 14px; line-height: 1.75; margin: 12px 0 10px; }
+
+  .callout {
+    display: flex; gap: 10px; align-items: flex-start; border-radius: 10px;
+    padding: 11px 13px; font-size: 13px; line-height: 1.6; margin-bottom: 10px;
+  }
+  .callout-teal { background: rgba(46,196,169,0.06); border: 1px solid rgba(46,196,169,0.2); color: #a2cfc8; }
+  .callout-yellow { background: rgba(247,201,72,0.06); border: 1px solid rgba(247,201,72,0.2); color: #cfc3a2; }
+  .callout-red { background: rgba(240,100,73,0.06); border: 1px solid rgba(240,100,73,0.2); color: #cfb0a2; }
+  .callout-blue { background: rgba(79,163,224,0.06); border: 1px solid rgba(79,163,224,0.2); color: #a2bccf; }
+
+  .code-block {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; font-family: 'DM Mono', monospace; font-size: 12px;
+    color: #c9d1d9; line-height: 1.8; overflow-x: auto; white-space: pre; margin-bottom: 10px;
+  }
+
+  .blocker {
+    background: linear-gradient(135deg, rgba(240,136,62,0.08), rgba(240,100,73,0.06));
+    border: 1px solid rgba(240,136,62,0.3); border-radius: 16px;
+    padding: 18px 20px; margin-bottom: 24px;
+  }
+  .blocker h3 {
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 15px;
+    color: var(--orange); margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+  }
+  .blocker p { font-size: 13px; color: #cfc3a2; line-height: 1.7; margin-bottom: 10px; }
+  .blocker code { font-family: 'DM Mono', monospace; font-size: 12px; background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <div class="hero-tag">Book a Dink · Updated Roadmap — Mar 10</div>
+  <h1>Next Steps <span>Plan</span></h1>
+  <p class="hero-sub">Based on updated stability notes & regression checklist — March 10, 2026</p>
+</div>
+
+<div class="main">
+
+  <div class="section-label">Current State</div>
+  <div class="status-grid">
+    <div class="status-card sc-done">
+      <div class="status-label">✓ Resolved</div>
+      <ul class="status-items">
+        <li><span>✓</span> Club detail freeze — fixed</li>
+        <li><span>✓</span> Legacy bookadink-preset paths — removed</li>
+        <li><span>✓</span> Loading screen — navy gradient + SVG logo</li>
+        <li><span>✓</span> Logo border artifact — fixed via transparent SVG</li>
+        <li><span>✓</span> Auth fullScreenCover mid-session overlay — fixed</li>
+        <li><span>✓</span> Club header redesign — done</li>
+        <li><span>✓</span> Default tab → Games — done</li>
+        <li><span>✓</span> Button hit area fix — Edit Profile & Calendar</li>
+        <li><span>✓</span> Invite button glow — removed</li>
+        <li><span>✓</span> Win Rate pill — removed from GamesPlayedCard</li>
+        <li><span>✓</span> String+NormalizedAddress — added</li>
+        <li><span>✓</span> Membership sync on reopen — refreshMemberships()</li>
+        <li><span>✓</span> CLAUDE.md — added</li>
+        <li><span>✓</span> Profile gamification — DUPRHistoryCard, GamesPlayedCard, BadgesCard</li>
+      </ul>
+    </div>
+
+    <div class="status-card sc-warn">
+      <div class="status-label">⚠ Needs Attention</div>
+      <ul class="status-items">
+        <li><span>⚠</span> Supabase RLS WITH CHECK — may not be applied to remote yet</li>
+        <li><span>⚠</span> No push notifications</li>
+        <li><span>⚠</span> No onboarding flow</li>
+        <li><span>⚠</span> No App Store prep started</li>
+      </ul>
+    </div>
+
+    <div class="status-card sc-block">
+      <div class="status-label">🔴 Blocker</div>
+      <ul class="status-items">
+        <li><span>🔴</span> Supabase RLS policy — profile updates silently failing without WITH CHECK</li>
+        <li><span>🔴</span> Push notifications — blocked pending Apple Developer account</li>
+      </ul>
+    </div>
+
+    <div class="status-card sc-todo">
+      <div class="status-label">◦ Not Started</div>
+      <ul class="status-items">
+        <li><span>◦</span> Onboarding flow</li>
+        <li><span>◦</span> Waitlist system</li>
+        <li><span>◦</span> App Store assets & metadata</li>
+        <li><span>◦</span> Deep linking / share game</li>
+        <li><span>◦</span> Offline handling</li>
+        <li><span>◦</span> Apple Sign In</li>
+        <li><span>◦</span> Map view for club discovery</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="blocker">
+    <h3>🔴 Blocker — Supabase RLS Profile Update Policy</h3>
+    <p>The <code>Users can update own profile</code> RLS policy is missing <code>WITH CHECK ((auth.uid() = id))</code>. Without it, PostgREST upserts to the profiles table <strong>silently fail</strong>.</p>
+    <div class="code-block">-- Run in Supabase SQL editor:
+DROP POLICY IF EXISTS "Users can update own profile" ON profiles;
+
+CREATE POLICY "Users can update own profile"
+ON profiles
+FOR UPDATE
+TO authenticated
+USING (auth.uid() = id)
+WITH CHECK (auth.uid() = id);</div>
+    <div class="callout callout-red">⚠ Verify by editing your profile in the app after applying — check the Supabase table editor to confirm the row changed.</div>
+  </div>
+
+  <div class="section-label">Prioritised Work Items</div>
+  <div class="tabs">
+    <button class="tab active" data-cat="all">All</button>
+    <button class="tab" data-cat="next">Do Next</button>
+    <button class="tab" data-cat="soon">Soon</button>
+    <button class="tab" data-cat="nice">Nice to Have</button>
+  </div>
+
+  <div class="priority-card" data-cat="next">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-next">Do Next</span>
+      <span class="pc-title">Onboarding flow — first-time user experience</span>
+      <span class="pc-effort">4–6 hrs</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">3-screen onboarding shown once after account creation. Gates with UserDefaults flag. Shows after ProfileSetupView, before MainTabView.</p>
+    </div>
+  </div>
+
+  <div class="priority-card" data-cat="next">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-next">Do Next</span>
+      <span class="pc-title">App Store prep — metadata, screenshots, privacy policy</span>
+      <span class="pc-effort">1 day</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">Must run in parallel with feature work — not last. App Review takes 1–3 days. Privacy policy mandatory since you collect email, name, DUPR, location.</p>
+    </div>
+  </div>
+
+  <div class="priority-card" data-cat="soon">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-soon">Soon</span>
+      <span class="pc-title">Waitlist system for full games</span>
+      <span class="pc-effort">4–6 hrs</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">waitlist table in Supabase. DB trigger promotes next person on cancellation and fires push notification. Pairs with push notifications work.</p>
+    </div>
+  </div>
+
+  <div class="priority-card" data-cat="soon">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-soon">Soon</span>
+      <span class="pc-title">Deep linking — share a game or club via URL</span>
+      <span class="pc-effort">3–4 hrs</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">Universal links to bookadink.com/club/[id] and bookadink.com/game/[id]. apple-app-site-association file on domain, handle via .onOpenURL modifier.</p>
+    </div>
+  </div>
+
+  <div class="priority-card" data-cat="nice">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-nice">Nice to Have</span>
+      <span class="pc-title">Map view for club discovery</span>
+      <span class="pc-effort">4–6 hrs</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">MapKit toggle on Explore tab. CLGeocoder converts normalizedAddress() to coordinates. Cache results to avoid hammering geocoder.</p>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  function toggle(h) { h.parentElement.classList.toggle('open'); }
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      const cat = tab.dataset.cat;
+      document.querySelectorAll('.priority-card').forEach(c => {
+        c.style.display = (cat === 'all' || c.dataset.cat === cat) ? '' : 'none';
+      });
+    });
+  });
+</script>
+</body>
+</html>
