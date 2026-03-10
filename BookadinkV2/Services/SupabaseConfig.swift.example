@@ -1,0 +1,20 @@
+// SupabaseConfig.swift.example
+//
+// SETUP: Copy this file to SupabaseConfig.swift (same directory) and fill in your values.
+// SupabaseConfig.swift is git-ignored and must never be committed.
+//
+// Find these values in your Supabase project dashboard → Settings → API.
+
+import Foundation
+
+enum SupabaseConfig {
+    static let urlString = "https://YOUR_PROJECT_REF.supabase.co"
+    static let anonKey   = "YOUR_SUPABASE_ANON_KEY"
+
+    static let clubNewsImageBucket = "feed-images"
+    static let clubChatPushHookFunctionName = ""
+
+    static var isConfigured: Bool {
+        URL(string: urlString) != nil && !anonKey.isEmpty
+    }
+}
