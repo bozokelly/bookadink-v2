@@ -427,7 +427,10 @@ struct ClubDetailView: View {
     }
 
     private var heroInviteButton: some View {
-        ShareLink(item: "Join \(club.name) on Book A Dink! bookadink://clubs/\(club.id)") {
+        ShareLink(
+            item: DeepLink.clubURL(id: club.id),
+            message: Text("Join \(club.name) on Book A Dink!")
+        ) {
             HStack(spacing: 6) {
                 Image(systemName: "person.badge.plus")
                 Text("Invite")

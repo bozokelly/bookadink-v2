@@ -22,6 +22,7 @@ final class AppState: ObservableObject {
     /// Inject as a separate @EnvironmentObject so only views that need it re-render.
     let scheduleStore = GameScheduleStore()
 
+    @Published var pendingDeepLink: DeepLink? = nil
     @Published var authState: AuthState = .signedOut
     @Published var authUserID: UUID? = nil
     @Published var authEmail: String? = nil
@@ -954,6 +955,16 @@ final class AppState: ObservableObject {
 
     func handleRemotePushRegistrationFailure(_ message: String) {
         remotePushRegistrationErrorMessage = AppCopy.friendlyError(message)
+    }
+
+    func handleDeepLink(_ url: URL) {
+        guard let link = DeepLink(url: url) else { return }
+        // If not yet authenticated, store and re-fire after sign-in
+        guard authState == .signedIn else {
+            pendingDeepLink = link
+            return
+        }
+        pendingDeepLink = link
     }
 
     func refreshAttendees(for game: Game) async {

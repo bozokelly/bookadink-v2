@@ -10,11 +10,16 @@ enum AppTab: Hashable {
 struct MainTabView: View {
     @EnvironmentObject private var appState: AppState
     @State private var selectedTab: AppTab = .clubs
+    @State private var deepLinkClub: Club? = nil
+    @State private var deepLinkGame: Game? = nil
 
     var body: some View {
         TabView(selection: $selectedTab) {
             NavigationStack {
                 ClubsListView(clubs: appState.clubs)
+                    .navigationDestination(item: $deepLinkClub) { club in
+                        ClubDetailView(club: club)
+                    }
             }
             .tabItem {
                 Label("Clubs", systemImage: "building.2")
@@ -47,6 +52,35 @@ struct MainTabView: View {
             .tag(AppTab.profile)
         }
         .tint(Brand.brandPrimary)
+        .sheet(item: $deepLinkGame) { game in
+            NavigationStack {
+                GameDetailView(game: game)
+            }
+        }
+        .onChange(of: appState.pendingDeepLink) { _, link in
+            guard let link else { return }
+            handleDeepLink(link)
+        }
+    }
+
+    private func handleDeepLink(_ link: DeepLink) {
+        switch link {
+        case .club(let id):
+            guard let club = appState.clubs.first(where: { $0.id == id }) else { return }
+            selectedTab = .clubs
+            // Small delay so the tab switch animates before the push
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                deepLinkClub = club
+                appState.pendingDeepLink = nil
+            }
+        case .game(let id):
+            guard let game = appState.gamesByClubID.values.flatMap({ $0 }).first(where: { $0.id == id }) else { return }
+            selectedTab = .clubs
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                deepLinkGame = game
+                appState.pendingDeepLink = nil
+            }
+        }
     }
 }
 

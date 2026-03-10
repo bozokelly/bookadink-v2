@@ -38,6 +38,9 @@ struct BookADinkApp: App {
                 .environmentObject(appState)
                 .environmentObject(appState.scheduleStore)
                 .preferredColorScheme(.light)
+                .onOpenURL { url in
+                    appState.handleDeepLink(url)
+                }
         }
     }
 }
