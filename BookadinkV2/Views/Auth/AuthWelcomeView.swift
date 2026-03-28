@@ -13,11 +13,11 @@ struct AuthWelcomeView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Book a dink")
                     .font(.system(size: 42, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Brand.primaryText)
 
                 Text("Find clubs, join your community, and book your next game.")
                     .font(.headline)
-                    .foregroundStyle(Color.white.opacity(0.88))
+                    .foregroundStyle(Brand.secondaryText)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -29,7 +29,7 @@ struct AuthWelcomeView: View {
                 }
                 .pickerStyle(.segmented)
                 .padding(4)
-                .background(Color.white.opacity(0.2), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
                 HStack(spacing: 12) {
                     Image(systemName: "envelope.fill")
@@ -39,7 +39,7 @@ struct AuthWelcomeView: View {
                         .keyboardType(.emailAddress)
                 }
                 .padding()
-                .glassCard(cornerRadius: 18, tint: Color.white.opacity(0.45))
+                .glassCard(cornerRadius: 18, tint: Brand.cardBackground)
 
                 HStack(spacing: 12) {
                     Image(systemName: "lock.fill")
@@ -47,7 +47,7 @@ struct AuthWelcomeView: View {
                     SecureField("Password", text: $password)
                 }
                 .padding()
-                .glassCard(cornerRadius: 18, tint: Color.white.opacity(0.45))
+                .glassCard(cornerRadius: 18, tint: Brand.cardBackground)
 
                 Button {
                     let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -76,7 +76,7 @@ struct AuthWelcomeView: View {
                 .disabled(appState.isAuthenticating || !canSubmit)
                 .opacity((appState.isAuthenticating || !canSubmit) ? 0.6 : 1)
                 .buttonStyle(.plain)
-                .actionBorder(cornerRadius: 16, color: Brand.lightCyan.opacity(0.5))
+                .actionBorder(cornerRadius: 16, color: Brand.softOutline)
 
                 if let info = appState.authInfoMessage, !info.isEmpty {
                     Text(info)
@@ -94,11 +94,11 @@ struct AuthWelcomeView: View {
 
             }
             .padding(18)
-            .glassCard(cornerRadius: 26, tint: Brand.rosyTaupe.opacity(0.18))
+            .glassCard(cornerRadius: 26, tint: Brand.cardBackground)
 
             Text("Email/password sign in is enabled.")
                 .font(.footnote)
-                .foregroundStyle(Color.white.opacity(0.85))
+                .foregroundStyle(Brand.secondaryText)
 
             Spacer()
         }

@@ -38,7 +38,7 @@ struct OnboardingView: View {
                 HStack(spacing: 6) {
                     ForEach(0..<pages.count, id: \.self) { i in
                         Capsule()
-                            .fill(i == currentPage ? Brand.pineTeal : Color.white.opacity(0.25))
+                            .fill(i == currentPage ? Brand.pineTeal : Brand.softOutline)
                             .frame(width: i == currentPage ? 20 : 6, height: 6)
                             .animation(.spring(response: 0.35, dampingFraction: 0.75), value: currentPage)
                     }
@@ -72,7 +72,7 @@ struct OnboardingView: View {
 
                         Button("Skip") { onComplete() }
                             .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(Color.white.opacity(0.5))
+                            .foregroundStyle(Brand.secondaryText)
                     } else {
                         Button {
                             onComplete()
@@ -115,14 +115,14 @@ struct OnboardingView: View {
             // Title
             Text(page.title)
                 .font(.system(size: 32, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
+                .foregroundStyle(Brand.primaryText)
                 .multilineTextAlignment(.center)
                 .padding(.bottom, 16)
 
             // Body
             Text(page.body)
                 .font(.system(size: 17, weight: .regular))
-                .foregroundStyle(Color.white.opacity(0.75))
+                .foregroundStyle(Brand.secondaryText)
                 .multilineTextAlignment(.center)
                 .lineSpacing(4)
                 .padding(.horizontal, 32)
@@ -136,14 +136,14 @@ struct OnboardingView: View {
                         .padding(.top, 1)
                     Text(detail)
                         .font(.system(size: 13))
-                        .foregroundStyle(Color.white.opacity(0.55))
+                        .foregroundStyle(Brand.secondaryText)
                         .lineSpacing(3)
                 }
                 .padding(14)
-                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.1), lineWidth: 1)
+                        .strokeBorder(Brand.softOutline, lineWidth: 1)
                 )
                 .padding(.horizontal, 28)
                 .padding(.top, 24)

@@ -31,6 +31,9 @@ final class AppState: ObservableObject {
     @Published var profile: UserProfile? = nil
     @Published var clubs: [Club] = MockData.clubs
     @Published var gamesByClubID: [UUID: [Game]] = [:]
+    /// All active upcoming games within the next 14 days, fetched at bootstrap.
+    /// Powers the "Games Near You" home section and NearbyGamesView.
+    @Published var allUpcomingGames: [Game] = []
     @Published var bookings: [BookingWithGame] = []
     @Published var attendeesByGameID: [UUID: [GameAttendee]] = [:]
     @Published var membershipStatesByClubID: [UUID: ClubMembershipState] = [:]
@@ -56,13 +59,22 @@ final class AppState: ObservableObject {
     @Published var resolvingClubNewsReportIDs: Set<UUID> = []
     @Published var requestingBookingGameIDs: Set<UUID> = []
     @Published var cancellingBookingIDs: Set<UUID> = []
+    @Published var cancellingGameIDs: Set<UUID> = []
     @Published var loadingAttendeeGameIDs: Set<UUID> = []
     @Published var ownerBookingUpdatingIDs: Set<UUID> = []
     @Published var ownerSavingGameIDs: Set<UUID> = []
     @Published var ownerDeletingGameIDs: Set<UUID> = []
     @Published var isDeletingClubIDs: Set<UUID> = []
+    @Published var reviewsByClubID: [UUID: [GameReview]] = [:]
+    @Published var loadingReviewsClubIDs: Set<UUID> = []
+    @Published var clubVenuesByClubID: [UUID: [ClubVenue]] = [:]
+    @Published var loadingClubVenueIDs: Set<UUID> = []
+    @Published var savingClubVenueIDs: Set<UUID> = []
+    @Published var deletingClubVenueIDs: Set<UUID> = []
     // reminderGameIDs, calendarGameIDs, exportingCalendarGameIDs live on scheduleStore.
     @Published var checkedInBookingIDs: Set<UUID> = []
+    /// Maps bookingID → payment_status ("unpaid" | "cash" | "stripe") for checked-in attendees.
+    @Published var attendancePaymentByBookingID: [UUID: String] = [:]
     @Published var isLoadingClubs = false
     @Published var loadingClubGameIDs: Set<UUID> = []
     @Published var clubGamesErrorByClubID: [UUID: String] = [:]
@@ -88,14 +100,19 @@ final class AppState: ObservableObject {
     @Published var membershipErrorMessage: String? = nil
     @Published var ownerToolsInfoMessage: String? = nil
     @Published var ownerToolsErrorMessage: String? = nil
+    /// Per-game admin feedback messages. Keyed by game ID so messages from one game
+    /// never appear in another game's view. Club-scoped actions use the global above.
+    @Published var gameOwnerInfoByID: [UUID: String] = [:]
+    @Published var gameOwnerErrorByID: [UUID: String] = [:]
     @Published var isSavingClubOwnerSettings = false
     @Published var isCreatingClub = false
     @Published var isCreatingOwnerGame = false
     @Published var isInitialBootstrapComplete = false
+    @Published var isPerformingPostSignInBootstrap = false
     @Published var duprID: String? = nil
     @Published var duprDoublesRating: Double? = nil
     @Published var duprSinglesRating: Double? = nil
-    @Published var clubNewsNotificationsEnabled = true
+    @Published var mutedClubChatIDs: Set<UUID> = []
     @Published var remotePushTokenHex: String? = nil
     @Published var remotePushRegistrationErrorMessage: String? = nil
     private var clubNewsPrimedClubIDs: Set<UUID> = []
@@ -106,6 +123,10 @@ final class AppState: ObservableObject {
     private var clubChatRealtimeRefreshTasks: [UUID: Task<Void, Never>] = [:]
     private var duprIDByUserID: [UUID: String] = [:]
     private var duprRatingsByUserID: [UUID: (doubles: Double?, singles: Double?)] = [:]
+
+    func duprDoublesRating(for userID: UUID) -> Double? {
+        duprRatingsByUserID[userID]?.doubles
+    }
     private var duprHistoryByUserID: [UUID: [DUPREntry]] = [:]
     @Published var duprHistory: [DUPREntry] = []
 
@@ -128,7 +149,8 @@ final class AppState: ObservableObject {
             await refreshClubs()
             if authState == .signedIn {
                 await loadProfileFromBackendIfAvailable()
-                await refreshBookings()
+                await refreshBookings(silent: true)
+                await refreshUpcomingGames()
             }
             isInitialBootstrapComplete = true
         }
@@ -163,6 +185,7 @@ final class AppState: ObservableObject {
         duprDoublesRating = nil
         duprSinglesRating = nil
         gamesByClubID = [:]
+        allUpcomingGames = []
         bookings = []
         attendeesByGameID = [:]
         membershipStatesByClubID = [:]
@@ -199,6 +222,7 @@ final class AppState: ObservableObject {
         resolvingClubNewsReportIDs = []
         requestingBookingGameIDs = []
         cancellingBookingIDs = []
+        cancellingGameIDs = []
         ownerSavingGameIDs = []
         ownerDeletingGameIDs = []
         loadingAttendeeGameIDs = []
@@ -214,6 +238,8 @@ final class AppState: ObservableObject {
         membershipErrorMessage = nil
         ownerToolsInfoMessage = nil
         ownerToolsErrorMessage = nil
+        gameOwnerInfoByID = [:]
+        gameOwnerErrorByID = [:]
         isCreatingClub = false
         clubNewsErrorByClubID = [:]
         clubNewsReportsErrorByClubID = [:]
@@ -313,8 +339,12 @@ final class AppState: ObservableObject {
             }
             telemetry("refresh_clubs_success count=\(fetched.count) duration_ms=\(elapsedMilliseconds(since: startedAt))")
         } catch {
-            clubsLoadErrorMessage = error.localizedDescription
-            isUsingLiveClubData = false
+            // Only show the preview-data banner if we don't already have live clubs loaded.
+            // A failed re-fetch should not wipe out the live indicator set by a previous
+            // successful fetch.
+            if !isUsingLiveClubData {
+                clubsLoadErrorMessage = error.localizedDescription
+            }
             print("[Clubs] Fetch FAILED: \(error)")
             telemetry("refresh_clubs_error duration_ms=\(elapsedMilliseconds(since: startedAt)) message=\(error.localizedDescription)")
         }
@@ -339,6 +369,20 @@ final class AppState: ObservableObject {
         } catch {
             // Keep local state if backend membership fetch isn't available yet.
         }
+
+        // Always refresh admin roles alongside memberships so promotions are reflected immediately.
+        do {
+            let roles = try await withAuthRetry {
+                try await self.dataProvider.fetchAllAdminRoles(userID: userID)
+            }
+            clubAdminRoleByClubID = roles
+        } catch {
+            // Non-fatal; existing local admin role state is kept.
+        }
+    }
+
+    func refreshProfile() async {
+        await loadProfileFromBackendIfAvailable()
     }
 
     func membershipState(for club: Club) -> ClubMembershipState {
@@ -415,6 +459,15 @@ final class AppState: ObservableObject {
         return role == "owner" || role == "admin"
     }
 
+    /// True only for the club owner — not regular admins.
+    /// Owners can promote/demote admins and remove any member.
+    /// Admins can only manage regular (non-admin) members.
+    func isClubOwner(for club: Club) -> Bool {
+        if club.createdByUserID == authUserID { return true }
+        guard let role = clubAdminRoleByClubID[club.id]?.lowercased() else { return false }
+        return role == "owner"
+    }
+
     func bookingState(for game: Game) -> BookingState {
         bookings.first(where: { $0.booking.gameID == game.id })?.booking.state ?? .none
     }
@@ -429,6 +482,10 @@ final class AppState: ObservableObject {
 
     func isCancellingBooking(for game: Game) -> Bool {
         cancellingBookingIDs.contains(game.id)
+    }
+
+    func isCancellingGame(_ game: Game) -> Bool {
+        cancellingGameIDs.contains(game.id)
     }
 
     func gameAttendees(for game: Game) -> [GameAttendee] {
@@ -510,11 +567,63 @@ final class AppState: ObservableObject {
                 try await self.dataProvider.fetchGames(clubID: club.id)
             }
             gamesByClubID[club.id] = loaded
+            mergeIntoAllUpcomingGames(loaded, forClubID: club.id)
             telemetry("refresh_games_success club_id=\(club.id.uuidString) count=\(loaded.count) duration_ms=\(elapsedMilliseconds(since: startedAt))")
         } catch {
             clubGamesErrorByClubID[club.id] = error.localizedDescription
             telemetry("refresh_games_error club_id=\(club.id.uuidString) duration_ms=\(elapsedMilliseconds(since: startedAt)) message=\(error.localizedDescription)")
         }
+    }
+
+    /// Fetches all active games within the next 14 days across all clubs and
+    /// populates `allUpcomingGames`. Non-critical — failures are silent.
+    func refreshUpcomingGames() async {
+        guard authState == .signedIn else { return }
+        do {
+            let games = try await withAuthRetry {
+                try await self.dataProvider.fetchUpcomingGames()
+            }
+            allUpcomingGames = games
+            let clubCount = Set(games.map(\.clubID)).count
+            print("[NearbyGames] Loaded \(games.count) games across \(clubCount) clubs")
+            // Log each game so we can verify Supabase returned coordinates.
+            for g in games {
+                let coordStatus: String
+                if g.latitude != nil {
+                    coordStatus = "game-coords"
+                } else if clubs.first(where: { $0.id == g.clubID })?.latitude != nil {
+                    coordStatus = "club-coords"
+                } else {
+                    coordStatus = "no-coords"
+                }
+                print("[NearbyGames]   · \(g.title) club=\(g.clubID.uuidString.prefix(8)) \(coordStatus)")
+            }
+
+            // Prefetch venues for any club whose upcoming games reference a specific
+            // venue by name. This ensures distance calculations can use the actual
+            // game venue coordinates rather than the club's base address.
+            let clubIDsNeedingVenues = Set(games.filter { $0.venueName != nil }.map(\.clubID))
+                .subtracting(Set(clubVenuesByClubID.keys))
+            for club in clubs.filter({ clubIDsNeedingVenues.contains($0.id) }) {
+                Task { await refreshVenues(for: club) }
+            }
+        } catch {
+            // Non-critical: the home section stays empty or keeps stale data on error.
+            print("[NearbyGames] Failed to load upcoming games: \(error.localizedDescription)")
+        }
+    }
+
+    /// Merges freshly-loaded per-club games into `allUpcomingGames`,
+    /// replacing any stale entries for that club.
+    private func mergeIntoAllUpcomingGames(_ loaded: [Game], forClubID clubID: UUID) {
+        let now = Date()
+        let windowEnd = now.addingTimeInterval(14 * 24 * 3_600)
+        let fresh = loaded.filter {
+            $0.dateTime >= now && $0.dateTime <= windowEnd && $0.status == "upcoming"
+            && ($0.publishAt == nil || $0.publishAt! <= now)
+        }
+        allUpcomingGames.removeAll { $0.clubID == clubID }
+        allUpcomingGames.append(contentsOf: fresh)
     }
 
     func refreshClubDirectoryMembers(for club: Club) async {
@@ -594,7 +703,8 @@ final class AppState: ObservableObject {
     }
 
     private func scheduleClubChatRealtimeRefresh(for club: Club, includeModeration: Bool, immediate: Bool) {
-        guard clubChatRealtimeRefreshTasks[club.id] == nil else { return }
+        // Cancel any in-flight debounce and reschedule — avoids dropping rapid realtime events
+        clubChatRealtimeRefreshTasks[club.id]?.cancel()
         clubChatRealtimeRefreshTasks[club.id] = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -701,11 +811,26 @@ final class AppState: ObservableObject {
         }
     }
 
+    // Mutates a single post in the local cache without a network round-trip.
+    private func updatePostLocally(clubID: UUID, postID: UUID, update: (inout ClubNewsPost) -> Void) {
+        guard var posts = clubNewsPostsByClubID[clubID],
+              let idx = posts.firstIndex(where: { $0.id == postID }) else { return }
+        update(&posts[idx])
+        clubNewsPostsByClubID[clubID] = posts
+    }
+
     func toggleClubNewsLike(for club: Club, post: ClubNewsPost) async {
         clubNewsErrorByClubID[club.id] = nil
         guard let authUserID else {
             authState = .signedOut
             return
+        }
+
+        // Optimistic flip — instant UI response, no full refresh needed
+        let wasLiked = post.isLikedByCurrentUser
+        updatePostLocally(clubID: club.id, postID: post.id) { p in
+            p.isLikedByCurrentUser = !wasLiked
+            p.likeCount = max(0, p.likeCount + (wasLiked ? -1 : 1))
         }
 
         updatingClubNewsPostIDs.insert(post.id)
@@ -715,8 +840,13 @@ final class AppState: ObservableObject {
             try await withAuthRetry {
                 try await self.dataProvider.toggleClubNewsLike(postID: post.id, userID: authUserID)
             }
-            await refreshClubNews(for: club)
+            // No full refresh — realtime will reconcile any edge-case discrepancy
         } catch {
+            // Revert optimistic change on failure
+            updatePostLocally(clubID: club.id, postID: post.id) { p in
+                p.isLikedByCurrentUser = wasLiked
+                p.likeCount = max(0, p.likeCount + (wasLiked ? 1 : -1))
+            }
             clubNewsErrorByClubID[club.id] = error.localizedDescription
         }
     }
@@ -733,6 +863,20 @@ final class AppState: ObservableObject {
 
         creatingClubNewsCommentPostIDs.insert(post.id)
         defer { creatingClubNewsCommentPostIDs.remove(post.id) }
+
+        // Optimistic insert — comment appears immediately with a temp UUID
+        let tempComment = ClubNewsComment(
+            id: UUID(),
+            postID: post.id,
+            userID: authUserID,
+            authorName: profile?.fullName ?? "You",
+            content: trimmed,
+            createdAt: Date(),
+            parentID: parentCommentID
+        )
+        updatePostLocally(clubID: club.id, postID: post.id) { p in
+            p.comments.append(tempComment)
+        }
 
         do {
             try await withAuthRetry {
@@ -751,8 +895,13 @@ final class AppState: ObservableObject {
                     referenceID: post.id
                 )
             }
-            await refreshClubNews(for: club)
+            // Background refresh replaces the temp comment with the real server row
+            Task { await self.refreshClubNews(for: club) }
         } catch {
+            // Revert optimistic insert
+            updatePostLocally(clubID: club.id, postID: post.id) { p in
+                p.comments.removeAll { $0.id == tempComment.id }
+            }
             clubNewsErrorByClubID[club.id] = error.localizedDescription
         }
     }
@@ -895,16 +1044,21 @@ final class AppState: ObservableObject {
         }
     }
 
-    func setClubNewsNotificationsEnabled(_ enabled: Bool) {
-        clubNewsNotificationsEnabled = enabled
-        persistClubNewsNotificationPreference()
-        if enabled {
+    func isClubChatMuted(for clubID: UUID) -> Bool {
+        mutedClubChatIDs.contains(clubID)
+    }
+
+    func setClubChatMuted(_ muted: Bool, for clubID: UUID) {
+        if muted {
+            mutedClubChatIDs.insert(clubID)
+        } else {
+            mutedClubChatIDs.remove(clubID)
             Task { await prepareClubChatPushNotificationsIfNeeded() }
         }
+        persistClubNewsNotificationPreference()
     }
 
     func prepareClubChatPushNotificationsIfNeeded() async {
-        guard clubNewsNotificationsEnabled else { return }
         guard !hasAttemptedRemotePushRegistrationThisLaunch else { return }
         hasAttemptedRemotePushRegistrationThisLaunch = true
         remotePushRegistrationErrorMessage = nil
@@ -980,32 +1134,37 @@ final class AppState: ObservableObject {
             }
             attendeesByGameID[game.id] = loaded
 
-            let syncedCheckedInIDs: Set<UUID>
+            let syncedAttendanceMap: [UUID: String]
             do {
-                syncedCheckedInIDs = try await withAuthRetry {
+                syncedAttendanceMap = try await withAuthRetry {
                     try await self.dataProvider.fetchCheckedInBookingIDs(gameID: game.id)
                 }
             } catch {
                 // If attendance policy is not available to this user, keep cached check-ins.
-                syncedCheckedInIDs = checkedInBookingIDs.intersection(Set(loaded.map(\.booking.id)))
+                let cached = checkedInBookingIDs.intersection(Set(loaded.map(\.booking.id)))
+                syncedAttendanceMap = Dictionary(uniqueKeysWithValues: cached.map { ($0, attendancePaymentByBookingID[$0] ?? "unpaid") })
             }
 
+            let syncedCheckedInIDs = Set(syncedAttendanceMap.keys)
             let currentGameBookingIDs = Set(loaded.map(\.booking.id))
             let removedForThisGame = previousBookingIDs.subtracting(currentGameBookingIDs)
             checkedInBookingIDs.subtract(removedForThisGame)
             checkedInBookingIDs.subtract(previousBookingIDs.intersection(currentGameBookingIDs))
             checkedInBookingIDs.formUnion(syncedCheckedInIDs)
+            // Update payment statuses for this game
+            for id in removedForThisGame { attendancePaymentByBookingID.removeValue(forKey: id) }
+            for (bookingID, status) in syncedAttendanceMap { attendancePaymentByBookingID[bookingID] = status }
             persistCheckedInBookingIDs()
         } catch {
             bookingsErrorMessage = error.localizedDescription
         }
     }
 
-    func refreshBookings() async {
+    func refreshBookings(silent: Bool = false) async {
         guard authState == .signedIn, let userID = authUserID else { return }
 
         isLoadingBookings = true
-        bookingsErrorMessage = nil
+        if !silent { bookingsErrorMessage = nil }
         defer { isLoadingBookings = false }
 
         do {
@@ -1025,7 +1184,8 @@ final class AppState: ObservableObject {
             scheduleStore.reminderGameIDs = scheduleStore.reminderGameIDs.intersection(activeReminderEligible)
             scheduleStore.persistReminderGameIDs()
         } catch {
-            bookingsErrorMessage = error.localizedDescription
+            // Silent failures don't surface to the user — only user-initiated refreshes show errors
+            if !silent { bookingsErrorMessage = error.localizedDescription }
         }
     }
 
@@ -1146,6 +1306,10 @@ final class AppState: ObservableObject {
             ownerToolsErrorMessage = "Owner access cannot be changed here."
             return
         }
+        guard isClubOwner(for: club) else {
+            ownerToolsErrorMessage = "Only the club owner can change admin access."
+            return
+        }
 
         ownerAdminUpdatingUserIDs.insert(member.userID)
         defer { ownerAdminUpdatingUserIDs.remove(member.userID) }
@@ -1169,7 +1333,8 @@ final class AppState: ObservableObject {
                     emergencyContactPhone: member.emergencyContactPhone,
                     isAdmin: makeAdmin,
                     isOwner: member.isOwner,
-                    adminRole: makeAdmin ? "admin" : nil
+                    adminRole: makeAdmin ? "admin" : nil,
+                    conductAcceptedAt: member.conductAcceptedAt
                 )
             }
             ownerMembersByClubID[club.id] = current.sorted { lhs, rhs in
@@ -1178,6 +1343,19 @@ final class AppState: ObservableObject {
                 return lhs.memberName.localizedCaseInsensitiveCompare(rhs.memberName) == .orderedAscending
             }
             ownerToolsInfoMessage = makeAdmin ? "\(member.memberName) is now an admin." : "Admin access removed."
+
+            if makeAdmin {
+                Task {
+                    try? await self.dataProvider.triggerNotify(
+                        userID: member.userID,
+                        title: "You're now an admin",
+                        body: "You have been made an admin of \(club.name). You can now manage members and create games.",
+                        type: "admin_promoted",
+                        referenceID: club.id,
+                        sendPush: true
+                    )
+                }
+            }
         } catch {
             ownerToolsErrorMessage = error.localizedDescription
         }
@@ -1214,6 +1392,29 @@ final class AppState: ObservableObject {
             await refreshClubs()
         } catch {
             ownerToolsErrorMessage = error.localizedDescription
+        }
+    }
+
+    func createPaymentIntent(amountCents: Int, currency: String, metadata: [String: String]) async throws -> String {
+        try await withAuthRetry {
+            try await self.dataProvider.createPaymentIntent(
+                amountCents: amountCents,
+                currency: currency,
+                metadata: metadata
+            )
+        }
+    }
+
+    func adminUpdateMemberDUPR(_ member: ClubOwnerMember, rating: Double) async {
+        ownerToolsErrorMessage = nil
+        ownerToolsInfoMessage = nil
+        do {
+            try await withAuthRetry {
+                try await self.dataProvider.adminUpdateMemberDUPR(memberUserID: member.userID, rating: rating)
+            }
+            ownerToolsInfoMessage = "DUPR updated to \(String(format: "%.3f", rating)) for \(member.memberName)."
+        } catch {
+            ownerToolsErrorMessage = "Failed to update DUPR: \(error.localizedDescription)"
         }
     }
 
@@ -1262,8 +1463,8 @@ final class AppState: ObservableObject {
     }
 
     func ownerSetBookingState(for game: Game, attendee: GameAttendee, targetState: BookingState) async {
-        ownerToolsErrorMessage = nil
-        ownerToolsInfoMessage = nil
+        gameOwnerErrorByID.removeValue(forKey: game.id)
+        gameOwnerInfoByID.removeValue(forKey: game.id)
         let freedConfirmedSpot = bookingStateIsConfirmed(attendee.booking.state) && bookingStateIsCancelled(targetState)
 
         ownerBookingUpdatingIDs.insert(attendee.booking.id)
@@ -1312,53 +1513,89 @@ final class AppState: ObservableObject {
 
             switch targetState {
             case .confirmed:
-                ownerToolsInfoMessage = "\(attendee.userName) moved to confirmed."
+                gameOwnerInfoByID[game.id] = "\(attendee.userName) moved to confirmed."
             case .waitlisted:
-                ownerToolsInfoMessage = "\(attendee.userName) moved to waitlist."
+                gameOwnerInfoByID[game.id] = "\(attendee.userName) moved to waitlist."
             case .cancelled:
-                ownerToolsInfoMessage = "\(attendee.userName)'s booking cancelled."
+                gameOwnerInfoByID[game.id] = "\(attendee.userName)'s booking cancelled."
             case .none, .unknown:
-                ownerToolsInfoMessage = "Booking updated."
+                gameOwnerInfoByID[game.id] = "Booking updated."
             }
+
+            // Snapshot waitlist before refresh (for DB-trigger promotion detection)
+            let preWaitlistedIDs: Set<UUID> = freedConfirmedSpot ? Set(
+                (attendeesByGameID[game.id] ?? [])
+                    .filter { bookingStateIsWaitlisted($0.booking.state) }
+                    .map { $0.booking.userID }
+            ) : []
 
             if let club = clubs.first(where: { $0.id == game.clubID }) {
                 await refreshGames(for: club)
             }
             await refreshAttendees(for: game)
             if freedConfirmedSpot {
+                await notifyWaitlistPromoted(for: game, previouslyWaitlisted: preWaitlistedIDs)
                 await autoPromoteWaitlistIfPossible(for: game)
             }
-            await refreshBookings()
+            await refreshBookings(silent: true)
         } catch {
-            ownerToolsErrorMessage = error.localizedDescription
+            gameOwnerErrorByID[game.id] = error.localizedDescription
         }
     }
 
     func ownerAddPlayerToGame(_ member: ClubOwnerMember, game: Game) async {
-        ownerToolsErrorMessage = nil
-        ownerToolsInfoMessage = nil
+        gameOwnerErrorByID.removeValue(forKey: game.id)
+        gameOwnerInfoByID.removeValue(forKey: game.id)
 
         do {
+            // Determine if the game is already at or over capacity
+            let currentConfirmed = gameAttendees(for: game).filter {
+                if case .confirmed = $0.booking.state { return true }; return false
+            }.count
+            let gameFull = currentConfirmed >= game.maxSpots
+
+            let nextWaitlistPos: Int? = gameFull ? {
+                let maxPos = gameAttendees(for: game).compactMap { row -> Int? in
+                    if case let .waitlisted(p) = row.booking.state { return p }; return nil
+                }.max() ?? 0
+                return maxPos + 1
+            }() : nil
+
             let booking = try await withAuthRetry {
-                try await self.dataProvider.createBooking(gameID: game.id, userID: member.userID)
+                try await self.dataProvider.ownerCreateBooking(
+                    gameID: game.id,
+                    userID: member.userID,
+                    status: gameFull ? "waitlisted" : "confirmed",
+                    waitlistPosition: nextWaitlistPos
+                )
             }
             let attendee = GameAttendee(booking: booking, userName: member.memberName, userEmail: member.memberEmail)
             var rows = attendeesByGameID[game.id] ?? []
             rows.append(attendee)
             attendeesByGameID[game.id] = rows
-            ownerToolsInfoMessage = "\(member.memberName) added to the game."
+
+            gameOwnerInfoByID[game.id] = gameFull
+                ? "\(member.memberName) added to the waitlist (game is full)."
+                : "\(member.memberName) added to the game."
+
             if let club = clubs.first(where: { $0.id == game.clubID }) {
                 await refreshGames(for: club)
             }
             await refreshAttendees(for: game)
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(code, _) = error, code == 409 {
+                gameOwnerErrorByID[game.id] = "This player already has an active booking for this game."
+            } else {
+                gameOwnerErrorByID[game.id] = "Could not add player: \(error.localizedDescription)"
+            }
         } catch {
-            ownerToolsErrorMessage = "Could not add player: \(error.localizedDescription)"
+            gameOwnerErrorByID[game.id] = "Could not add player: \(error.localizedDescription)"
         }
     }
 
     func toggleCheckIn(for game: Game, attendee: GameAttendee) async {
-        ownerToolsErrorMessage = nil
-        ownerToolsInfoMessage = nil
+        gameOwnerErrorByID.removeValue(forKey: game.id)
+        gameOwnerInfoByID.removeValue(forKey: game.id)
 
         guard let authUserID else {
             authState = .signedOut
@@ -1374,7 +1611,7 @@ final class AppState: ObservableObject {
                     try await self.dataProvider.deleteAttendanceCheckIn(bookingID: attendee.booking.id)
                 }
                 checkedInBookingIDs.remove(attendee.booking.id)
-                ownerToolsInfoMessage = "Check-in removed."
+                gameOwnerInfoByID[game.id] = "Check-in removed."
             } else {
                 try await withAuthRetry {
                     try await self.dataProvider.upsertAttendanceCheckIn(
@@ -1385,18 +1622,41 @@ final class AppState: ObservableObject {
                     )
                 }
                 checkedInBookingIDs.insert(attendee.booking.id)
-                ownerToolsInfoMessage = "\(attendee.userName) checked in."
+                gameOwnerInfoByID[game.id] = "\(attendee.userName) checked in."
             }
             persistCheckedInBookingIDs()
             await refreshAttendees(for: game)
         } catch {
-            ownerToolsErrorMessage = error.localizedDescription
+            gameOwnerErrorByID[game.id] = error.localizedDescription
+        }
+    }
+
+    func paymentStatus(for bookingID: UUID) -> String {
+        attendancePaymentByBookingID[bookingID] ?? "unpaid"
+    }
+
+    func updatePaymentStatus(for game: Game, attendee: GameAttendee, status: String) async {
+        gameOwnerErrorByID.removeValue(forKey: game.id)
+
+        ownerBookingUpdatingIDs.insert(attendee.booking.id)
+        defer { ownerBookingUpdatingIDs.remove(attendee.booking.id) }
+
+        do {
+            try await withAuthRetry {
+                try await self.dataProvider.updateAttendancePaymentStatus(
+                    bookingID: attendee.booking.id,
+                    status: status
+                )
+            }
+            attendancePaymentByBookingID[attendee.booking.id] = status
+        } catch {
+            gameOwnerErrorByID[game.id] = "Could not update payment: \(error.localizedDescription)"
         }
     }
 
     func ownerMoveWaitlistAttendee(for game: Game, attendee: GameAttendee, directionUp: Bool) async {
-        ownerToolsErrorMessage = nil
-        ownerToolsInfoMessage = nil
+        gameOwnerErrorByID.removeValue(forKey: game.id)
+        gameOwnerInfoByID.removeValue(forKey: game.id)
 
         guard case .waitlisted = attendee.booking.state else { return }
 
@@ -1442,17 +1702,17 @@ final class AppState: ObservableObject {
                     waitlistPosition: currentPos
                 )
             }
-            ownerToolsInfoMessage = "Waitlist reordered."
+            gameOwnerInfoByID[game.id] = "Waitlist reordered."
             await refreshAttendees(for: game)
-            await refreshBookings()
+            await refreshBookings(silent: true)
         } catch {
-            ownerToolsErrorMessage = error.localizedDescription
+            gameOwnerErrorByID[game.id] = error.localizedDescription
         }
     }
 
     func ownerConfirmAllWaitlist(for game: Game) async {
-        ownerToolsErrorMessage = nil
-        ownerToolsInfoMessage = nil
+        gameOwnerErrorByID.removeValue(forKey: game.id)
+        gameOwnerInfoByID.removeValue(forKey: game.id)
 
         let waitlisted = gameAttendees(for: game).filter {
             if case .waitlisted = $0.booking.state { return true }
@@ -1470,20 +1730,20 @@ final class AppState: ObservableObject {
                     )
                 }
             }
-            ownerToolsInfoMessage = "Confirmed \(waitlisted.count) waitlisted attendee\(waitlisted.count == 1 ? "" : "s")."
+            gameOwnerInfoByID[game.id] = "Confirmed \(waitlisted.count) waitlisted attendee\(waitlisted.count == 1 ? "" : "s")."
             if let club = clubs.first(where: { $0.id == game.clubID }) {
                 await refreshGames(for: club)
             }
             await refreshAttendees(for: game)
-            await refreshBookings()
+            await refreshBookings(silent: true)
         } catch {
-            ownerToolsErrorMessage = error.localizedDescription
+            gameOwnerErrorByID[game.id] = error.localizedDescription
         }
     }
 
     func ownerClearWaitlist(for game: Game) async {
-        ownerToolsErrorMessage = nil
-        ownerToolsInfoMessage = nil
+        gameOwnerErrorByID.removeValue(forKey: game.id)
+        gameOwnerInfoByID.removeValue(forKey: game.id)
 
         let waitlisted = gameAttendees(for: game).filter {
             if case .waitlisted = $0.booking.state { return true }
@@ -1503,14 +1763,14 @@ final class AppState: ObservableObject {
                 checkedInBookingIDs.remove(attendee.booking.id)
             }
             persistCheckedInBookingIDs()
-            ownerToolsInfoMessage = "Cleared waitlist."
+            gameOwnerInfoByID[game.id] = "Cleared waitlist."
             if let club = clubs.first(where: { $0.id == game.clubID }) {
                 await refreshGames(for: club)
             }
             await refreshAttendees(for: game)
-            await refreshBookings()
+            await refreshBookings(silent: true)
         } catch {
-            ownerToolsErrorMessage = error.localizedDescription
+            gameOwnerErrorByID[game.id] = error.localizedDescription
         }
     }
 
@@ -1524,6 +1784,16 @@ final class AppState: ObservableObject {
             return false
         }
 
+        guard draft.hasVenue else {
+            ownerToolsErrorMessage = "Please select a venue for this game."
+            return false
+        }
+
+        if let pa = draft.publishAt, pa <= Date() {
+            ownerToolsErrorMessage = "Publish time must be in the future."
+            return false
+        }
+
         guard let userID = authUserID else {
             authState = .signedOut
             return false
@@ -1534,6 +1804,10 @@ final class AppState: ObservableObject {
         isCreatingOwnerGame = true
         defer { isCreatingOwnerGame = false }
 
+        // Pre-compute the publish offset (seconds before game start) so each
+        // recurring occurrence gets publish_at = its own start time – offset.
+        let publishOffset: TimeInterval? = draft.publishAt.map { draft.startDate.timeIntervalSince($0) }
+
         do {
             let recurrenceGroupID = repeatCount > 1 ? UUID() : nil
             var createdGames: [Game] = []
@@ -1543,6 +1817,10 @@ final class AppState: ObservableObject {
                 if occurrenceIndex > 0,
                    let nextDate = Calendar.current.date(byAdding: .day, value: occurrenceIndex * 7, to: draft.startDate) {
                     instanceDraft.startDate = nextDate
+                }
+                // Apply the same publish offset to each occurrence's start time.
+                if let offset = publishOffset {
+                    instanceDraft.publishAt = instanceDraft.startDate.addingTimeInterval(-offset)
                 }
 
                 let game = try await withAuthRetry {
@@ -1579,6 +1857,16 @@ final class AppState: ObservableObject {
             return false
         }
 
+        guard draft.hasVenue else {
+            ownerToolsErrorMessage = "Please select a venue for this game."
+            return false
+        }
+
+        if let pa = draft.publishAt, pa <= Date() {
+            ownerToolsErrorMessage = "Publish time must be in the future."
+            return false
+        }
+
         ownerSavingGameIDs.insert(game.id)
         defer { ownerSavingGameIDs.remove(game.id) }
 
@@ -1589,14 +1877,20 @@ final class AppState: ObservableObject {
                 let updated = try await withAuthRetry {
                     try await self.dataProvider.updateGame(gameID: game.id, draft: draft)
                 }
+                // Preserve confirmed/waitlist counts (not returned by the update endpoint).
+                var merged = updated
+                if let current = gamesByClubID[club.id]?.first(where: { $0.id == game.id }) {
+                    merged.confirmedCount = current.confirmedCount
+                    merged.waitlistCount  = current.waitlistCount
+                }
+                // Update gamesByClubID immediately so ClubDetailView reflects the change.
                 if var current = gamesByClubID[club.id], let index = current.firstIndex(where: { $0.id == game.id }) {
-                    var merged = updated
-                    merged.confirmedCount = current[index].confirmedCount
-                    merged.waitlistCount = current[index].waitlistCount
                     current[index] = merged
                     current.sort { $0.dateTime < $1.dateTime }
                     gamesByClubID[club.id] = current
                 }
+                // Propagate into bookings right away — no network call needed.
+                syncGameIntoBookings(merged)
                 ownerToolsInfoMessage = "Game updated."
             } else if let recurrenceGroupID = game.recurrenceGroupID {
                 let series = try await withAuthRetry {
@@ -1614,20 +1908,59 @@ final class AppState: ObservableObject {
                 }
 
                 let delta = draft.startDate.timeIntervalSince(game.dateTime)
+                // Pre-compute publish offset so each game in the series keeps the same gap.
+                let publishOffset: TimeInterval? = draft.publishAt.map { draft.startDate.timeIntervalSince($0) }
                 for target in targets {
                     var perGameDraft = draft
                     perGameDraft.startDate = target.dateTime.addingTimeInterval(delta)
+                    if let offset = publishOffset {
+                        perGameDraft.publishAt = perGameDraft.startDate.addingTimeInterval(-offset)
+                    }
                     _ = try await withAuthRetry {
                         try await self.dataProvider.updateGame(gameID: target.id, draft: perGameDraft)
                     }
                 }
                 ownerToolsInfoMessage = effectiveScope == .entireSeries ? "Entire series updated." : "This and future games updated."
             }
+
+            // Re-fetch the club's games from the server so gamesByClubID and
+            // allUpcomingGames are authoritative, then sync bookings from that
+            // fresh data — covers both the singleEvent and series paths.
             await refreshGames(for: club)
+            syncGamesIntoBookings(from: club.id)
+            // Authoritative full-bookings refresh ensures appState.bookings
+            // reflects the latest game data (including on the Home screen's
+            // "Your Next Game" section) without requiring the user to pull-to-refresh.
+            await refreshBookings(silent: true)
             return true
         } catch {
             ownerToolsErrorMessage = error.localizedDescription
             return false
+        }
+    }
+
+    /// Replaces the embedded `game` snapshot inside `appState.bookings` for a
+    /// single updated game. Called immediately after a successful singleEvent edit
+    /// so the UI reflects the change without waiting for a network round-trip.
+    private func syncGameIntoBookings(_ updatedGame: Game) {
+        bookings = bookings.map { item in
+            guard item.game?.id == updatedGame.id else { return item }
+            return BookingWithGame(booking: item.booking, game: updatedGame)
+        }
+    }
+
+    /// Replaces the embedded `game` snapshots inside `appState.bookings` for all
+    /// games belonging to `clubID`, using the freshly fetched data already in
+    /// `gamesByClubID`. Called after `refreshGames(for:)` completes.
+    private func syncGamesIntoBookings(from clubID: UUID) {
+        let games = gamesByClubID[clubID] ?? []
+        guard !games.isEmpty else { return }
+        let gameByID = Dictionary(uniqueKeysWithValues: games.map { ($0.id, $0) })
+        bookings = bookings.map { item in
+            guard item.game?.clubID == clubID,
+                  let gameID = item.game?.id,
+                  let fresh = gameByID[gameID] else { return item }
+            return BookingWithGame(booking: item.booking, game: fresh)
         }
     }
 
@@ -1729,8 +2062,8 @@ final class AppState: ObservableObject {
             membershipStatesByClubID[created.id] = .unknown("owner")
             ownerToolsInfoMessage = "Club created."
             telemetry("create_club_success club_id=\(created.id.uuidString) duration_ms=\(elapsedMilliseconds(since: startedAt))")
+            // refreshClubs() already calls refreshMemberships() internally.
             await refreshClubs()
-            await refreshMemberships()
             await refreshClubAdminRole(for: created)
             return created
         } catch {
@@ -1760,7 +2093,7 @@ final class AppState: ObservableObject {
             }
             ownerToolsInfoMessage = "Club details updated."
             telemetry("owner_update_club_success club_id=\(club.id.uuidString) duration_ms=\(elapsedMilliseconds(since: startedAt))")
-            await refreshClubs()
+            // Club already patched in-memory above; no full refetch needed.
             return true
         } catch {
             ownerToolsErrorMessage = error.localizedDescription
@@ -1823,6 +2156,7 @@ final class AppState: ObservableObject {
         // Remove all club-keyed cached state
         clubs.removeAll { $0.id == club.id }
         gamesByClubID.removeValue(forKey: club.id)
+        allUpcomingGames.removeAll { $0.clubID == club.id }
         membershipStatesByClubID.removeValue(forKey: club.id)
         ownerJoinRequestsByClubID.removeValue(forKey: club.id)
         ownerMembersByClubID.removeValue(forKey: club.id)
@@ -1845,7 +2179,7 @@ final class AppState: ObservableObject {
         stopClubChatRealtime(for: club)
     }
 
-    func requestMembership(for club: Club) async {
+    func requestMembership(for club: Club, conductAcceptedAt: Date? = nil) async {
         membershipErrorMessage = nil
         membershipInfoMessage = nil
         let currentState = membershipState(for: club)
@@ -1861,7 +2195,7 @@ final class AppState: ObservableObject {
 
         do {
             let status = try await withAuthRetry {
-                try await self.dataProvider.requestMembership(clubID: club.id, userID: userID)
+                try await self.dataProvider.requestMembership(clubID: club.id, userID: userID, conductAcceptedAt: conductAcceptedAt)
             }
             membershipStatesByClubID[club.id] = status
             membershipInfoMessage = (status == .pending) ? "Membership request sent." : "Club membership updated."
@@ -1950,9 +2284,13 @@ final class AppState: ObservableObject {
         }
     }
 
-    func requestBooking(for game: Game) async {
+    func requestBooking(for game: Game, stripePaymentIntentID: String? = nil) async {
         bookingsErrorMessage = nil
         bookingInfoMessage = nil
+        guard !game.startsInPast else {
+            bookingsErrorMessage = "This game has already taken place."
+            return
+        }
         let currentState = bookingState(for: game)
         guard currentState.canBook else { return }
 
@@ -1995,8 +2333,23 @@ final class AppState: ObservableObject {
         defer { requestingBookingGameIDs.remove(game.id) }
 
         do {
+            // Determine booking status from live in-memory game state.
+            // This avoids relying on a DB trigger and correctly waitlists when full.
+            let liveGame = gamesByClubID[game.clubID]?.first(where: { $0.id == game.id }) ?? game
+            let gameFull = liveGame.isFull
+            let waitlistPos: Int? = gameFull ? (liveGame.waitlistCount ?? 0) + 1 : nil
+            let bookingStatus = gameFull ? "waitlisted" : "confirmed"
+
             let created = try await withAuthRetry {
-                try await self.dataProvider.createBooking(gameID: game.id, userID: userID)
+                try await self.dataProvider.createBooking(
+                    gameID: game.id,
+                    userID: userID,
+                    status: bookingStatus,
+                    waitlistPosition: waitlistPos,
+                    feePaid: stripePaymentIntentID != nil,
+                    stripePaymentIntentID: stripePaymentIntentID,
+                    paymentMethod: stripePaymentIntentID != nil ? "stripe" : nil
+                )
             }
 
             if let idx = bookings.firstIndex(where: { $0.booking.gameID == game.id }) {
@@ -2015,7 +2368,7 @@ final class AppState: ObservableObject {
                         body: "You're on the waitlist for \(game.title). We'll notify you if a spot opens.",
                         type: "booking_waitlisted",
                         referenceID: game.id,
-                        sendPush: false
+                        sendPush: true
                     )
                     await self.refreshNotifications()
                 }
@@ -2041,7 +2394,7 @@ final class AppState: ObservableObject {
                 bookingInfoMessage = "Booking updated."
             }
 
-            await refreshBookings()
+            await refreshBookings(silent: true)
             if let club = clubs.first(where: { $0.id == game.clubID }) {
                 await refreshGames(for: club)
             }
@@ -2064,6 +2417,10 @@ final class AppState: ObservableObject {
         bookingsErrorMessage = nil
         bookingInfoMessage = nil
 
+        guard !game.startsInPast else {
+            bookingsErrorMessage = "Bookings cannot be cancelled after a game has taken place."
+            return
+        }
         guard bookingState(for: game).canCancel else { return }
         guard let booking = existingBooking(for: game) else { return }
 
@@ -2088,11 +2445,19 @@ final class AppState: ObservableObject {
 
             bookingInfoMessage = "Booking cancelled."
 
-            await refreshBookings()
+            // Snapshot waitlist before refresh so we can detect DB-trigger auto-promotions
+            let preWaitlistedIDs = Set(
+                (attendeesByGameID[game.id] ?? [])
+                    .filter { bookingStateIsWaitlisted($0.booking.state) }
+                    .map { $0.booking.userID }
+            )
+
+            await refreshBookings(silent: true)
             if let club = clubs.first(where: { $0.id == game.clubID }) {
                 await refreshGames(for: club)
             }
             await refreshAttendees(for: game)
+            await notifyWaitlistPromoted(for: game, previouslyWaitlisted: preWaitlistedIDs)
             await autoPromoteWaitlistIfPossible(for: game)
         } catch let serviceError as SupabaseServiceError {
             switch serviceError {
@@ -2103,6 +2468,70 @@ final class AppState: ObservableObject {
             }
         } catch {
             bookingsErrorMessage = error.localizedDescription
+        }
+    }
+
+    func cancelGame(for game: Game) async {
+        ownerToolsErrorMessage = nil
+        ownerToolsInfoMessage = nil
+
+        cancellingGameIDs.insert(game.id)
+        defer { cancellingGameIDs.remove(game.id) }
+
+        do {
+            try await withAuthRetry {
+                try await self.dataProvider.cancelGame(gameID: game.id)
+            }
+
+            // Update in-memory game status — propagates immediately to all list views
+            if var games = gamesByClubID[game.clubID],
+               let idx = games.firstIndex(where: { $0.id == game.id }) {
+                games[idx].status = "cancelled"
+                gamesByClubID[game.clubID] = games
+            }
+            allUpcomingGames.removeAll { $0.id == game.id }
+
+            // Notify all booked players
+            try? await withAuthRetry {
+                try await self.dataProvider.triggerGameCancelledNotify(
+                    gameID: game.id,
+                    gameTitle: game.title
+                )
+            }
+
+            ownerToolsInfoMessage = "Game cancelled."
+        } catch let serviceError as SupabaseServiceError {
+            switch serviceError {
+            case .authenticationRequired:
+                authInfoMessage = "Please sign in again to manage games."
+            default:
+                ownerToolsErrorMessage = serviceError.localizedDescription
+            }
+        } catch {
+            ownerToolsErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Detects players who transitioned from waitlisted → confirmed after a refresh
+    /// (i.e. promoted by the DB trigger) and sends them a push notification.
+    private func notifyWaitlistPromoted(for game: Game, previouslyWaitlisted: Set<UUID>) async {
+        guard !previouslyWaitlisted.isEmpty else { return }
+        let promoted = (attendeesByGameID[game.id] ?? []).filter { attendee in
+            guard previouslyWaitlisted.contains(attendee.booking.userID) else { return false }
+            return bookingStateIsConfirmed(attendee.booking.state)
+        }
+        for attendee in promoted {
+            let promotedUserID = attendee.booking.userID
+            Task {
+                try? await self.dataProvider.triggerNotify(
+                    userID: promotedUserID,
+                    title: "You're In!",
+                    body: "A spot opened up — you've been moved from the waitlist to confirmed for \(game.title).",
+                    type: "waitlist_promoted",
+                    referenceID: game.id,
+                    sendPush: true
+                )
+            }
         }
     }
 
@@ -2157,7 +2586,7 @@ final class AppState: ObservableObject {
                     )
                 }
             } catch {
-                ownerToolsErrorMessage = error.localizedDescription
+                gameOwnerErrorByID[game.id] = error.localizedDescription
                 break
             }
         }
@@ -2165,14 +2594,14 @@ final class AppState: ObservableObject {
         guard !promotedNames.isEmpty else { return }
 
         if promotedNames.count == 1 {
-            ownerToolsInfoMessage = "\(promotedNames[0]) was auto-promoted from the waitlist."
+            gameOwnerInfoByID[game.id] = "\(promotedNames[0]) was auto-promoted from the waitlist."
         } else {
-            ownerToolsInfoMessage = "Auto-promoted \(promotedNames.count) players from the waitlist."
+            gameOwnerInfoByID[game.id] = "Auto-promoted \(promotedNames.count) players from the waitlist."
         }
 
         await refreshAttendees(for: game)
         await refreshGames(for: club)
-        await refreshBookings()
+        await refreshBookings(silent: true)
     }
 
     private func bookingStateIsConfirmed(_ state: BookingState) -> Bool {
@@ -2208,10 +2637,11 @@ final class AppState: ObservableObject {
         }
 
         do {
-            let scheduledDate = try await LocalNotificationManager.shared.scheduleGameReminder(for: game)
+            let clubName = clubs.first(where: { $0.id == game.clubID })?.name ?? ""
+            _ = try await LocalNotificationManager.shared.scheduleGameReminder(for: game, clubName: clubName)
             scheduleStore.reminderGameIDs.insert(game.id)
             scheduleStore.persistReminderGameIDs()
-            bookingInfoMessage = "Reminder set for \(scheduledDate.formatted(date: .omitted, time: .shortened))."
+            bookingInfoMessage = "Reminder set — you'll be notified 1 hour before the game."
         } catch {
             bookingInfoMessage = error.localizedDescription
         }
@@ -2236,7 +2666,9 @@ final class AppState: ObservableObject {
 
         do {
             let clubName = clubs.first(where: { $0.id == game.clubID })?.name
-            let eventID = try await LocalCalendarManager.shared.addGameToCalendar(game: game, clubName: clubName)
+            let venues = clubVenuesByClubID[game.clubID] ?? []
+            let resolvedVenue = LocationService.resolvedVenue(for: game, venues: venues)
+            let eventID = try await LocalCalendarManager.shared.addGameToCalendar(game: game, clubName: clubName, resolvedVenue: resolvedVenue)
             scheduleStore.calendarEventIDsByGameID[game.id] = eventID
             scheduleStore.calendarGameIDs.insert(game.id)
             scheduleStore.persistCalendarGameIDs()
@@ -2304,12 +2736,28 @@ final class AppState: ObservableObject {
     }
 
     private func postAuthenticationBootstrap() async {
+        isPerformingPostSignInBootstrap = true
+        defer { isPerformingPostSignInBootstrap = false }
         await refreshClubs()
         await loadProfileFromBackendIfAvailable()
         await refreshMemberships()
-        await refreshBookings()
+        await refreshBookings(silent: true)
+        await refreshUpcomingGames()
         await refreshNotifications()
         await prepareClubChatPushNotificationsIfNeeded()
+        // Flush any push token that arrived before auth was ready (common on first launch / session restore).
+        await flushPendingPushTokenIfNeeded()
+    }
+
+    private func flushPendingPushTokenIfNeeded() async {
+        guard let userID = authUserID, let token = remotePushTokenHex else { return }
+        do {
+            try await withAuthRetry {
+                try await self.dataProvider.updateProfilePushToken(userID: userID, pushToken: token)
+            }
+        } catch {
+            // Non-fatal — local notifications still work.
+        }
     }
 
     // MARK: - In-App Notifications
@@ -2341,6 +2789,47 @@ final class AppState: ObservableObject {
         try? await dataProvider.markAllNotificationsRead(userID: userID)
     }
 
+    func clearAllNotifications() async {
+        guard let userID = authUserID else { return }
+        notifications = []
+        try? await dataProvider.deleteAllNotifications(userID: userID)
+    }
+
+    func submitReview(gameID: UUID, rating: Int, comment: String?) async throws {
+        guard let userID = authUserID else { return }
+        try await dataProvider.submitReview(gameID: gameID, userID: userID, rating: rating, comment: comment)
+    }
+
+    /// Resolves the club for a game ID. Checks memory caches first; falls back to a
+    /// lightweight DB fetch of just club_id. Safe to call from a Task during sheet open.
+    func clubForGame(gameID: UUID) async -> Club? {
+        // 1. Check upcoming games cache
+        for (clubID, games) in gamesByClubID {
+            if games.contains(where: { $0.id == gameID }) {
+                return clubs.first { $0.id == clubID }
+            }
+        }
+        // 2. Check bookings cache (includes past games)
+        if let game = bookings.first(where: { $0.booking.gameID == gameID })?.game {
+            return clubs.first { $0.id == game.clubID }
+        }
+        // 3. Fetch club_id from DB (past game not cached anywhere)
+        guard let clubID = try? await dataProvider.fetchGameClubID(gameID: gameID) else { return nil }
+        return clubs.first { $0.id == clubID }
+    }
+
+    func fetchReviews(for clubID: UUID) async {
+        guard !loadingReviewsClubIDs.contains(clubID) else { return }
+        loadingReviewsClubIDs.insert(clubID)
+        do {
+            let reviews = try await dataProvider.fetchClubReviews(clubID: clubID)
+            reviewsByClubID[clubID] = reviews
+        } catch {
+            // Silently fail — reviews are non-critical; section stays hidden
+        }
+        loadingReviewsClubIDs.remove(clubID)
+    }
+
     private func loadProfileFromBackendIfAvailable() async {
         guard authState == .signedIn, let userID = authUserID else { return }
         do {
@@ -2365,6 +2854,11 @@ final class AppState: ObservableObject {
                     avatarPresetID: profile?.avatarPresetID
                 )
                 authEmail = fetchedProfile.email
+                // Sync Supabase DUPR value → UserDefaults so admin-applied updates
+                // are reflected on the member's device after next profile load.
+                if let rating = fetchedProfile.duprRating {
+                    _ = saveDUPRRatings(doubles: rating, singles: duprSinglesRating)
+                }
             }
         } catch {
             // Avoid blocking the UI; auth is valid even if profile row is missing.
@@ -2389,7 +2883,9 @@ final class AppState: ObservableObject {
             let updated = try await withAuthRetry { try await self.dataProvider.patchProfile(current) }
             profile = updated
             if let rating = duprRating {
-                appendDUPREntry(rating: rating, context: "Manual update")
+                // Keep UserDefaults DUPR store in sync with the Supabase value.
+                // Preserve the existing singles rating; only update doubles.
+                _ = saveDUPRRatings(doubles: rating, singles: duprSinglesRating)
             }
         } catch {
             profileSaveErrorMessage = AppCopy.friendlyError(error.localizedDescription)
@@ -2445,7 +2941,6 @@ final class AppState: ObservableObject {
     private func normalizedClubDraftForSave(_ draft: ClubOwnerEditDraft) -> ClubOwnerEditDraft? {
         var normalizedDraft = draft
         normalizedDraft.name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        normalizedDraft.location = draft.location.trimmingCharacters(in: .whitespacesAndNewlines)
         normalizedDraft.description = draft.description.trimmingCharacters(in: .whitespacesAndNewlines)
         normalizedDraft.contactEmail = draft.contactEmail.trimmingCharacters(in: .whitespacesAndNewlines)
         normalizedDraft.website = draft.website.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2694,15 +3189,13 @@ final class AppState: ObservableObject {
     }
 
     private func persistClubNewsNotificationPreference() {
-        UserDefaults.standard.set(clubNewsNotificationsEnabled, forKey: StorageKeys.clubNewsNotificationsEnabled)
+        let mutedStrings = mutedClubChatIDs.map(\.uuidString)
+        UserDefaults.standard.set(mutedStrings, forKey: StorageKeys.clubNewsNotificationsEnabled)
     }
 
     private func restoreClubNewsNotificationPreference() {
-        if UserDefaults.standard.object(forKey: StorageKeys.clubNewsNotificationsEnabled) == nil {
-            clubNewsNotificationsEnabled = true
-        } else {
-            clubNewsNotificationsEnabled = UserDefaults.standard.bool(forKey: StorageKeys.clubNewsNotificationsEnabled)
-        }
+        let mutedStrings = UserDefaults.standard.stringArray(forKey: StorageKeys.clubNewsNotificationsEnabled) ?? []
+        mutedClubChatIDs = Set(mutedStrings.compactMap(UUID.init))
     }
 
     func appendDUPREntry(rating: Double, context: String? = nil) {
@@ -2762,7 +3255,7 @@ final class AppState: ObservableObject {
     }
 
     private func handleClubNewsNotificationsIfNeeded(club: Club, previousPosts: [ClubNewsPost], newPosts: [ClubNewsPost]) async {
-        guard clubNewsNotificationsEnabled else {
+        guard !mutedClubChatIDs.contains(club.id) else {
             seenClubNewsPostIDsByClubID[club.id] = Set(newPosts.map(\.id))
             seenClubNewsCommentIDsByClubID[club.id] = Set(newPosts.flatMap { $0.comments.map(\.id) })
             clubNewsPrimedClubIDs.insert(club.id)
@@ -2806,6 +3299,112 @@ final class AppState: ObservableObject {
                     body: "\(comment.authorName) replied: \(comment.content)"
                 )
             }
+        }
+    }
+
+    // MARK: - Club Venues
+
+    func venues(for club: Club) -> [ClubVenue] {
+        clubVenuesByClubID[club.id] ?? []
+    }
+
+    func refreshVenues(for club: Club) async {
+        loadingClubVenueIDs.insert(club.id)
+        defer { loadingClubVenueIDs.remove(club.id) }
+        do {
+            let fetched = try await withAuthRetry {
+                try await self.dataProvider.fetchClubVenues(clubID: club.id)
+            }
+            clubVenuesByClubID[club.id] = fetched
+        } catch {
+            telemetryLogger.error("fetchClubVenues failed: \(error.localizedDescription)")
+        }
+    }
+
+    func createVenue(for club: Club, draft: ClubVenueDraft) async -> Bool {
+        ownerToolsErrorMessage = nil
+        let tempID = UUID()
+        savingClubVenueIDs.insert(tempID)
+        defer { savingClubVenueIDs.remove(tempID) }
+        // Geocode the address before saving. On failure, coordinates stay nil
+        // and the venue is saved in an unresolved state — does not block the save.
+        let geocoded = await LocationService.geocode(draft: draft)
+        do {
+            let venue = try await withAuthRetry {
+                try await self.dataProvider.createClubVenue(
+                    clubID: club.id,
+                    draft: draft,
+                    latitude: geocoded?.coordinate.latitude,
+                    longitude: geocoded?.coordinate.longitude
+                )
+            }
+            var current = clubVenuesByClubID[club.id] ?? []
+            current.append(venue)
+            current.sort { ($0.isPrimary && !$1.isPrimary) || ($0.venueName < $1.venueName && $0.isPrimary == $1.isPrimary) }
+            clubVenuesByClubID[club.id] = current
+            // Propagate primary venue coordinates to the club row so it appears on the explore map.
+            if draft.isPrimary, let lat = venue.latitude, let lng = venue.longitude {
+                try? await withAuthRetry {
+                    try await self.dataProvider.updateClubCoordinates(clubID: club.id, latitude: lat, longitude: lng)
+                }
+                await refreshClubs()
+            }
+            return true
+        } catch {
+            ownerToolsErrorMessage = "Could not save venue: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func updateVenue(for club: Club, venue: ClubVenue, draft: ClubVenueDraft) async -> Bool {
+        ownerToolsErrorMessage = nil
+        savingClubVenueIDs.insert(venue.id)
+        defer { savingClubVenueIDs.remove(venue.id) }
+        // Re-geocode only when the address changed. On failure the coordinates
+        // are set to nil (stale coords cleared). Address unchanged → coords preserved.
+        var geocodedLat: Double? = nil
+        var geocodedLng: Double? = nil
+        if draft.locationChanged {
+            let geocoded = await LocationService.geocode(draft: draft)
+            geocodedLat = geocoded?.coordinate.latitude
+            geocodedLng = geocoded?.coordinate.longitude
+        }
+        do {
+            let updated = try await withAuthRetry {
+                try await self.dataProvider.updateClubVenue(
+                    venueID: venue.id,
+                    draft: draft,
+                    latitude: geocodedLat,
+                    longitude: geocodedLng,
+                    updateCoordinates: draft.locationChanged
+                )
+            }
+            var current = clubVenuesByClubID[club.id] ?? []
+            if let idx = current.firstIndex(where: { $0.id == venue.id }) {
+                current[idx] = updated
+            }
+            current.sort { ($0.isPrimary && !$1.isPrimary) || ($0.venueName < $1.venueName && $0.isPrimary == $1.isPrimary) }
+            clubVenuesByClubID[club.id] = current
+            return true
+        } catch {
+            ownerToolsErrorMessage = "Could not update venue: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func deleteVenue(for club: Club, venue: ClubVenue) async -> Bool {
+        ownerToolsErrorMessage = nil
+        deletingClubVenueIDs.insert(venue.id)
+        defer { deletingClubVenueIDs.remove(venue.id) }
+        do {
+            try await withAuthRetry {
+                try await self.dataProvider.deleteClubVenue(venueID: venue.id)
+            }
+            clubVenuesByClubID[club.id]?.removeAll { $0.id == venue.id }
+            return true
+        } catch {
+            ownerToolsErrorMessage = "Could not delete venue: \(error.localizedDescription)"
+            return false
         }
     }
 }

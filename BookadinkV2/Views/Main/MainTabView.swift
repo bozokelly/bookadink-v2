@@ -1,6 +1,7 @@
 import SwiftUI
 
 enum AppTab: Hashable {
+    case home
     case clubs
     case bookings
     case notifications
@@ -9,12 +10,20 @@ enum AppTab: Hashable {
 
 struct MainTabView: View {
     @EnvironmentObject private var appState: AppState
-    @State private var selectedTab: AppTab = .clubs
+    @State private var selectedTab: AppTab = .home
     @State private var deepLinkClub: Club? = nil
     @State private var deepLinkGame: Game? = nil
 
     var body: some View {
         TabView(selection: $selectedTab) {
+            NavigationStack {
+                HomeView(selectedTab: $selectedTab)
+            }
+            .tabItem {
+                Label("Home", systemImage: "house.fill")
+            }
+            .tag(AppTab.home)
+
             NavigationStack {
                 ClubsListView(clubs: appState.clubs)
                     .navigationDestination(item: $deepLinkClub) { club in
@@ -51,7 +60,11 @@ struct MainTabView: View {
             }
             .tag(AppTab.profile)
         }
-        .tint(Brand.brandPrimary)
+        .tint(Brand.primaryText)
+        // Force traditional bottom tab bar on all devices including iPad iOS 18+,
+        // which defaults to a sidebar/top-bar layout when no explicit style is set.
+        .tabViewStyle(DefaultTabViewStyle())
+        .toolbarBackground(.visible, for: .tabBar)
         .sheet(item: $deepLinkGame) { game in
             NavigationStack {
                 GameDetailView(game: game)
@@ -60,6 +73,9 @@ struct MainTabView: View {
         .onChange(of: appState.pendingDeepLink) { _, link in
             guard let link else { return }
             handleDeepLink(link)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .bookADinkOpenNotificationsTab)) { _ in
+            selectedTab = .notifications
         }
     }
 
@@ -75,11 +91,14 @@ struct MainTabView: View {
             }
         case .game(let id):
             guard let game = appState.gamesByClubID.values.flatMap({ $0 }).first(where: { $0.id == id }) else { return }
-            selectedTab = .clubs
+            // Game sheet is presented at MainTabView level, no tab switch needed
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 deepLinkGame = game
                 appState.pendingDeepLink = nil
             }
+        case .review:
+            // Review prompts are handled inline in NotificationsView — no tab switch needed
+            appState.pendingDeepLink = nil
         }
     }
 }

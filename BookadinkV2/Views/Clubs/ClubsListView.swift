@@ -8,6 +8,7 @@ struct ClubsListView: View {
     @State private var selectedFilter: ClubsFilter = .myClubs
     @State private var isShowingCreateClubSheet = false
     @State private var createdClubNavigationTarget: Club? = nil
+    @AppStorage("clubs_tip_dismissed") private var tipDismissed = false
 
     // FIX (Performance): Single-pass filter combining membership + search,
     // and a single reduce for header counts — avoids redundant array traversals.
@@ -41,7 +42,7 @@ struct ClubsListView: View {
                     HStack(alignment: .center) {
                         Text("Clubs")
                             .font(.system(size: 32, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(Brand.primaryText)
                         Spacer()
                         if appState.authState == .signedIn {
                             Button {
@@ -49,7 +50,7 @@ struct ClubsListView: View {
                             } label: {
                                 Image(systemName: "plus.circle.fill")
                                     .font(.system(size: 24, weight: .semibold))
-                                    .foregroundStyle(.white)
+                                    .foregroundStyle(Brand.primaryText)
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("Create new club")
@@ -57,7 +58,9 @@ struct ClubsListView: View {
                     }
                     .padding(.horizontal, 4)
 
-                    header
+                    if !tipDismissed {
+                        iPadTipBanner
+                    }
 
                     if let error = appState.clubsLoadErrorMessage, !appState.isUsingLiveClubData {
                         HStack(spacing: 8) {
@@ -65,7 +68,7 @@ struct ClubsListView: View {
                             Text("Using preview data. \(AppCopy.friendlyError(error))")
                         }
                         .font(.footnote)
-                        .foregroundStyle(Color.white.opacity(0.92))
+                        .foregroundStyle(Brand.secondaryText)
                         .padding(.horizontal, 6)
                     }
 
@@ -82,7 +85,8 @@ struct ClubsListView: View {
                                 ClubRowCard(
                                     club: club,
                                     membershipState: appState.membershipState(for: club),
-                                    isAdmin: appState.isClubAdmin(for: club)
+                                    isAdmin: appState.isClubAdmin(for: club),
+                                    isOwner: appState.isClubOwner(for: club)
                                 )
                             }
                             .buttonStyle(.plain)
@@ -112,19 +116,40 @@ struct ClubsListView: View {
 
     // MARK: - Subviews
 
-    private var header: some View {
-        let firstName = appState.profile?.fullName.components(separatedBy: " ").first ?? "Player"
-        return Text("Hey, \(firstName) 👋")
-            .font(.headline.weight(.bold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 4)
-            .padding(.vertical, 6)
+    @ViewBuilder
+    private var iPadTipBanner: some View {
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            HStack(spacing: 10) {
+                Image(systemName: "hand.tap")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(Brand.secondaryText)
+                Text("Tap any club to view details, book games, or manage members.")
+                    .font(.footnote)
+                    .foregroundStyle(Brand.primaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        tipDismissed = true
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Brand.secondaryText)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss tip")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .glassCard(cornerRadius: 16, tint: Brand.cardBackground)
+            .transition(.opacity.combined(with: .move(edge: .top)))
+        }
     }
 
     private var searchField: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(Brand.pineTeal)
+                .foregroundStyle(Brand.secondaryText)
             TextField("Search clubs or location", text: $searchText)
                 .textInputAutocapitalization(.words)
             if !searchText.isEmpty {
@@ -132,7 +157,7 @@ struct ClubsListView: View {
                     searchText = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(Brand.mutedText)
+                        .foregroundStyle(Brand.secondaryText)
                 }
                 .buttonStyle(.plain)
                 // FIX (Accessibility): Label clear button for VoiceOver.
@@ -141,7 +166,7 @@ struct ClubsListView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .glassCard(cornerRadius: 20, tint: Color.white.opacity(0.5))
+        .glassCard(cornerRadius: 20, tint: Brand.cardBackground)
     }
 
     private var segmentBar: some View {
@@ -165,15 +190,15 @@ struct ClubsListView: View {
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass.circle")
                     .font(.system(size: 28))
-                    .foregroundStyle(Brand.pineTeal)
+                    .foregroundStyle(Brand.secondaryText)
                 Text("No clubs match your filters")
                     .font(.headline)
-                    .foregroundStyle(Brand.ink)
+                    .foregroundStyle(Brand.primaryText)
             }
 
             Text("Try clearing the search or switching to Explore.")
                 .font(.subheadline)
-                .foregroundStyle(Brand.mutedText)
+                .foregroundStyle(Brand.secondaryText)
 
             HStack(spacing: 10) {
                 Button {
@@ -181,13 +206,13 @@ struct ClubsListView: View {
                 } label: {
                     Text("Clear Search")
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(Brand.pineTeal)
+                        .foregroundStyle(Brand.primaryText)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
-                        .background(Color.white.opacity(0.92), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .actionBorder(cornerRadius: 12, color: Brand.slateBlue.opacity(0.22))
+                .actionBorder(cornerRadius: 12, color: Brand.softOutline)
 
                 Button {
                     selectedFilter = .explore
@@ -197,15 +222,14 @@ struct ClubsListView: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
-                        .background(Brand.slateBlue, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .background(Brand.primaryText, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .actionBorder(cornerRadius: 12, color: Brand.lightCyan.opacity(0.45))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
-        .glassCard(cornerRadius: 20, tint: Color.white.opacity(0.62))
+        .glassCard(cornerRadius: 20, tint: Brand.cardBackground)
     }
 
     // MARK: - Filter Logic
@@ -213,6 +237,8 @@ struct ClubsListView: View {
     private func matchesSearch(_ club: Club) -> Bool {
         guard !searchText.isEmpty else { return true }
         return club.name.localizedCaseInsensitiveContains(searchText) ||
+            (club.venueName?.localizedCaseInsensitiveContains(searchText) == true) ||
+            (club.suburb?.localizedCaseInsensitiveContains(searchText) == true) ||
             club.city.localizedCaseInsensitiveContains(searchText) ||
             club.region.localizedCaseInsensitiveContains(searchText) ||
             club.address.localizedCaseInsensitiveContains(searchText)
@@ -247,97 +273,33 @@ private struct StartClubSheet: View {
     @State private var showCreateSuccess = false
     @State private var pendingDismissTask: Task<Void, Never>?
 
-    // FIX (Code Quality): Inline field validation errors for better UX.
-    @State private var emailError: String? = nil
-    @State private var websiteError: String? = nil
+    /// Local draft for the first venue — not saved to DB until club is created.
+    @State private var pendingVenue: ClubVenueDraft? = nil
+    /// Working copy while the venue form is open; committed on save.
+    @State private var editingVenueDraft = ClubVenueDraft()
+    @State private var showVenueForm = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Club") {
-                    TextField("Club Name", text: $draft.name)
-                    TextField("Location", text: $draft.location, axis: .vertical)
-                        .lineLimit(2...3)
-                    Toggle("Require Approval To Join", isOn: $draft.membersOnly)
-                }
-
-                Section("Club Profile Picture") {
-                    Text("Choose one of 9 profile pictures.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    LazyVGrid(
-                        columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3),
-                        spacing: 8
-                    ) {
-                        ForEach(ClubProfileImagePresets.all) { preset in
-                            Button {
-                                draft.profilePicturePresetID = preset.id
-                            } label: {
-                                VStack(spacing: 6) {
-                                    ProfileAvatarArtwork(preset: preset)
-                                        .frame(height: 72)
-
-                                    Text(preset.name)
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(2)
-                                        .multilineTextAlignment(.center)
-                                        .minimumScaleFactor(0.8)
-                                        .frame(maxWidth: .infinity, minHeight: 20, alignment: .top)
-                                }
-                                .padding(6)
-                                .frame(maxWidth: .infinity)
-                                .background(tileBackground(isSelected: draft.profilePicturePresetID == preset.id))
-                                .overlay(tileBorder(isSelected: draft.profilePicturePresetID == preset.id))
-                            }
-                            .buttonStyle(.plain)
-                        }
+                ClubFormBody(
+                    draft: $draft,
+                    club: nil,
+                    pendingVenue: pendingVenue,
+                    onAddPendingVenue: {
+                        editingVenueDraft = ClubVenueDraft()
+                        editingVenueDraft.isPrimary = true
+                        showVenueForm = true
+                    },
+                    onEditPendingVenue: {
+                        editingVenueDraft = pendingVenue ?? ClubVenueDraft()
+                        editingVenueDraft.isPrimary = true
+                        showVenueForm = true
+                    },
+                    onRemovePendingVenue: {
+                        pendingVenue = nil
                     }
-                }
-
-                Section("Contact") {
-                    // FIX (Code Quality): Validate email format inline.
-                    VStack(alignment: .leading, spacing: 4) {
-                        TextField("Contact Email", text: $draft.contactEmail)
-                            .keyboardType(.emailAddress)
-                            .textInputAutocapitalization(.never)
-                            .onChange(of: draft.contactEmail) { _, new in
-                                emailError = (!new.isEmpty && !new.contains("@"))
-                                    ? "Enter a valid email address"
-                                    : nil
-                            }
-                        if let emailError {
-                            Text(emailError)
-                                .font(.caption)
-                                .foregroundStyle(Brand.errorRed)
-                        }
-                    }
-
-                    TextField("Manager Name", text: $draft.managerName)
-
-                    // FIX (Code Quality): Validate URL format inline.
-                    VStack(alignment: .leading, spacing: 4) {
-                        TextField("Website", text: $draft.website)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .onChange(of: draft.website) { _, new in
-                                websiteError = (!new.isEmpty && URL(string: new) == nil)
-                                    ? "Enter a valid URL (e.g. https://myclub.com)"
-                                    : nil
-                            }
-                        if let websiteError {
-                            Text(websiteError)
-                                .font(.caption)
-                                .foregroundStyle(Brand.errorRed)
-                        }
-                    }
-                }
-
-                Section("Description") {
-                    TextField("About the club", text: $draft.description, axis: .vertical)
-                        .lineLimit(4...8)
-                }
+                )
 
                 if showCreateSuccess {
                     Section {
@@ -349,8 +311,7 @@ private struct StartClubSheet: View {
 
                 if let error = appState.ownerToolsErrorMessage, !error.isEmpty {
                     Section {
-                        Text(error)
-                            .foregroundStyle(Brand.errorRed)
+                        Text(error).foregroundStyle(Brand.errorRed)
                     }
                 }
             }
@@ -360,33 +321,32 @@ private struct StartClubSheet: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") { dismiss() }
                 }
-
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         Task {
                             showCreateSuccess = false
                             guard let created = await appState.createClub(draft: draft) else { return }
 
+                            // Create the first venue, ensuring it is marked primary
+                            if var venueDraft = pendingVenue {
+                                venueDraft.isPrimary = true
+                                _ = await appState.createVenue(for: created, draft: venueDraft)
+                            }
+
                             showCreateSuccess = true
                             onCreated(created)
-
                             pendingDismissTask?.cancel()
                             pendingDismissTask = Task {
                                 try? await Task.sleep(nanoseconds: 800_000_000)
                                 guard !Task.isCancelled else { return }
-                                await MainActor.run {
-                                    dismiss()
-                                }
+                                await MainActor.run { dismiss() }
                             }
                         }
                     } label: {
-                        if appState.isCreatingClub {
-                            ProgressView()
-                        } else {
-                            Text("Create")
-                                .fontWeight(.semibold)
-                        }
+                        if appState.isCreatingClub { ProgressView() }
+                        else { Text("Create").fontWeight(.semibold) }
                     }
+                    .buttonStyle(.plain)
                     .disabled(isCreateDisabled)
                 }
             }
@@ -394,31 +354,81 @@ private struct StartClubSheet: View {
                 appState.ownerToolsErrorMessage = nil
                 appState.ownerToolsInfoMessage = nil
             }
-            .onDisappear {
-                pendingDismissTask?.cancel()
+            .onDisappear { pendingDismissTask?.cancel() }
+            .sheet(isPresented: $showVenueForm) {
+                PendingVenueFormSheet(draft: $editingVenueDraft) {
+                    pendingVenue = editingVenueDraft
+                }
             }
         }
     }
 
-    // FIX (Code Quality): Validate email and URL in addition to name.
+    /// Create is blocked until: club name present + primary venue draft added.
+    /// Email and URL validated if provided.
     private var isCreateDisabled: Bool {
         let nameOK = !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let emailOK = draft.contactEmail.isEmpty || draft.contactEmail.contains("@")
         let urlOK = draft.website.isEmpty || URL(string: draft.website) != nil
-        return appState.isCreatingClub || !nameOK || !emailOK || !urlOK
+        let venueOK = pendingVenue != nil
+        return appState.isCreatingClub || !nameOK || !emailOK || !urlOK || !venueOK
     }
+}
 
-    private func tileBackground(isSelected: Bool) -> some View {
-        RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(isSelected ? Brand.emeraldAction.opacity(0.12) : Color.white.opacity(0.88))
-    }
+// MARK: - Pending Venue Form Sheet
 
-    private func tileBorder(isSelected: Bool) -> some View {
-        RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .stroke(
-                isSelected ? Brand.emeraldAction : Brand.slateBlue.opacity(0.14),
-                lineWidth: isSelected ? 2 : 1
-            )
+/// Captures the first venue draft during club creation.
+/// No DB operations — commits to the parent's state via `onSave`.
+private struct PendingVenueFormSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var draft: ClubVenueDraft
+    let onSave: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Venue Details") {
+                    TextField("Venue name", text: $draft.venueName)
+                    TextField("Street address", text: $draft.streetAddress)
+                    TextField("Suburb", text: $draft.suburb)
+                    HStack(spacing: 12) {
+                        TextField("State", text: $draft.state)
+                        TextField("Postcode", text: $draft.postcode)
+                            .keyboardType(.numberPad)
+                    }
+                    Picker("Country", selection: $draft.country) {
+                        Text("Australia").tag("Australia")
+                        Text("New Zealand").tag("New Zealand")
+                        Text("United States").tag("United States")
+                        Text("United Kingdom").tag("United Kingdom")
+                        Text("Canada").tag("Canada")
+                        Text("Other").tag("Other")
+                    }
+                    .pickerStyle(.menu)
+                }
+
+                Section {
+                    Text("This will be the club's primary venue — used for maps, directions, and distance.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Primary Venue")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        onSave()
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                    .buttonStyle(.plain)
+                    .disabled(draft.venueName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
     }
 }
 
@@ -444,10 +454,11 @@ private enum ClubsFilter: String, CaseIterable, Identifiable {
 
 // MARK: - Club Row Card
 
-private struct ClubRowCard: View {
+struct ClubRowCard: View {
     let club: Club
     let membershipState: ClubMembershipState
     let isAdmin: Bool
+    var isOwner: Bool = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
@@ -461,7 +472,7 @@ private struct ClubRowCard: View {
                     .lineSpacing(1)
                     .lineLimit(2)
 
-                Text(club.locationDisplay)
+                Text(club.addressLine1)
                     .font(.subheadline)
                     .foregroundStyle(Brand.mutedText)
                     .lineLimit(2)
@@ -474,13 +485,13 @@ private struct ClubRowCard: View {
                     Spacer(minLength: 8)
 
                     if isAdmin {
-                        badgeView(title: "Admin", fill: Brand.pineTeal, text: .white)
-                            .accessibilityLabel("Membership status: Admin")
+                        badgeView(title: isOwner ? "Owner" : "Admin", fill: Brand.primaryText, text: .white)
+                            .accessibilityLabel("Membership status: \(isOwner ? "Owner" : "Admin")")
                     } else if membershipState != .none {
                         badgeView(
                             title: badgeTitle(for: membershipState),
-                            fill: membershipState == .approved ? Brand.brandPrimary : Color.white.opacity(0.88),
-                            text: membershipState == .approved ? .white : Brand.brandPrimary
+                            fill: membershipState == .approved ? Brand.primaryText : Brand.secondarySurface,
+                            text: membershipState == .approved ? .white : Brand.primaryText
                         )
                         .accessibilityLabel("Membership status: \(badgeTitle(for: membershipState))")
                     }
@@ -514,7 +525,7 @@ private struct ClubRowCard: View {
 
 // MARK: - Club Image Badge
 
-private struct ClubImageBadge: View {
+struct ClubImageBadge: View {
     let club: Club
 
     var body: some View {
@@ -523,7 +534,7 @@ private struct ClubImageBadge: View {
                 ProfileAvatarArtwork(preset: preset, variant: .club)
             } else {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Brand.brandPrimaryDark.opacity(0.95))
+                    .fill(Brand.secondarySurface)
             }
 
             if let url = club.imageURL,
@@ -539,10 +550,10 @@ private struct ClubImageBadge: View {
                     // and only show the fallback icon on actual failure.
                     case .empty:
                         RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .fill(Brand.brandPrimaryDark.opacity(0.4))
+                            .fill(Brand.secondarySurface)
                             .overlay(
                                 ProgressView()
-                                    .tint(.white.opacity(0.4))
+                                    .tint(Brand.secondaryText)
                             )
                     case .failure:
                         fallbackIcon

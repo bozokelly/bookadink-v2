@@ -1,51 +1,64 @@
 import SwiftUI
 
 enum Brand {
-    // Core palette
-    static let brandPrimary = Color(hex: "4F6FA3")      // Slate Blue (requested)
-    static let brandPrimaryDark = Color(hex: "425E8B")
-    static let brandPrimaryDarker = Color(hex: "334C74")
-    static let brandPrimaryLight = Color(hex: "6F8FC0")
-    static let powderBlue = Color(hex: "98C1D9")
-    static let lightCyan = Color(hex: "E0FBFC")
+    // ── Core premium off-white palette ────────────────────────────────────────
+    static let appBackground    = Color(hex: "F7F7F4")   // warm off-white screen background
+    static let cardBackground   = Color.white             // card surface
+    static let secondarySurface = Color(hex: "F1F1EC")   // secondary / hover surface
+    static let primaryText      = Color(hex: "111111")   // near-black heading + body
+    static let secondaryText    = Color(hex: "6B7280")   // muted grey metadata
+    static let tertiaryText     = Color(hex: "9CA3AF")   // lighter muted labels
+    static let dividerColor     = Color(hex: "E7E5E4")   // dividers
+    static let darkOutline      = Color(hex: "111111")   // strong black outline
+    static let softOutline      = Color(hex: "D6D3D1")   // subtle neutral outline
 
-    static let emeraldAction = Color(hex: "2ECC71")
-    static let softOrangeAccent = Color(hex: "FFA500")
-    static let errorRed = Color(hex: "E85C5C")
+    // Signature neon-lime accent — 5–10% usage only (dots, underlines, micro-accents)
+    static let accentGreen      = Color(hex: "C3FF45")
 
-    // Frosted surfaces
-    static let frostedSurface = Color.white.opacity(0.20)
-    static let frostedSurfaceStrong = Color.white.opacity(0.26)
-    static let frostedSurfaceSoft = Color.white.opacity(0.16)
-    static let frostedBorder = Color.white.opacity(0.18)
+    // ── Preserved legacy token names (updated to neutral values) ────────────
+    // These keep all existing call sites compiling while shifting the palette.
+    static let brandPrimary       = primaryText
+    static let brandPrimaryDark   = primaryText
+    static let brandPrimaryDarker = primaryText
+    static let brandPrimaryLight  = secondaryText
+    static let powderBlue         = softOutline
+    static let lightCyan          = appBackground
 
-    // Backward-compatible aliases used across the app (progressively migrating).
-    static let slateBlue = brandPrimary
-    static let slateBlueLight = brandPrimaryLight
-    static let slateBlueDark = brandPrimaryDarker
-    static let coralBlaze = errorRed
-    static let spicyOrange = softOrangeAccent
-    static let pineTeal = brandPrimaryDark
-    static let rosyTaupe = powderBlue
+    // Form / destructive CTA buttons (EditProfileSheet, etc.) stay green.
+    static let emeraldAction      = Color(hex: "2ECC71")
+    static let softOrangeAccent   = Color(hex: "FFA500")
+    static let errorRed           = Color(hex: "E85C5C")
 
-    static let ink = brandPrimaryDarker
-    static let cream = lightCyan
-    static let softCard = lightCyan.opacity(0.72)
-    static let mutedText = brandPrimaryLight
+    // ── Frosted surface aliases → solid clean surfaces ────────────────────────
+    static let frostedSurface       = cardBackground
+    static let frostedSurfaceStrong = cardBackground
+    static let frostedSurfaceSoft   = secondarySurface
+    static let frostedBorder        = softOutline
 
+    // ── Semantic aliases (consumed throughout the app) ────────────────────────
+    static let slateBlue      = primaryText
+    static let slateBlueLight = secondaryText
+    static let slateBlueDark  = primaryText
+    static let coralBlaze     = errorRed
+    static let spicyOrange    = softOrangeAccent
+    static let pineTeal       = primaryText      // was teal → now clean dark neutral
+    static let rosyTaupe      = softOutline
+
+    static let ink       = primaryText      // was dark navy → near-black
+    static let cream     = appBackground    // was light cyan → warm off-white
+    static let softCard  = secondarySurface
+    static let mutedText = secondaryText    // was light blue → muted grey
+
+    // ── Page background (flat off-white — no blue gradient) ──────────────────
     static let pageGradient = LinearGradient(
-        colors: [
-            brandPrimaryDarker,
-            brandPrimaryDark,
-            brandPrimary,
-            brandPrimaryLight.opacity(0.9)
-        ],
+        colors: [appBackground, appBackground],
         startPoint: .top,
         endPoint: .bottom
     )
 
+    // Kept as a token for any future use; now neutral dark-to-secondary
     static let accentGradient = LinearGradient(
-        colors: [emeraldAction, brandPrimaryLight],
+        colors: [primaryText, secondaryText],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )

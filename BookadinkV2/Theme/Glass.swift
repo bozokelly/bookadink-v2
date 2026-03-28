@@ -1,81 +1,72 @@
 import SwiftUI
 
+// MARK: - Card
+
 struct GlassCardStyle: ViewModifier {
     var cornerRadius: CGFloat = 24
-    var tint: Color = Brand.frostedSurface
-    var strokeOpacity: Double = 0.18
+    var tint: Color = Brand.cardBackground
 
     func body(content: Content) -> some View {
         content
             .background(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(.ultraThinMaterial)
+                    .fill(tint)
                     .overlay(
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .fill(tint)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .stroke(Color.white.opacity(strokeOpacity), lineWidth: 1)
+                            .stroke(Brand.softOutline, lineWidth: 1)
                     )
             )
-            .shadow(color: Brand.brandPrimaryDarker.opacity(0.12), radius: 14, x: 0, y: 8)
-            .shadow(color: Color.black.opacity(0.04), radius: 3, x: 0, y: 1)
+            .shadow(color: Color.black.opacity(0.06), radius: 8, x: 0, y: 2)
     }
 }
+
+// MARK: - Primary CTA Button (dark fill, white label)
 
 struct PrimaryCTAButtonStyle: ButtonStyle {
     var cornerRadius: CGFloat = 16
 
     func makeBody(configuration: Configuration) -> some View {
         let isPressed = configuration.isPressed
-        let fillColor = Brand.emeraldAction.opacity(isPressed ? 0.9 : 1)
-        let shadowColor = Brand.emeraldAction.opacity(isPressed ? 0.12 : 0.22)
-        let shadowRadius: CGFloat = isPressed ? 6 : 10
-        let shadowY: CGFloat = isPressed ? 3 : 6
 
         return configuration.label
             .foregroundStyle(.white)
             .background(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(fillColor)
+                    .fill(Brand.primaryText.opacity(isPressed ? 0.82 : 1.0))
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(Color.white.opacity(0.16), lineWidth: 1)
-            )
-            .shadow(color: shadowColor, radius: shadowRadius, x: 0, y: shadowY)
             .scaleEffect(isPressed ? 0.98 : 1)
             .animation(.easeOut(duration: 0.12), value: isPressed)
     }
 }
+
+// MARK: - Secondary Button (white surface, dark outline)
 
 struct SecondaryFrostedButtonStyle: ButtonStyle {
     var cornerRadius: CGFloat = 16
 
     func makeBody(configuration: Configuration) -> some View {
         let isPressed = configuration.isPressed
-        let foreground = Color.white.opacity(isPressed ? 0.9 : 1)
-        let fill = Color.white.opacity(isPressed ? 0.16 : 0.20)
+        let foreground = Brand.primaryText.opacity(isPressed ? 0.7 : 1.0)
 
         return configuration.label
             .foregroundStyle(foreground)
             .background(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(fill)
+                    .fill(Brand.cardBackground)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    .stroke(Brand.softOutline, lineWidth: 1)
             )
-            .shadow(color: Brand.brandPrimaryDarker.opacity(0.08), radius: 8, x: 0, y: 4)
             .scaleEffect(isPressed ? 0.99 : 1)
             .animation(.easeOut(duration: 0.12), value: isPressed)
     }
 }
 
+// MARK: - View Extensions
+
 extension View {
-    func glassCard(cornerRadius: CGFloat = 24, tint: Color = Brand.frostedSurface) -> some View {
+    func glassCard(cornerRadius: CGFloat = 24, tint: Color = Brand.cardBackground) -> some View {
         modifier(GlassCardStyle(cornerRadius: cornerRadius, tint: tint))
     }
 
@@ -86,10 +77,11 @@ extension View {
         )
     }
 
+    /// Segment / tab pill — active: dark fill + white label; inactive: outline only.
     func segmentPillStyle(active: Bool, cornerRadius: CGFloat = 18) -> some View {
-        let foreground: Color = active ? .white : Color.white.opacity(0.68)
-        let fill = active ? Brand.brandPrimaryLight.opacity(0.88) : Color.white.opacity(0.14)
-        let stroke = active ? Color.white.opacity(0.26) : Color.white.opacity(0.16)
+        let foreground: Color = active ? .white : Brand.secondaryText
+        let fill: Color       = active ? Brand.primaryText : Color.clear
+        let stroke: Color     = active ? Color.clear : Brand.softOutline
 
         return self
             .font(.callout.weight(.semibold))
@@ -106,13 +98,12 @@ extension View {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .stroke(stroke, lineWidth: 1)
             )
-            .shadow(color: active ? Brand.brandPrimaryDarker.opacity(0.12) : .clear, radius: 8, x: 0, y: 3)
     }
 
+    /// Filter chip — selected: secondary surface fill; unselected: outline only.
     func filterChipStyle(selected: Bool, cornerRadius: CGFloat = 12) -> some View {
-        let foreground = selected ? Color.white : Brand.brandPrimaryDarker
-        let fill = selected ? Brand.brandPrimary.opacity(0.9) : Color.white.opacity(0.78)
-        let stroke = selected ? Color.white.opacity(0.18) : Brand.brandPrimary.opacity(0.14)
+        let foreground: Color = selected ? Brand.primaryText : Brand.secondaryText
+        let fill: Color       = selected ? Brand.secondarySurface : Color.clear
 
         return self
             .font(.caption.weight(.semibold))
@@ -127,7 +118,7 @@ extension View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(stroke, lineWidth: 1)
+                    .stroke(Brand.softOutline, lineWidth: 1)
             )
     }
 
@@ -137,11 +128,11 @@ extension View {
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(Brand.errorRed.opacity(0.12))
+                    .fill(Brand.errorRed.opacity(0.08))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(Brand.errorRed.opacity(0.25), lineWidth: 1)
+                    .stroke(Brand.errorRed.opacity(0.22), lineWidth: 1)
             )
     }
 }

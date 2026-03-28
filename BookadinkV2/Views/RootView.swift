@@ -3,11 +3,12 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject private var appState: AppState
     @State private var hasCompletedOnboarding: Bool = false
+    @State private var splashComplete: Bool = false
 
     private var isBootstrapping: Bool {
         appState.authState != .signedOut
-            && !appState.isInitialBootstrapComplete
             && appState.profile == nil
+            && (!appState.isInitialBootstrapComplete || appState.isPerformingPostSignInBootstrap)
     }
 
     private var onboardingKey: String {
@@ -50,6 +51,18 @@ struct RootView: View {
         .animation(.easeInOut(duration: 0.55), value: appState.authState == .signedOut)
         .animation(.easeInOut(duration: 0.55), value: appState.profile == nil)
         .animation(.easeInOut(duration: 0.55), value: hasCompletedOnboarding)
+        .overlay {
+            if !splashComplete {
+                SplashView {
+                    withAnimation(.easeOut(duration: 0.4)) {
+                        splashComplete = true
+                    }
+                }
+                .ignoresSafeArea()
+                .transition(.opacity)
+                .zIndex(10)
+            }
+        }
         .onChange(of: appState.authUserID) { _, newID in
             guard let id = newID else { return }
             let key = "bookadink.onboarding.complete.\(id.uuidString)"

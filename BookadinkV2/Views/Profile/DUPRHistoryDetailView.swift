@@ -20,7 +20,7 @@ struct DUPRHistoryDetailView: View {
                         .foregroundStyle(.white)
                     Text("Update your DUPR rating to start tracking.")
                         .font(.subheadline)
-                        .foregroundStyle(Color.white.opacity(0.7))
+                        .foregroundStyle(Brand.secondaryText)
                         .multilineTextAlignment(.center)
                 }
                 .padding(32)
@@ -54,7 +54,7 @@ struct DUPRHistoryDetailView: View {
                                 }
                             }
                             .padding(14)
-                            .glassCard(cornerRadius: 16, tint: Color.white.opacity(0.65))
+                            .glassCard(cornerRadius: 16, tint: Brand.cardBackground)
                         }
                     }
                     .padding(.horizontal, 16)

@@ -1,0 +1,12 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <!-- Back paddle: outline, rotated +28° -->
+  <g transform="translate(50,48) rotate(28)">
+    <rect x="-22" y="-32" width="44" height="46" rx="22" fill="white" stroke="#111111" stroke-width="4"/>
+    <rect x="-10" y="12" width="20" height="26" rx="6" fill="white" stroke="#111111" stroke-width="4"/>
+  </g>
+  <!-- Front paddle: filled, rotated -28° -->
+  <g transform="translate(50,48) rotate(-28)">
+    <rect x="-22" y="-32" width="44" height="46" rx="22" fill="#111111"/>
+    <rect x="-10" y="12" width="20" height="26" rx="6" fill="#111111"/>
+  </g>
+</svg>

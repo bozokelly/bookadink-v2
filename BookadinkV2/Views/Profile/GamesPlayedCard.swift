@@ -10,6 +10,9 @@ struct GamesPlayedCard: View {
         var month: Date { id }
         let count: Int
         let isCurrent: Bool
+        var label: String {
+            month.formatted(.dateTime.month(.abbreviated))
+        }
     }
 
     private var confirmedBookings: [BookingWithGame] {
@@ -42,9 +45,12 @@ struct GamesPlayedCard: View {
                 let dc = cal.dateComponents([.year, .month], from: date)
                 return dc.year == comps.year && dc.month == comps.month
             }.count
-            let isCurrent = cal.isDate(monthDate, equalTo: now, toGranularity: .month)
-            return MonthData(id: start, count: count, isCurrent: isCurrent)
+            return MonthData(id: start, count: count, isCurrent: cal.isDate(monthDate, equalTo: now, toGranularity: .month))
         }
+    }
+
+    private var peakMonth: MonthData? {
+        monthlyData.max(by: { $0.count < $1.count })
     }
 
     private var insightText: String? {
@@ -57,99 +63,147 @@ struct GamesPlayedCard: View {
             dayCounts[weekday, default: 0] += 1
         }
         guard let (topDay, _) = dayCounts.max(by: { $0.value < $1.value }) else { return nil }
-        return "Most active: \(cal.weekdaySymbols[topDay - 1])s"
+        return "Most active on \(cal.weekdaySymbols[topDay - 1])s"
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Label("Games Played", systemImage: "figure.pickleball")
-                    .font(.headline.weight(.semibold))
-                    .foregroundStyle(Brand.ink)
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Games Played")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Brand.mutedText)
+                    Text("\(totalGames)")
+                        .font(.system(size: 40, weight: .bold, design: .rounded))
+                        .foregroundStyle(Brand.ink)
+                        .contentTransition(.numericText())
+                }
                 Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("This month")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Brand.mutedText)
+                    Text("\(gamesThisMonth)")
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
+                        .foregroundStyle(gamesThisMonth > 0 ? Brand.pineTeal : Brand.mutedText)
+                        .contentTransition(.numericText())
+                }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 12)
 
             if totalGames == 0 {
                 emptyState
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
             } else {
-                statRow
-                barChart
+                // Chart
+                lineChart
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+
+                // Footer insight
                 if let insight = insightText {
-                    Text(insight)
-                        .font(.caption)
-                        .foregroundStyle(Brand.mutedText)
-                        .padding(.top, 2)
+                    HStack(spacing: 4) {
+                        Image(systemName: "sparkle")
+                            .font(.caption2)
+                            .foregroundStyle(Brand.pineTeal)
+                        Text(insight)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(Brand.mutedText)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 14)
+                } else {
+                    Spacer().frame(height: 14)
                 }
             }
         }
-        .padding(16)
         .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .shadow(color: .black.opacity(0.08), radius: 10, y: 3)
-        .onAppear { withAnimation(.easeIn(duration: 0.4).delay(0.1)) { chartAppeared = true } }
-    }
-
-    private var statRow: some View {
-        HStack(spacing: 10) {
-            statPill(label: "Total", value: "\(totalGames)", background: Color(.systemGray6), valueColor: Brand.ink)
-            statPill(label: "This Month", value: "\(gamesThisMonth)", background: Brand.pineTeal.opacity(0.1), valueColor: Brand.pineTeal)
+        .shadow(color: .black.opacity(0.07), radius: 12, y: 4)
+        .onAppear {
+            withAnimation(.spring(response: 0.6, dampingFraction: 0.8).delay(0.15)) {
+                chartAppeared = true
+            }
         }
     }
 
-    private func statPill(label: String, value: String, background: Color, valueColor: Color) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(label)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(Brand.mutedText)
-            Text(value)
-                .font(.system(.subheadline, design: .rounded).weight(.bold))
-                .foregroundStyle(valueColor)
-                .contentTransition(.numericText())
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(background, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-    }
+    // MARK: - Line Chart
 
-    private var barChart: some View {
-        Chart(monthlyData) { item in
-            BarMark(
-                x: .value("Month", item.month, unit: .month),
-                y: .value("Games", item.count)
-            )
-            .foregroundStyle(item.isCurrent ? Brand.pineTeal : Brand.slateBlue.opacity(0.55))
-            .cornerRadius(5)
+    private var lineChart: some View {
+        let maxCount = max(monthlyData.map(\.count).max() ?? 1, 1)
+
+        return Chart {
+            ForEach(monthlyData) { item in
+                // Area fill
+                AreaMark(
+                    x: .value("Month", item.month, unit: .month),
+                    y: .value("Games", chartAppeared ? item.count : 0)
+                )
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [Brand.pineTeal.opacity(0.25), Brand.pineTeal.opacity(0.0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .interpolationMethod(.catmullRom)
+
+                // Line
+                LineMark(
+                    x: .value("Month", item.month, unit: .month),
+                    y: .value("Games", chartAppeared ? item.count : 0)
+                )
+                .foregroundStyle(Brand.pineTeal)
+                .lineStyle(StrokeStyle(lineWidth: 2.5))
+                .interpolationMethod(.catmullRom)
+
+                // Dot on current month
+                if item.isCurrent {
+                    PointMark(
+                        x: .value("Month", item.month, unit: .month),
+                        y: .value("Games", chartAppeared ? item.count : 0)
+                    )
+                    .foregroundStyle(Brand.pineTeal)
+                    .symbolSize(50)
+                }
+            }
         }
         .chartXAxis {
             AxisMarks(values: .stride(by: .month)) { _ in
                 AxisValueLabel(format: .dateTime.month(.abbreviated))
-                    .font(.caption2)
-                    .foregroundStyle(Color.secondary)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(Brand.mutedText)
             }
         }
         .chartYAxis {
-            AxisMarks(values: .automatic(desiredCount: 3)) { _ in
+            AxisMarks(values: .automatic(desiredCount: 3)) { value in
+                AxisGridLine()
+                    .foregroundStyle(Color.secondary.opacity(0.12))
                 AxisValueLabel()
                     .font(.caption2)
-                    .foregroundStyle(Color.secondary)
-                AxisGridLine()
-                    .foregroundStyle(Color.secondary.opacity(0.2))
+                    .foregroundStyle(Brand.mutedText)
             }
         }
-        .frame(height: 90)
-        .opacity(chartAppeared ? 1 : 0)
-        .animation(.easeIn(duration: 0.5), value: chartAppeared)
+        .chartYScale(domain: 0...(maxCount + 1))
+        .frame(height: 130)
+        .animation(.spring(response: 0.6, dampingFraction: 0.8), value: chartAppeared)
     }
+
+    // MARK: - Empty State
 
     private var emptyState: some View {
         HStack(spacing: 12) {
             Image(systemName: "figure.pickleball")
                 .font(.title2)
-                .foregroundStyle(Brand.pineTeal.opacity(0.5))
-            Text("No games recorded yet. Book your first session to get started.")
+                .foregroundStyle(Brand.pineTeal.opacity(0.45))
+            Text("No games yet. Book your first session to start tracking.")
                 .font(.subheadline)
                 .foregroundStyle(Brand.mutedText)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, 12)
     }
 }

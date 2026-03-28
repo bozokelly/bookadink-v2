@@ -42,10 +42,10 @@ serve(async (req: Request) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
 
-  // Fetch the user's push token and the game title
+  // Fetch the user's push token, game details, and club name via join
   const [profileResult, gameResult] = await Promise.all([
     supabase.from("profiles").select("push_token").eq("id", user_id).single(),
-    supabase.from("games").select("title, date_time, location").eq("id", game_id).single(),
+    supabase.from("games").select("title, date_time, venue_name, clubs(name)").eq("id", game_id).single(),
   ]);
 
   if (profileResult.error || !profileResult.data?.push_token) {
@@ -66,11 +66,17 @@ serve(async (req: Request) => {
         timeZone: "UTC",
       })
     : "";
-  const location = game?.location ?? "the club";
+
+  // Location rule (mirrors iOS LocalNotificationManager.locationSuffix):
+  //   venue_name → club name → omit. Never use placeholder text.
+  const venueName = (game?.venue_name as string | null)?.trim() ?? "";
+  const clubName = ((game?.clubs as { name?: string } | null)?.name ?? "").trim();
+  const locationDisplay = venueName || clubName;
+  const locationSuffix = locationDisplay ? ` at ${locationDisplay}` : "";
 
   const notificationBody = gameTime
-    ? `${gameTitle} is confirmed for ${gameTime} at ${location}.`
-    : `You're booked for ${gameTitle} at ${location}.`;
+    ? `${gameTitle} is confirmed for ${gameTime}${locationSuffix}.`
+    : `You're booked for ${gameTitle}${locationSuffix}.`;
 
   // Send APNs push notification
   try {

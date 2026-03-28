@@ -1,0 +1,6 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <!-- Paddle head: wide rounded rectangle -->
+  <rect x="26" y="8" width="48" height="52" rx="24" fill="#111111"/>
+  <!-- Handle: narrower, below head -->
+  <rect x="39" y="58" width="22" height="34" rx="7" fill="#111111"/>
+</svg>

@@ -25,7 +25,7 @@ final class LocalCalendarManager {
 
     private init() {}
 
-    func addGameToCalendar(game: Game, clubName: String?) async throws -> String {
+    func addGameToCalendar(game: Game, clubName: String?, resolvedVenue: ClubVenue?) async throws -> String {
         try await ensurePermission()
 
         let event = EKEvent(eventStore: store)
@@ -33,7 +33,7 @@ final class LocalCalendarManager {
         event.title = game.title
         event.startDate = game.dateTime
         event.endDate = game.dateTime.addingTimeInterval(TimeInterval(max(game.durationMinutes, 30) * 60))
-        event.location = formattedLocation(game: game, clubName: clubName)
+        event.location = formattedLocation(clubName: clubName, resolvedVenue: resolvedVenue)
         event.notes = formattedNotes(game: game, clubName: clubName)
 
         do {
@@ -62,14 +62,15 @@ final class LocalCalendarManager {
         }
     }
 
-    private func formattedLocation(game: Game, clubName: String?) -> String {
-        let club = clubName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let venue = game.displayLocation.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !club.isEmpty, !venue.isEmpty {
-            return "\(club) • \(venue)"
+    private func formattedLocation(clubName: String?, resolvedVenue: ClubVenue?) -> String {
+        if let venue = resolvedVenue {
+            var parts: [String] = [venue.venueName]
+            if let address = LocationService.formattedAddress(for: venue) {
+                parts.append(address)
+            }
+            return parts.joined(separator: ", ")
         }
-        if !club.isEmpty { return club }
-        return venue
+        return clubName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     private func formattedNotes(game: Game, clubName: String?) -> String {

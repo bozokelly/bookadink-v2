@@ -20,7 +20,6 @@ struct ClubNewsView: View {
     @State private var editingPost: ClubNewsPost?
     @State private var reportTarget: ClubNewsReportTarget?
     @State private var showModerationQueue = false
-    @State private var commentDrafts: [UUID: String] = [:]
     @State private var hiddenPostIDs: Set<UUID> = []
     @State private var localInfoMessage: String?
 
@@ -40,7 +39,8 @@ struct ClubNewsView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        ScrollView {
+          VStack(alignment: .leading, spacing: 12) {
             headerCard
 
             if let error = appState.clubNewsError(for: club), !error.isEmpty {
@@ -66,23 +66,23 @@ struct ClubNewsView: View {
                         .foregroundStyle(Brand.emeraldAction)
                     Text(localInfoMessage)
                         .font(.footnote.weight(.semibold))
-                        .foregroundStyle(Color.white.opacity(0.92))
+                        .foregroundStyle(Brand.secondaryText)
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.10))
+                        .fill(Brand.cardBackground)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        .stroke(Brand.softOutline, lineWidth: 1)
                 )
             }
 
             if let pushError = appState.remotePushRegistrationErrorMessage,
-               appState.clubNewsNotificationsEnabled,
+               !appState.isClubChatMuted(for: club.id),
                !pushError.isEmpty {
                 HStack(spacing: 8) {
                     Image(systemName: "bell.slash")
@@ -108,17 +108,12 @@ struct ClubNewsView: View {
                         club: club,
                         post: post,
                         isClubModerator: isClubModerator,
-                        commentDraft: Binding(
-                            get: { commentDrafts[post.id] ?? "" },
-                            set: { commentDrafts[post.id] = $0 }
-                        ),
                         onLike: {
                             Task { await appState.toggleClubNewsLike(for: club, post: post) }
                         },
                         onComment: { text, parentID in
                             Task {
                                 await appState.addClubNewsComment(for: club, post: post, content: text, parentCommentID: parentID)
-                                commentDrafts[post.id] = ""
                             }
                         },
                         onDelete: {
@@ -144,6 +139,10 @@ struct ClubNewsView: View {
                     .environmentObject(appState)
                 }
             }
+          }
+          .padding(.horizontal, 16)
+          .padding(.top, 8)
+          .padding(.bottom, 32)
         }
         .onChange(of: selectedPhotoItems.count) { _, _ in
             Task { await loadPickedPhotos(selectedPhotoItems) }
@@ -258,7 +257,7 @@ struct ClubNewsView: View {
                 .environmentObject(appState)
         }
         .task(id: club.id) {
-            if appState.clubNewsNotificationsEnabled {
+            if !appState.isClubChatMuted(for: club.id) {
                 await appState.prepareClubChatPushNotificationsIfNeeded()
             }
             appState.startClubChatRealtime(for: club, includeModeration: isClubModerator)
@@ -291,11 +290,11 @@ struct ClubNewsView: View {
                         .frame(width: 7, height: 7)
                     Text("Club Chat")
                         .font(.headline.weight(.semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(Brand.primaryText)
                 }
                 Text("Live posts, photos, and replies synced with the website.")
                     .font(.caption)
-                    .foregroundStyle(Color.white.opacity(0.7))
+                    .foregroundStyle(Brand.secondaryText)
                     .lineLimit(2)
             }
             Spacer(minLength: 6)
@@ -307,29 +306,29 @@ struct ClubNewsView: View {
                 }
                 .font(.caption.weight(.semibold))
                 .buttonStyle(.plain)
-                .foregroundStyle(.white)
+                .foregroundStyle(Brand.primaryText)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
-                .background(Color.white.opacity(0.14), in: Capsule())
+                .background(Brand.secondarySurface, in: Capsule())
                 .overlay(
                     Capsule()
-                        .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                        .stroke(Brand.softOutline, lineWidth: 1)
                 )
             }
 
             HStack(spacing: 6) {
                 Button {
-                    appState.setClubNewsNotificationsEnabled(!appState.clubNewsNotificationsEnabled)
+                    appState.setClubChatMuted(!appState.isClubChatMuted(for: club.id), for: club.id)
                 } label: {
-                    Image(systemName: appState.clubNewsNotificationsEnabled ? "bell.badge.fill" : "bell.slash")
+                    Image(systemName: appState.isClubChatMuted(for: club.id) ? "bell.slash" : "bell.badge.fill")
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(appState.clubNewsNotificationsEnabled ? Brand.softOrangeAccent : .white)
+                        .foregroundStyle(appState.isClubChatMuted(for: club.id) ? Brand.secondaryText : Brand.softOrangeAccent)
                         .frame(width: 34, height: 34)
-                        .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .actionBorder(cornerRadius: 10, color: Color.white.opacity(0.14), lineWidth: 1)
-                .accessibilityLabel(appState.clubNewsNotificationsEnabled ? "Disable club chat alerts" : "Enable club chat alerts")
+                .actionBorder(cornerRadius: 10, color: Brand.softOutline, lineWidth: 1)
+                .accessibilityLabel(appState.isClubChatMuted(for: club.id) ? "Enable club chat alerts" : "Disable club chat alerts")
 
                 if isClubModerator {
                     Button {
@@ -337,12 +336,12 @@ struct ClubNewsView: View {
                     } label: {
                         Image(systemName: "shield.lefthalf.filled")
                             .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(Brand.primaryText)
                             .frame(width: 34, height: 34)
-                            .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     }
                     .buttonStyle(.plain)
-                    .actionBorder(cornerRadius: 10, color: Color.white.opacity(0.14), lineWidth: 1)
+                    .actionBorder(cornerRadius: 10, color: Brand.softOutline, lineWidth: 1)
                     .accessibilityLabel("Open moderation reports")
                 }
 
@@ -351,12 +350,12 @@ struct ClubNewsView: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(Brand.primaryText)
                         .frame(width: 34, height: 34)
-                        .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .actionBorder(cornerRadius: 10, color: Color.white.opacity(0.14), lineWidth: 1)
+                .actionBorder(cornerRadius: 10, color: Brand.softOutline, lineWidth: 1)
                 .accessibilityLabel("Refresh club chat")
             }
         }
@@ -494,7 +493,7 @@ struct ClubNewsView: View {
         .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Brand.slateBlue.opacity(0.15), lineWidth: 1)
+                .stroke(Brand.softOutline, lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
     }
@@ -604,7 +603,8 @@ private struct ClubNewsPostCard: View {
     let club: Club
     let post: ClubNewsPost
     let isClubModerator: Bool
-    @Binding var commentDraft: String
+    // Draft is owned by the card — typing here no longer re-renders sibling cards
+    @State private var commentDraft: String = ""
     let onLike: () -> Void
     let onComment: (_ text: String, _ parentCommentID: UUID?) -> Void
     let onDelete: () -> Void
@@ -754,8 +754,10 @@ private struct ClubNewsPostCard: View {
 
                 Button {
                     let text = commentDraft
-                    onComment(text, replyTarget?.id)
+                    let parentID = replyTarget?.id
+                    commentDraft = ""  // clear immediately; no need to wait for async
                     replyTarget = nil
+                    onComment(text, parentID)
                 } label: {
                     if appState.isCreatingClubNewsComment(for: post.id) {
                         ProgressView().tint(.white).controlSize(.small)
@@ -900,23 +902,26 @@ private struct ClubNewsImageGrid: View {
                         case let .success(image):
                             image
                                 .resizable()
-                                .scaledToFill()
+                                .scaledToFit()
                         case .failure:
                             ZStack {
-                                Color.white.opacity(0.8)
+                                Brand.secondarySurface
                                 Image(systemName: "photo")
                                     .foregroundStyle(Brand.mutedText)
                             }
+                            .frame(height: urls.count == 1 ? 180 : 120)
                         case .empty:
                             ZStack {
-                                Color.white.opacity(0.6)
+                                Brand.secondarySurface
                                 ProgressView()
                             }
+                            .frame(height: urls.count == 1 ? 180 : 120)
                         @unknown default:
-                            Color.white.opacity(0.6)
+                            Brand.secondarySurface
+                                .frame(height: urls.count == 1 ? 180 : 120)
                         }
                     }
-                    .frame(height: urls.count == 1 ? 220 : 140)
+                    .frame(maxWidth: .infinity, maxHeight: urls.count == 1 ? 500 : 200)
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
                 .buttonStyle(.plain)
@@ -999,7 +1004,7 @@ private struct ClubNewsEditPostSheet: View {
                                                 image.resizable().scaledToFill()
                                             default:
                                                 ZStack {
-                                                    Color.white.opacity(0.8)
+                                                    Brand.secondarySurface
                                                     Image(systemName: "photo")
                                                 }
                                             }
@@ -1080,6 +1085,7 @@ private struct ClubNewsEditPostSheet: View {
                             Text("Save")
                         }
                     }
+                    .buttonStyle(.plain)
                     .disabled(
                         appState.isUpdatingClubNewsPost(post.id) ||
                         (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && retainedURLs.isEmpty && newDraftImages.isEmpty)
@@ -1214,6 +1220,7 @@ private struct ClubNewsModerationQueueSheet: View {
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
+                    .buttonStyle(.plain)
                 }
             }
             .task {

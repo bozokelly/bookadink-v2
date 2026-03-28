@@ -1,0 +1,14 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <!-- Ribbon left -->
+  <rect x="36" y="60" width="12" height="30" rx="4" transform="rotate(-10, 42, 75)" fill="#111111"/>
+  <!-- Ribbon right -->
+  <rect x="52" y="60" width="12" height="30" rx="4" transform="rotate(10, 58, 75)" fill="#111111"/>
+  <!-- Medal circle (outer) -->
+  <circle cx="50" cy="40" r="28" fill="#111111"/>
+  <!-- Inner white ring -->
+  <circle cx="50" cy="40" r="20" fill="white"/>
+  <!-- Green accent ring -->
+  <circle cx="50" cy="40" r="13" fill="none" stroke="#39FF14" stroke-width="3"/>
+  <!-- Centre dot -->
+  <circle cx="50" cy="40" r="5" fill="#111111"/>
+</svg>

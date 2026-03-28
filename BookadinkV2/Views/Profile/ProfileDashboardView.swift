@@ -14,7 +14,7 @@ struct ProfileDashboardView: View {
                 LazyVStack(spacing: 16) {
                     Text("My Profile")
                         .font(.system(size: 32, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(Brand.primaryText)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 4)
                         .cardAppear(index: 0, appeared: appeared)
@@ -41,6 +41,11 @@ struct ProfileDashboardView: View {
                 .padding(.bottom, 40)
             }
             .scrollIndicators(.hidden)
+            .refreshable {
+                await appState.refreshProfile()
+                await appState.refreshBookings(silent: true)
+                await appState.refreshMemberships()
+            }
         }
         .toolbar(.hidden, for: .navigationBar)
         .sheet(isPresented: $showEditProfile) {
@@ -72,7 +77,7 @@ struct ProfileDashboardView: View {
                 .frame(width: 72, height: 72)
                 .overlay(
                     Circle()
-                        .stroke(Color.white.opacity(0.55), lineWidth: 2.5)
+                        .stroke(Brand.softOutline, lineWidth: 2)
                 )
 
                 // Name + email
@@ -113,8 +118,8 @@ struct ProfileDashboardView: View {
                         .foregroundStyle(Brand.pineTeal)
                         .frame(maxWidth: .infinity)
                         .frame(height: 42)
-                        .background(Color.white.opacity(0.9), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .actionBorder(cornerRadius: 12, color: Brand.slateBlue.opacity(0.22))
+                        .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .actionBorder(cornerRadius: 12, color: Brand.softOutline)
                 }
                 .buttonStyle(.plain)
 

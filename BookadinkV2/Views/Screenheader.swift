@@ -7,8 +7,8 @@ struct ScreenHeader: View {
         HStack {
             Text(title)
                 .font(.system(size: 32, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
-            
+                .foregroundStyle(Brand.primaryText)
+
             Spacer()
         }
         .padding(.horizontal)

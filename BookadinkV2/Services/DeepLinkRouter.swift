@@ -6,13 +6,15 @@ import Foundation
 ///   bookadink://club/{uuid}
 ///   bookadink://game/{uuid}
 ///
-/// When universal links are configured (bookadink.com), the same
-/// path structure applies:
+/// Universal links (future, when bookadink.com is live):
 ///   https://bookadink.com/club/{uuid}
-///   https://bookadink.com/game/{uuid}
+///   https://www.bookadink.com/club/{uuid}
 enum DeepLink: Equatable {
     case club(id: UUID)
     case game(id: UUID)
+    case review(gameID: UUID)
+
+    private static let knownHosts: Set<String> = ["bookadink.com", "www.bookadink.com"]
 
     init?(url: URL) {
         // Custom scheme: bookadink://club/{uuid}
@@ -26,8 +28,8 @@ enum DeepLink: Equatable {
             return
         }
 
-        // Universal link: https://bookadink.com/club/{uuid}
-        guard url.host == "bookadink.com" else { return nil }
+        // Universal link: https://bookadink.com/club/{uuid} or https://www.bookadink.com/...
+        guard let host = url.host, Self.knownHosts.contains(host) else { return nil }
         let components = url.pathComponents.filter { $0 != "/" }
         guard components.count == 2, let id = UUID(uuidString: components[1]) else { return nil }
         switch components[0] {
@@ -37,13 +39,17 @@ enum DeepLink: Equatable {
         }
     }
 
-    /// Shareable URL for this deep link destination.
+    /// Shareable URL using the custom scheme so the app opens directly.
+    /// Uses bookadink:// rather than HTTPS because bookadink.com is not yet
+    /// a live website — HTTPS links just open Safari and hit 404.
     var shareURL: URL {
         switch self {
         case .club(let id):
-            return URL(string: "https://bookadink.com/club/\(id.uuidString)")!
+            return URL(string: "bookadink://club/\(id.uuidString)")!
         case .game(let id):
-            return URL(string: "https://bookadink.com/game/\(id.uuidString)")!
+            return URL(string: "bookadink://game/\(id.uuidString)")!
+        case .review(let gameID):
+            return URL(string: "bookadink://game/\(gameID.uuidString)")!
         }
     }
 

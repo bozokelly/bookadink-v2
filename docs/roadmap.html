@@ -292,6 +292,66 @@ WITH CHECK (auth.uid() = id);</div>
     </div>
   </div>
 
+  <div class="priority-card" data-cat="soon">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-soon">Soon</span>
+      <span class="pc-title">Post-game review emails — members & paid casuals</span>
+      <span class="pc-effort">3–5 hrs</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">Trigger a review request email ~24 hours after game end time. Target both club members and paid casuals who booked via Stripe. Use a scheduled Supabase Edge Function (cron) or a DB trigger on game status change. Email links to an in-app or web review form. Ratings surface on club/game pages.</p>
+    </div>
+  </div>
+
+  <div class="priority-card" data-cat="next">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-next">Do Next</span>
+      <span class="pc-title">Club chat — verify mute/silence button works</span>
+      <span class="pc-effort">1–2 hrs</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">Per-club mute is now fixed client-side (local notifications only). Remaining gap: APNs pushes from club-chat-push Edge Function still arrive when muted — server needs to check a per-user muted club list before sending. Tracked under the full notification overhaul below.</p>
+    </div>
+  </div>
+
+  <div class="priority-card" data-cat="soon">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-soon">Soon</span>
+      <span class="pc-title">Notification preferences & permissions — full overhaul</span>
+      <span class="pc-effort">1–2 days</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">
+        Full end-to-end notification settings screen with granular controls. Covers:
+        <br><br>
+        <strong>iOS permissions:</strong> Prompt at the right time (not on cold launch), deep-link to Settings if denied, surface permission state clearly in UI.
+        <br><br>
+        <strong>Per-club chat mute:</strong> Currently mute only suppresses local notifications. APNs pushes still arrive server-side. Fix requires storing muted_club_chat_ids in Supabase profiles and checking it in the club-chat-push Edge Function before fanning out.
+        <br><br>
+        <strong>Notification type toggles:</strong> Let users opt in/out of booking confirmations, waitlist updates, game cancellations, club announcements, and membership updates — both push and email independently.
+        <br><br>
+        <strong>Email preferences:</strong> Honour unsubscribe from Resend. Store email_opt_out per type in profiles. Check before sending in send-notification-email Edge Function.
+        <br><br>
+        <strong>Quiet hours:</strong> Optional time window (e.g. 10pm–8am) where local notifications are suppressed but delivered as a morning summary.
+      </p>
+    </div>
+  </div>
+
+  <div class="priority-card" data-cat="next">
+    <div class="pc-header" onclick="toggle(this)">
+      <span class="pc-badge badge-next">Do Next</span>
+      <span class="pc-title">Club chat — delete own photo post</span>
+      <span class="pc-effort">1–2 hrs</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="pc-body">
+      <p class="pc-desc">Users can't currently delete a photo they posted in club chat. Needs a delete action on ClubNewsPostCard (long-press or swipe) that removes the post row from Supabase and deletes the image from the feed-images storage bucket. Gate delete behind post ownership or admin check.</p>
+    </div>
+  </div>
+
 </div>
 
 <script>

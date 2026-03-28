@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		41093C252F69A8AF00032EBE /* splash.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 41093C242F69A8AF00032EBE /* splash.mp4 */; };
+		41B454022F74342400AA272A /* StripePaymentSheet in Frameworks */ = {isa = PBXBuildFile; productRef = 41B454012F74342400AA272A /* StripePaymentSheet */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		4195CC5C2F4C94E30068C5F2 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -24,6 +29,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		41093C242F69A8AF00032EBE /* splash.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = splash.mp4; sourceTree = "<group>"; };
 		4195CC4B2F4C94E20068C5F2 /* BookadinkV2.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BookadinkV2.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4195CC5B2F4C94E30068C5F2 /* BookadinkV2Tests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BookadinkV2Tests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		4195CC652F4C94E30068C5F2 /* BookadinkV2UITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BookadinkV2UITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -65,6 +71,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				41B454022F74342400AA272A /* StripePaymentSheet in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -92,6 +99,8 @@
 				4195CC5E2F4C94E30068C5F2 /* BookadinkV2Tests */,
 				4195CC682F4C94E30068C5F2 /* BookadinkV2UITests */,
 				4195CC4C2F4C94E20068C5F2 /* Products */,
+				41093C242F69A8AF00032EBE /* splash.mp4 */,
+				41B454002F74342400AA272A /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
@@ -103,6 +112,13 @@
 				4195CC652F4C94E30068C5F2 /* BookadinkV2UITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		41B454002F74342400AA272A /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -125,6 +141,7 @@
 			);
 			name = BookadinkV2;
 			packageProductDependencies = (
+				41B454012F74342400AA272A /* StripePaymentSheet */,
 			);
 			productName = BookadinkV2;
 			productReference = 4195CC4B2F4C94E20068C5F2 /* BookadinkV2.app */;
@@ -208,6 +225,9 @@
 			);
 			mainGroup = 4195CC422F4C94E20068C5F2;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				41B453FF2F74307800AA272A /* XCRemoteSwiftPackageReference "stripe-ios" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 4195CC4C2F4C94E20068C5F2 /* Products */;
 			projectDirPath = "";
@@ -225,6 +245,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				41093C252F69A8AF00032EBE /* splash.mp4 in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -587,6 +608,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		41B453FF2F74307800AA272A /* XCRemoteSwiftPackageReference "stripe-ios" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/stripe/stripe-ios";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 25.8.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		41B454012F74342400AA272A /* StripePaymentSheet */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 41B453FF2F74307800AA272A /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripePaymentSheet;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 4195CC432F4C94E20068C5F2 /* Project object */;
 }

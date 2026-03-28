@@ -28,7 +28,7 @@ final class LocalNotificationManager {
 
     private init() {}
 
-    func scheduleGameReminder(for game: Game) async throws -> Date {
+    func scheduleGameReminder(for game: Game, clubName: String = "") async throws -> Date {
         let now = Date()
         guard game.dateTime > now else { throw LocalNotificationError.gameAlreadyStarted }
 
@@ -36,10 +36,14 @@ final class LocalNotificationManager {
 
         let fireDate = try reminderDate(for: game, now: now)
 
+        let locationSuffix = Self.locationSuffix(venueName: game.venueName, clubName: clubName)
+
         let content = UNMutableNotificationContent()
         content.title = "Upcoming Game"
-        content.body = "\(game.title) starts \(game.dateTime.formatted(date: .omitted, time: .shortened)) at \(game.displayLocation)."
+        content.body = "\(game.title) starts \(game.dateTime.formatted(date: .omitted, time: .shortened))\(locationSuffix)."
         content.sound = .default
+        // game_id in userInfo enables deep-link routing when the notification is tapped
+        content.userInfo = ["game_id": game.id.uuidString]
 
         let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: fireDate)
         let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
@@ -133,6 +137,18 @@ final class LocalNotificationManager {
                 continuation.resume(returning: settings)
             }
         }
+    }
+
+    /// Canonical location suffix for game notification bodies.
+    ///
+    /// Rule (mirrors UI and Edge Function logic):
+    ///   venue name → club name → omit
+    ///
+    /// Returns " at {name}" or "" — never placeholder text.
+    static func locationSuffix(venueName: String?, clubName: String) -> String {
+        let venue = venueName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let name  = venue.isEmpty ? clubName.trimmingCharacters(in: .whitespacesAndNewlines) : venue
+        return name.isEmpty ? "" : " at \(name)"
     }
 
     private func addRequest(_ request: UNNotificationRequest) async throws {

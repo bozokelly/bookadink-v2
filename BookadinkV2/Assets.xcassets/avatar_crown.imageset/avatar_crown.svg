@@ -1,0 +1,6 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <!-- Crown silhouette: three peaks + filled body -->
+  <path d="M 10 80 L 10 50 L 28 64 L 50 16 L 72 64 L 90 50 L 90 80 Z" fill="#111111"/>
+  <!-- Subtle base band -->
+  <rect x="10" y="74" width="80" height="10" rx="4" fill="#111111"/>
+</svg>

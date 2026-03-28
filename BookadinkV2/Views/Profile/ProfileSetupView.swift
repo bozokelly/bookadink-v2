@@ -13,10 +13,10 @@ struct ProfileSetupView: View {
             VStack(alignment: .leading, spacing: 18) {
                 Text("Set up your profile")
                     .font(.system(size: 34, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Brand.primaryText)
 
                 Text("This will be your first step before joining clubs and booking courts.")
-                    .foregroundStyle(Color.white.opacity(0.85))
+                    .foregroundStyle(Brand.secondaryText)
 
                 VStack(spacing: 14) {
                     inputField("Full name", text: $fullName, icon: "person.fill")
@@ -36,7 +36,7 @@ struct ProfileSetupView: View {
                         .pickerStyle(.segmented)
                     }
                     .padding()
-                    .glassCard(cornerRadius: 18, tint: Color.white.opacity(0.48))
+                    .glassCard(cornerRadius: 18, tint: Brand.cardBackground)
 
                     Button {
                         guard !fullName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -66,7 +66,7 @@ struct ProfileSetupView: View {
                     .disabled(fullName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || appState.isSavingProfile)
                     .opacity((fullName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || appState.isSavingProfile) ? 0.55 : 1)
                     .buttonStyle(.plain)
-                    .actionBorder(cornerRadius: 16, color: Color.white.opacity(0.20))
+                    .actionBorder(cornerRadius: 16, color: Brand.softOutline)
 
                     if let error = appState.profileSaveErrorMessage, !error.isEmpty {
                         HStack(spacing: 8) {
@@ -98,7 +98,7 @@ struct ProfileSetupView: View {
             TextField(title, text: text)
         }
         .padding()
-        .glassCard(cornerRadius: 18, tint: Color.white.opacity(0.48))
+        .glassCard(cornerRadius: 18, tint: Brand.cardBackground)
     }
 
     private var avatarPickerSection: some View {
@@ -140,7 +140,7 @@ struct ProfileSetupView: View {
                 } label: {
                     VStack(spacing: 6) {
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(Color.white.opacity(0.82))
+                            .fill(Brand.secondarySurface)
                             .overlay {
                                 Image(systemName: "person.crop.circle.badge.xmark")
                                     .font(.system(size: 24, weight: .semibold))
@@ -186,7 +186,7 @@ struct ProfileSetupView: View {
             }
         }
         .padding()
-        .glassCard(cornerRadius: 18, tint: Color.white.opacity(0.48))
+        .glassCard(cornerRadius: 18, tint: Brand.cardBackground)
     }
 
     private var avatarPresetTitle: String {
@@ -205,12 +205,12 @@ struct ProfileSetupView: View {
 
     private func tileBackground(isSelected: Bool) -> some View {
         RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .fill(isSelected ? Brand.emeraldAction.opacity(0.12) : Color.white.opacity(0.88))
+            .fill(isSelected ? Brand.accentGreen.opacity(0.12) : Brand.secondarySurface)
     }
 
     private func tileBorder(isSelected: Bool) -> some View {
         RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .stroke(isSelected ? Brand.emeraldAction : Brand.slateBlue.opacity(0.14), lineWidth: isSelected ? 2 : 1)
+            .stroke(isSelected ? Brand.primaryText : Brand.softOutline, lineWidth: isSelected ? 2 : 1)
     }
 }
 
