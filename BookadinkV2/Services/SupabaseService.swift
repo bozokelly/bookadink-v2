@@ -1,5 +1,23 @@
 import Foundation
 
+/// Server-authoritative result returned by `cancelBookingWithCredit`.
+struct CancellationResult {
+    /// Credits issued to the player's club balance (0 if outside the window or free game).
+    let creditIssuedCents: Int
+    /// True when the cancellation was within the 6-hour eligible window.
+    let wasEligible: Bool
+    /// The player's authoritative credit balance for the club after the operation.
+    let newBalanceCents: Int
+}
+
+/// Attendance records for a single game, returned by fetchAttendanceRecords.
+struct AttendanceRecords {
+    /// Maps bookingID → attendance status ('attended' | 'no_show') for all rows in game_attendance.
+    let attendanceStatusByBookingID: [UUID: String]
+    /// Maps bookingID → payment status ('unpaid' | 'cash' | 'stripe') for all rows in game_attendance.
+    let paymentByBookingID: [UUID: String]
+}
+
 protocol ClubDataProviding {
     func setAccessToken(_ token: String?)
     func signIn(email: String, password: String) async throws -> AuthFlowResult
@@ -10,20 +28,21 @@ protocol ClubDataProviding {
     func fetchGames(clubID: UUID) async throws -> [Game]
     func fetchGamesInSeries(recurrenceGroupID: UUID) async throws -> [Game]
     func fetchGameAttendees(gameID: UUID) async throws -> [GameAttendee]
-    /// Returns bookingID → paymentStatus for all checked-in attendees of the game.
-    func fetchCheckedInBookingIDs(gameID: UUID) async throws -> [UUID: String]
+    /// Returns attendance and payment records for all game_attendance rows for this game.
+    func fetchAttendanceRecords(gameID: UUID) async throws -> AttendanceRecords
     func updateAttendancePaymentStatus(bookingID: UUID, status: String) async throws
     func fetchUserBookings(userID: UUID) async throws -> [BookingWithGame]
     func fetchProfile(userID: UUID) async throws -> UserProfile?
+    func patchDuprID(userID: UUID, duprID: String) async throws
     func fetchMemberships(userID: UUID) async throws -> [ClubMembershipRecord]
     func fetchPendingClubJoinRequests(clubID: UUID) async throws -> [ClubJoinRequest]
     func fetchOwnerClubMembers(clubID: UUID, ownerUserID: UUID?) async throws -> [ClubOwnerMember]
     func fetchClubDirectoryMembers(clubID: UUID) async throws -> [ClubDirectoryMember]
-    func fetchClubAdminRole(clubID: UUID, userID: UUID) async throws -> String?
-    func fetchAllAdminRoles(userID: UUID) async throws -> [UUID: String]
+    func fetchClubAdminRole(clubID: UUID, userID: UUID) async throws -> ClubAdminRole?
+    func fetchAllAdminRoles(userID: UUID) async throws -> [UUID: ClubAdminRole]
     func fetchClubNewsPosts(clubID: UUID, currentUserID: UUID?) async throws -> [ClubNewsPost]
     func updateClubNewsPost(postID: UUID, content: String, imageURLs: [URL]) async throws
-    func requestMembership(clubID: UUID, userID: UUID, conductAcceptedAt: Date?) async throws -> ClubMembershipState
+    func requestMembership(clubID: UUID, userID: UUID, conductAcceptedAt: Date?, cancellationPolicyAcceptedAt: Date?) async throws -> ClubMembershipState
     func removeMembership(clubID: UUID, userID: UUID) async throws
     func updateClubJoinRequest(requestID: UUID, status: String, respondedBy: UUID?) async throws
     func setClubAdminAccess(clubID: UUID, userID: UUID, makeAdmin: Bool) async throws
@@ -35,28 +54,55 @@ protocol ClubDataProviding {
     func cancelGame(gameID: UUID) async throws
     func updateClubOwnerFields(clubID: UUID, draft: ClubOwnerEditDraft) async throws -> Club
     func deleteClub(clubID: UUID) async throws
-    func createBooking(gameID: UUID, userID: UUID, status: String, waitlistPosition: Int?, feePaid: Bool, stripePaymentIntentID: String?, paymentMethod: String?) async throws -> BookingRecord
+    func createBooking(gameID: UUID, userID: UUID, status: String, waitlistPosition: Int?, feePaid: Bool, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord
+    /// Atomically books a game, letting the server determine confirmed vs waitlisted status.
+    /// Pass `holdForPayment: true` for paid fresh bookings — creates a `pending_payment`
+    /// booking with a 30-min hold so `create-payment-intent` can scope the PI to this booking_id.
+    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord
+    /// Transitions a `pending_payment` booking to `confirmed` after successful Stripe payment.
+    func confirmPendingBooking(bookingID: UUID, stripePaymentIntentID: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord
     func ownerCreateBooking(gameID: UUID, userID: UUID, status: String, waitlistPosition: Int?) async throws -> BookingRecord
-    func cancelBooking(bookingID: UUID) async throws -> BookingRecord
+    /// Atomically cancels the caller's own booking and issues a credit refund when within
+    /// the 6-hour window. Server computes the eligible amount — no client-side math.
+    func cancelBookingWithCredit(bookingID: UUID) async throws -> CancellationResult
     func ownerUpdateBooking(bookingID: UUID, status: String, waitlistPosition: Int?) async throws -> BookingRecord
-    func upsertAttendanceCheckIn(gameID: UUID, bookingID: UUID, userID: UUID, checkedInBy: UUID) async throws
+    func updateBookingPaymentMethod(bookingID: UUID, paymentMethod: String) async throws -> BookingRecord
+    func upsertAttendance(gameID: UUID, bookingID: UUID, userID: UUID, checkedInBy: UUID, status: String) async throws
     func deleteAttendanceCheckIn(bookingID: UUID) async throws
+    func uploadClubAvatarImage(_ data: Data, clubID: UUID) async throws -> URL
+    func uploadClubBannerImage(_ data: Data, clubID: UUID) async throws -> URL
     func uploadClubNewsImage(_ image: FeedImageUploadPayload, userID: UUID, clubID: UUID) async throws -> URL
     func deleteClubNewsImages(_ imageURLs: [URL]) async throws
-    func createClubNewsPost(clubID: UUID, userID: UUID, content: String, imageURLs: [URL], isAnnouncement: Bool) async throws
+    /// Deletes a club avatar or banner image from Supabase storage by its public URL.
+    /// Silently no-ops if the URL does not belong to the managed club-images bucket.
+    func deleteClubStorageImage(at url: URL) async throws
+    func createClubNewsPost(clubID: UUID, userID: UUID, content: String, imageURLs: [URL], isAnnouncement: Bool) async throws -> UUID?
     func toggleClubNewsLike(postID: UUID, userID: UUID) async throws
-    func createClubNewsComment(postID: UUID, userID: UUID, content: String, parentCommentID: UUID?) async throws
+    func createClubNewsComment(postID: UUID, userID: UUID, content: String, parentCommentID: UUID?) async throws -> UUID?
     func deleteClubNewsComment(commentID: UUID) async throws
     func deleteClubNewsPost(postID: UUID) async throws
     func createClubNewsModerationReport(clubID: UUID, senderUserID: UUID, targetKind: ClubNewsModerationReport.TargetKind, targetID: UUID?, reason: String, details: String) async throws
     func fetchClubNewsModerationReports(clubID: UUID) async throws -> [ClubNewsModerationReport]
     func resolveClubNewsModerationReport(reportID: UUID) async throws
-    func triggerClubChatPushHook(clubID: UUID, actorUserID: UUID, event: String, referenceID: UUID?) async throws
+    func triggerClubChatPushHook(clubID: UUID, actorUserID: UUID, event: String, referenceID: UUID?, postAuthorID: UUID?, content: String?) async throws
     func triggerBookingConfirmedPush(gameID: UUID, bookingID: UUID, userID: UUID) async throws
     func triggerNotify(userID: UUID, title: String, body: String, type: String, referenceID: UUID?, sendPush: Bool) async throws
-    func triggerGameCancelledNotify(gameID: UUID, gameTitle: String) async throws
+    func triggerGameUpdatedNotify(gameID: UUID, clubID: UUID, gameTitle: String, clubName: String, gameDateTime: Date?, changedFields: [String], clubTimezone: String) async throws
+    func triggerGameCancelledNotify(gameID: UUID, gameTitle: String, clubTimezone: String) async throws
+    func triggerGamePublishedNotify(gameID: UUID, gameTitle: String, gameDateTime: Date, clubID: UUID, clubName: String, createdByUserID: UUID, skillLevel: String?, clubTimezone: String) async throws
     func triggerClubAnnouncementNotify(clubID: UUID, postID: UUID, posterUserID: UUID, clubName: String, posterName: String, postBody: String) async throws
-    func createPaymentIntent(amountCents: Int, currency: String, metadata: [String: String]) async throws -> String
+    func createPaymentIntent(amountCents: Int, currency: String, clubID: UUID?, metadata: [String: String]) async throws -> PaymentIntentResult
+    func fetchClubStripeAccount(clubID: UUID) async throws -> ClubStripeAccount?
+    /// Fetches live Stripe account state, persists it to club_stripe_accounts, and returns current status.
+    func refreshStripeAccountStatus(clubID: UUID) async throws -> ClubStripeAccount?
+    /// Creates a Stripe Connect onboarding link for the club. `returnURL` is the deep link back into the app.
+    func createConnectOnboarding(clubID: UUID, returnURL: String) async throws -> String
+    // MARK: - Club Subscriptions (Phase 4)
+    func fetchClubSubscription(clubID: UUID) async throws -> ClubSubscription?
+    func createClubSubscription(clubID: UUID, priceID: String) async throws -> ClubSubscriptionResult
+    func cancelClubSubscription(clubID: UUID) async throws
+    // MARK: - Club Entitlements (Phase 4 Part 2A)
+    func fetchClubEntitlements(clubID: UUID) async throws -> ClubEntitlements?
     func fetchClubAdminUserIDs(clubID: UUID) async throws -> [UUID]
     func fetchNotifications(userID: UUID) async throws -> [AppNotification]
     func markNotificationRead(id: UUID) async throws
@@ -64,6 +110,17 @@ protocol ClubDataProviding {
     func deleteAllNotifications(userID: UUID) async throws
     func submitReview(gameID: UUID, userID: UUID, rating: Int, comment: String?) async throws
     func fetchClubReviews(clubID: UUID) async throws -> [GameReview]
+    func fetchPendingReviewPrompt(userID: UUID) async throws -> PendingReviewPrompt?
+    func dismissReviewPrompt(gameID: UUID) async throws
+    func fetchClubRevenueSummary(clubID: UUID, days: Int?) async throws -> ClubRevenueSummary?
+    func fetchClubFillRateSummary(clubID: UUID, days: Int?) async throws -> ClubFillRateSummary?
+
+    // Phase 5B — Advanced Analytics
+    func fetchClubAnalyticsKPIs(clubID: UUID, days: Int, startDate: Date?, endDate: Date?) async throws -> ClubAnalyticsKPIs?
+    func fetchClubRevenueTrend(clubID: UUID, days: Int, startDate: Date?, endDate: Date?) async throws -> [ClubRevenueTrendPoint]
+    func fetchClubTopGames(clubID: UUID, days: Int, startDate: Date?, endDate: Date?) async throws -> [ClubTopGame]
+    func fetchClubPeakTimes(clubID: UUID, days: Int, startDate: Date?, endDate: Date?) async throws -> [ClubPeakTime]
+    func fetchGame(gameID: UUID) async throws -> Game?
     func fetchGameClubID(gameID: UUID) async throws -> UUID?
     func updateProfilePushToken(userID: UUID, pushToken: String?) async throws
     func upsertProfile(_ profile: UserProfile) async throws -> UserProfile
@@ -80,6 +137,53 @@ protocol ClubDataProviding {
     func updateClubVenue(venueID: UUID, draft: ClubVenueDraft, latitude: Double?, longitude: Double?, updateCoordinates: Bool) async throws -> ClubVenue
     func deleteClubVenue(venueID: UUID) async throws
     func updateClubCoordinates(clubID: UUID, latitude: Double, longitude: Double) async throws
+    func updateClubVenueName(clubID: UUID, venueName: String) async throws
+    /// Sets is_primary = false on every venue for `clubID` except `exceptVenueID`.
+    /// Call after saving a primary venue to enforce single-primary invariant.
+    func demoteOtherPrimaryVenues(clubID: UUID, exceptVenueID: UUID) async throws
+
+    // MARK: - Credits (Phase 2)
+    /// Fetches the credit balance for a specific user at a specific club.
+    func fetchCreditBalance(userID: UUID, clubID: UUID) async throws -> Int
+    // MARK: - Waitlist Promotion (Phase 3)
+    /// Atomically promotes a waitlisted booking to `pending_payment` with a timed hold.
+    /// Returns `true` if the promotion succeeded.
+    func promoteWaitlistPlayer(gameID: UUID, bookingID: UUID, holdMinutes: Int) async throws -> Bool
+    /// Atomically deducts `amountCents` from the user's club-scoped credit balance. Returns `true` on success.
+    func applyCredits(userID: UUID, bookingID: UUID, amountCents: Int, clubID: UUID) async throws -> Bool
+
+    // MARK: - Notification Preferences
+    /// Returns the stored preferences, or `nil` if no row exists yet (caller treats nil as all-defaults).
+    func fetchNotificationPreferences(userID: UUID) async throws -> NotificationPreferences?
+    /// Upserts the preferences row for the given user.
+    func saveNotificationPreferences(userID: UUID, prefs: NotificationPreferences) async throws
+
+    // MARK: - Club Dashboard Summary
+    /// Fetches lightweight dashboard metrics available on all plan tiers.
+    /// No analytics entitlement required.
+    func fetchClubDashboardSummary(clubID: UUID) async throws -> ClubDashboardSummary?
+
+    // MARK: - Analytics Supplemental
+    /// Fetches operational + membership metrics. Requires Pro analytics entitlement.
+    func fetchClubAnalyticsSupplemental(clubID: UUID, days: Int, startDate: Date?, endDate: Date?) async throws -> ClubAnalyticsSupplemental?
+
+    // MARK: - Avatar Palettes
+    /// Returns all active palette definitions from the canonical avatar_palettes table.
+    func fetchAvatarPalettes() async throws -> [AvatarPaletteRow]
+
+    // MARK: - Plan Tier Limits
+    /// Returns canonical plan limit definitions for all tiers (free, starter, pro).
+    /// Global constants — not per-club. iOS/Android/Web call this once at launch.
+    func fetchPlanTierLimits() async throws -> [String: PlanTierLimits]
+
+    /// Returns active subscription plan definitions from the subscription_plans table.
+    /// Clients use the returned stripe_price_id and display_price — never hardcode either.
+    func fetchSubscriptionPlans() async throws -> [SubscriptionPlan]
+
+    // MARK: - App Config
+    /// Returns all rows from the app_config table as a [key: value] dictionary.
+    /// Server-authoritative runtime constants consumed by iOS, Android, and Edge Functions.
+    func fetchAppConfig() async throws -> [String: String]
 }
 
 enum SupabaseServiceError: LocalizedError {
@@ -88,6 +192,9 @@ enum SupabaseServiceError: LocalizedError {
     case authenticationRequired
     case duplicateMembership
     case notFound
+    case holdExpired
+    case membershipRequired
+    case duprRequired
     case missingSession
     case httpStatus(Int, String)
     case decoding(String)
@@ -105,6 +212,12 @@ enum SupabaseServiceError: LocalizedError {
             return "Membership request already exists."
         case .notFound:
             return "Requested item was not found."
+        case .holdExpired:
+            return "Your spot hold has expired. The next player in the queue has been offered this spot."
+        case .membershipRequired:
+            return "You must be an approved club member to book this game."
+        case .duprRequired:
+            return "A valid DUPR ID is required to book this game."
         case .missingSession:
             return "No authenticated session is available."
         case let .httpStatus(code, body):
@@ -224,7 +337,7 @@ final class SupabaseService: ClubDataProviding {
         let clubRows: [ClubRow] = try await send(
             path: "clubs",
             queryItems: [
-                .init(name: "select", value: "id,name,description,image_url,contact_email,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,code_of_conduct")
+                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone")
             ],
             method: "GET",
             body: nil,
@@ -263,7 +376,7 @@ final class SupabaseService: ClubDataProviding {
         let clubs: [ClubRow] = try await send(
             path: "clubs",
             queryItems: [
-                .init(name: "select", value: "id,name,description,image_url,contact_email,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,code_of_conduct"),
+                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone"),
                 .init(name: "id", value: "eq.\(id.uuidString)")
             ],
             method: "GET",
@@ -395,7 +508,7 @@ final class SupabaseService: ClubDataProviding {
         let bookingRows: [BookingRow] = try await send(
             path: "bookings",
             queryItems: [
-                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,games(id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at)"),
+                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at,games(id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at)"),
                 .init(name: "user_id", value: "eq.\(userID.uuidString)"),
                 .init(name: "order", value: "created_at.desc")
             ],
@@ -421,7 +534,7 @@ final class SupabaseService: ClubDataProviding {
         let bookingRows: [BookingRow] = try await send(
             path: "bookings",
             queryItems: [
-                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method"),
+                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at"),
                 .init(name: "game_id", value: "eq.\(gameID.uuidString)"),
                 .init(name: "order", value: "created_at.asc")
             ],
@@ -434,7 +547,7 @@ final class SupabaseService: ClubDataProviding {
         let profileRows: [OwnerProfileLiteRow] = userIDs.isEmpty ? [] : (try? await send(
             path: "profiles",
             queryItems: [
-                .init(name: "select", value: "id,full_name,email,phone,emergency_contact_name,emergency_contact_phone"),
+                .init(name: "select", value: "id,full_name,email,phone,emergency_contact_name,emergency_contact_phone,dupr_rating,avatar_color_key"),
                 .init(name: "id", value: "in.(\(userIDs.map(\.uuidString).joined(separator: ",")))")
             ],
             method: "GET",
@@ -450,7 +563,9 @@ final class SupabaseService: ClubDataProviding {
                 return GameAttendee(
                     booking: row.toBookingRecord(),
                     userName: trimmed.isEmpty ? "Member" : trimmed,
-                    userEmail: profile?.email
+                    userEmail: profile?.email,
+                    duprRating: profile?.duprRating,
+                    avatarColorKey: profile?.avatarColorKey
                 )
             }
             .sorted { lhs, rhs in
@@ -458,8 +573,8 @@ final class SupabaseService: ClubDataProviding {
             }
     }
 
-    func fetchCheckedInBookingIDs(gameID: UUID) async throws -> [UUID: String] {
-        guard SupabaseConfig.isConfigured else { return [:] }
+    func fetchAttendanceRecords(gameID: UUID) async throws -> AttendanceRecords {
+        guard SupabaseConfig.isConfigured else { return AttendanceRecords(attendanceStatusByBookingID: [:], paymentByBookingID: [:]) }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
         }
@@ -467,7 +582,7 @@ final class SupabaseService: ClubDataProviding {
         let rows: [GameAttendanceRow] = try await send(
             path: "game_attendance",
             queryItems: [
-                .init(name: "select", value: "booking_id,payment_status"),
+                .init(name: "select", value: "booking_id,payment_status,attendance_status"),
                 .init(name: "game_id", value: "eq.\(gameID.uuidString)")
             ],
             method: "GET",
@@ -475,7 +590,16 @@ final class SupabaseService: ClubDataProviding {
             authBearerToken: authToken
         )
 
-        return Dictionary(uniqueKeysWithValues: rows.map { ($0.bookingID, $0.paymentStatus ?? "unpaid") })
+        var attendanceStatusByBookingID: [UUID: String] = [:]
+        var paymentByBookingID: [UUID: String] = [:]
+        for row in rows {
+            attendanceStatusByBookingID[row.bookingID] = row.attendanceStatus ?? "attended"
+            paymentByBookingID[row.bookingID] = row.paymentStatus ?? "unpaid"
+        }
+        return AttendanceRecords(
+            attendanceStatusByBookingID: attendanceStatusByBookingID,
+            paymentByBookingID: paymentByBookingID
+        )
     }
 
     func updateAttendancePaymentStatus(bookingID: UUID, status: String) async throws {
@@ -585,7 +709,7 @@ final class SupabaseService: ClubDataProviding {
         let membershipRows: [ClubJoinRequestRow] = try await send(
             path: "club_members",
             queryItems: [
-                .init(name: "select", value: "id,club_id,user_id,status,requested_at,conduct_accepted_at"),
+                .init(name: "select", value: "id,club_id,user_id,status,requested_at,conduct_accepted_at,cancellation_policy_accepted_at"),
                 .init(name: "club_id", value: "eq.\(clubID.uuidString)"),
                 .init(name: "status", value: "eq.approved"),
                 .init(name: "order", value: "requested_at.asc")
@@ -610,7 +734,7 @@ final class SupabaseService: ClubDataProviding {
         let profileRows: [OwnerProfileLiteRow] = userIDs.isEmpty ? [] : (try? await send(
             path: "profiles",
             queryItems: [
-                .init(name: "select", value: "id,full_name,email"),
+                .init(name: "select", value: "id,full_name,email,phone,emergency_contact_name,emergency_contact_phone,dupr_rating,dupr_updated_at,dupr_updated_by_name,avatar_color_key"),
                 .init(name: "id", value: "in.(\(userIDs.map(\.uuidString).joined(separator: ",")))")
             ],
             method: "GET",
@@ -636,9 +760,14 @@ final class SupabaseService: ClubDataProviding {
                 emergencyContactName: profile?.emergencyContactName,
                 emergencyContactPhone: profile?.emergencyContactPhone,
                 isAdmin: adminRow != nil,
-                isOwner: ownerUserID == row.userID || adminRow?.role?.lowercased() == "owner",
+                isOwner: ownerUserID == row.userID || adminRow?.role == .owner,
                 adminRole: adminRow?.role,
-                conductAcceptedAt: row.conductAcceptedAtRaw.flatMap(SupabaseDateParser.parse)
+                conductAcceptedAt: row.conductAcceptedAtRaw.flatMap(SupabaseDateParser.parse),
+                cancellationPolicyAcceptedAt: row.cancellationPolicyAcceptedAtRaw.flatMap(SupabaseDateParser.parse),
+                duprRating: profile?.duprRating,
+                duprUpdatedAt: profile?.duprUpdatedAtRaw.flatMap(SupabaseDateParser.parse),
+                duprUpdatedByName: profile?.duprUpdatedByName,
+                avatarColorKey: profile?.avatarColorKey
             )
         }
         .sorted { lhs, rhs in
@@ -651,7 +780,7 @@ final class SupabaseService: ClubDataProviding {
     func fetchClubDirectoryMembers(clubID: UUID) async throws -> [ClubDirectoryMember] {
         guard SupabaseConfig.isConfigured else {
             return MockData.clubs.first(where: { $0.id == clubID })?.topMembers.map {
-                ClubDirectoryMember(id: $0.id, name: $0.name, duprRating: $0.rating)
+                ClubDirectoryMember(id: $0.id, name: $0.name, duprRating: $0.rating, avatarColorKey: nil)
             } ?? []
         }
 
@@ -673,7 +802,7 @@ final class SupabaseService: ClubDataProviding {
         let profileRows: [ClubDirectoryProfileRow] = (try? await send(
             path: "profiles",
             queryItems: [
-                .init(name: "select", value: "id,full_name,dupr_rating"),
+                .init(name: "select", value: "id,full_name,dupr_rating,avatar_color_key"),
                 .init(name: "id", value: "in.(\(userIDs.map(\.uuidString).joined(separator: ",")))")
             ],
             method: "GET",
@@ -685,12 +814,12 @@ final class SupabaseService: ClubDataProviding {
         return membershipRows.compactMap { row in
             guard let profile = profilesByID[row.userID] else { return nil }
             let name = Self.displayName(profile.fullName)
-            return ClubDirectoryMember(id: row.userID, name: name, duprRating: profile.duprRating)
+            return ClubDirectoryMember(id: row.userID, name: name, duprRating: profile.duprRating, avatarColorKey: profile.avatarColorKey)
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    func fetchClubAdminRole(clubID: UUID, userID: UUID) async throws -> String? {
+    func fetchClubAdminRole(clubID: UUID, userID: UUID) async throws -> ClubAdminRole? {
         guard SupabaseConfig.isConfigured else { return nil }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
@@ -711,7 +840,7 @@ final class SupabaseService: ClubDataProviding {
         return rows.first?.role
     }
 
-    func fetchAllAdminRoles(userID: UUID) async throws -> [UUID: String] {
+    func fetchAllAdminRoles(userID: UUID) async throws -> [UUID: ClubAdminRole] {
         guard SupabaseConfig.isConfigured else { return [:] }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
@@ -776,12 +905,13 @@ final class SupabaseService: ClubDataProviding {
         let commentRows = (try? await commentRowsTask) ?? []
         let reactionRows = (try? await reactionRowsTask) ?? []
 
-        let userIDs = Set(postRows.map(\.userID)).union(commentRows.map(\.userID))
+        // userID is now optional (null when poster/commenter deleted account) — compact to avoid profile fetches for nil IDs
+        let userIDs = Set(postRows.compactMap(\.userID)).union(commentRows.compactMap(\.userID))
         // Only fetch id + full_name — email and other fields are not used here
         let profileRows: [OwnerProfileLiteRow] = userIDs.isEmpty ? [] : (try? await send(
             path: "profiles",
             queryItems: [
-                .init(name: "select", value: "id,full_name"),
+                .init(name: "select", value: "id,full_name,avatar_color_key"),
                 .init(name: "id", value: "in.(\(userIDs.map(\.uuidString).joined(separator: ",")))")
             ],
             method: "GET",
@@ -793,17 +923,23 @@ final class SupabaseService: ClubDataProviding {
         let commentsByPost = Dictionary(grouping: commentRows, by: \.postID)
         let reactionsByPost = Dictionary(grouping: reactionRows, by: \.postID)
 
+        // Placeholder UUID for posts/comments whose author deleted their account
+        let deletedUserID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+
         return postRows.map { row in
-            let profile = profilesByID[row.userID]
+            let resolvedUserID = row.userID ?? deletedUserID
+            let profile = profilesByID[resolvedUserID]
             let authorName = Self.displayName(profile?.fullName)
             let comments = (commentsByPost[row.id] ?? []).map { commentRow in
-                let commentProfile = profilesByID[commentRow.userID]
+                let commentUserID = commentRow.userID ?? deletedUserID
+                let commentProfile = profilesByID[commentUserID]
                 return ClubNewsComment(
                     id: commentRow.id,
                     postID: commentRow.postID,
-                    userID: commentRow.userID,
+                    userID: commentUserID,
                     authorName: Self.displayName(commentProfile?.fullName),
-                    content: commentRow.content,
+                    avatarColorKey: commentProfile?.avatarColorKey,
+                    content: commentRow.content ?? "",
                     createdAt: commentRow.createdAtRaw.flatMap(SupabaseDateParser.parse),
                     parentID: commentRow.parentID
                 )
@@ -814,9 +950,10 @@ final class SupabaseService: ClubDataProviding {
             return ClubNewsPost(
                 id: row.id,
                 clubID: row.clubID ?? clubID,
-                userID: row.userID,
+                userID: resolvedUserID,
                 authorName: authorName,
-                content: row.content,
+                avatarColorKey: profile?.avatarColorKey,
+                content: row.content ?? "",
                 imageURLs: row.imageURLsResolved,
                 createdAt: row.createdAtRaw.flatMap(SupabaseDateParser.parse),
                 updatedAt: row.updatedAtRaw.flatMap(SupabaseDateParser.parse),
@@ -852,6 +989,32 @@ final class SupabaseService: ClubDataProviding {
                 "Content-Type": "application/json"
             ]
         )
+    }
+
+    func uploadClubAvatarImage(_ data: Data, clubID: UUID) async throws -> URL {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        let bucket = SupabaseConfig.clubImageBucket
+        let objectPath = "club-avatars/\(clubID.uuidString.lowercased())/\(UUID().uuidString.lowercased()).jpg"
+        try await uploadStorageObject(bucket: bucket, objectPath: objectPath,
+                                      data: data, contentType: "image/jpeg",
+                                      authBearerToken: authToken)
+        return publicStorageURL(bucket: bucket, objectPath: objectPath)
+    }
+
+    func uploadClubBannerImage(_ data: Data, clubID: UUID) async throws -> URL {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        let bucket = SupabaseConfig.clubImageBucket
+        let objectPath = "club-banners/\(clubID.uuidString.lowercased())/\(UUID().uuidString.lowercased()).jpg"
+        try await uploadStorageObject(bucket: bucket, objectPath: objectPath,
+                                      data: data, contentType: "image/jpeg",
+                                      authBearerToken: authToken)
+        return publicStorageURL(bucket: bucket, objectPath: objectPath)
     }
 
     func uploadClubNewsImage(_ image: FeedImageUploadPayload, userID: UUID, clubID: UUID) async throws -> URL {
@@ -893,7 +1056,23 @@ final class SupabaseService: ClubDataProviding {
         }
     }
 
-    func createClubNewsPost(clubID: UUID, userID: UUID, content: String, imageURLs: [URL], isAnnouncement: Bool) async throws {
+    func deleteClubStorageImage(at url: URL) async throws {
+        guard SupabaseConfig.isConfigured else { return }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        let bucket = SupabaseConfig.clubImageBucket
+        let prefix = "/storage/v1/object/public/\(bucket)/"
+        guard let baseURL = URL(string: SupabaseConfig.urlString),
+              url.host == baseURL.host,
+              url.path.hasPrefix(prefix) else { return }
+        let rawPath = String(url.path.dropFirst(prefix.count))
+        let objectPath = rawPath.removingPercentEncoding ?? rawPath
+        guard !objectPath.isEmpty else { return }
+        try await deleteStorageObject(bucket: bucket, objectPath: objectPath, authBearerToken: authToken)
+    }
+
+    func createClubNewsPost(clubID: UUID, userID: UUID, content: String, imageURLs: [URL], isAnnouncement: Bool) async throws -> UUID? {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
@@ -907,7 +1086,7 @@ final class SupabaseService: ClubDataProviding {
             imageURLs: imageURLs.map(\.absoluteString),
             isAnnouncement: isAnnouncement
         )
-        let _: [FeedIDRow] = try await send(
+        let rows: [FeedIDRow] = try await send(
             path: "feed_posts",
             queryItems: [.init(name: "select", value: "id")],
             method: "POST",
@@ -918,6 +1097,7 @@ final class SupabaseService: ClubDataProviding {
                 "Content-Type": "application/json"
             ]
         )
+        return rows.first?.id
     }
 
     func toggleClubNewsLike(postID: UUID, userID: UUID) async throws {
@@ -968,14 +1148,14 @@ final class SupabaseService: ClubDataProviding {
         }
     }
 
-    func createClubNewsComment(postID: UUID, userID: UUID, content: String, parentCommentID: UUID?) async throws {
+    func createClubNewsComment(postID: UUID, userID: UUID, content: String, parentCommentID: UUID?) async throws -> UUID? {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
         }
 
         let body = FeedCommentInsertBody(postID: postID, userID: userID, content: content, parentID: parentCommentID)
-        let _: [FeedCommentRow] = try await send(
+        let rows: [FeedCommentRow] = try await send(
             path: "feed_comments",
             queryItems: [.init(name: "select", value: "id,post_id,user_id,content,created_at,parent_id")],
             method: "POST",
@@ -986,6 +1166,7 @@ final class SupabaseService: ClubDataProviding {
                 "Content-Type": "application/json"
             ]
         )
+        return rows.first?.id
     }
 
     func deleteClubNewsComment(commentID: UUID) async throws {
@@ -1054,7 +1235,8 @@ final class SupabaseService: ClubDataProviding {
             subject: subject,
             body: encodedDetails
         )
-        let _: [ClubMessageRow] = try await send(
+        struct IDOnly: Decodable { let id: UUID }
+        let _: [IDOnly] = try await send(
             path: "club_messages",
             queryItems: [.init(name: "select", value: "id")],
             method: "POST",
@@ -1134,7 +1316,7 @@ final class SupabaseService: ClubDataProviding {
         )
     }
 
-    func triggerClubChatPushHook(clubID: UUID, actorUserID: UUID, event: String, referenceID: UUID?) async throws {
+    func triggerClubChatPushHook(clubID: UUID, actorUserID: UUID, event: String, referenceID: UUID?, postAuthorID: UUID?, content: String?) async throws {
         guard SupabaseConfig.isConfigured else { return }
         let functionName = SupabaseConfig.clubChatPushHookFunctionName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !functionName.isEmpty else { return }
@@ -1154,7 +1336,9 @@ final class SupabaseService: ClubDataProviding {
             clubID: clubID,
             actorUserID: actorUserID,
             event: event,
-            referenceID: referenceID
+            referenceID: referenceID,
+            postAuthorID: postAuthorID,
+            content: content
         )
 
         var request = URLRequest(url: url)
@@ -1223,6 +1407,67 @@ final class SupabaseService: ClubDataProviding {
         }
     }
 
+    func triggerGameUpdatedNotify(gameID: UUID, clubID: UUID, gameTitle: String, clubName: String, gameDateTime: Date?, changedFields: [String], clubTimezone: String) async throws {
+        guard SupabaseConfig.isConfigured else { return }
+        let functionName = SupabaseConfig.gameUpdatedNotifyFunctionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !functionName.isEmpty else { return }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        guard let baseURL = URL(string: SupabaseConfig.urlString) else {
+            throw SupabaseServiceError.invalidURL
+        }
+
+        let url = baseURL
+            .appendingPathComponent("functions")
+            .appendingPathComponent("v1")
+            .appendingPathComponent(functionName)
+
+        struct Payload: Encodable {
+            let game_id: String
+            let club_id: String
+            let game_title: String
+            let club_name: String
+            let game_date_time: String?
+            let changed_fields: [String]
+            let club_timezone: String
+        }
+
+        let iso = ISO8601DateFormatter()
+        let payload = Payload(
+            game_id: gameID.uuidString,
+            club_id: clubID.uuidString,
+            game_title: gameTitle,
+            club_name: clubName,
+            game_date_time: gameDateTime.map { iso.string(from: $0) },
+            changed_fields: changedFields,
+            club_timezone: clubTimezone
+        )
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(payload)
+        request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw SupabaseServiceError.network(error.localizedDescription)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SupabaseServiceError.network("Non-HTTP response")
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let bodyString = String(data: data, encoding: .utf8) ?? "<no body>"
+            throw SupabaseServiceError.httpStatus(httpResponse.statusCode, bodyString)
+        }
+    }
+
     func fetchProfile(userID: UUID) async throws -> UserProfile? {
         guard SupabaseConfig.isConfigured else { return nil }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
@@ -1232,7 +1477,7 @@ final class SupabaseService: ClubDataProviding {
         let rows: [ProfileRow] = try await send(
             path: "profiles",
             queryItems: [
-                .init(name: "select", value: "id,email,full_name,phone,date_of_birth,emergency_contact_name,emergency_contact_phone,dupr_rating"),
+                .init(name: "select", value: "id,email,first_name,last_name,full_name,phone,date_of_birth,emergency_contact_name,emergency_contact_phone,dupr_rating,dupr_id,avatar_color_key"),
                 .init(name: "id", value: "eq.\(userID.uuidString)"),
                 .init(name: "limit", value: "1")
             ],
@@ -1244,6 +1489,8 @@ final class SupabaseService: ClubDataProviding {
         guard let row = rows.first else { return nil }
         return UserProfile(
             id: row.id,
+            firstName: row.firstName,
+            lastName: row.lastName,
             fullName: row.fullName ?? "",
             email: row.email,
             phone: row.phone,
@@ -1251,12 +1498,41 @@ final class SupabaseService: ClubDataProviding {
             emergencyContactName: row.emergencyContactName,
             emergencyContactPhone: row.emergencyContactPhone,
             duprRating: row.duprRating,
+            duprID: row.duprID,
             favoriteClubName: nil,
-            skillLevel: .beginner
+            skillLevel: .beginner,
+            avatarColorKey: row.avatarColorKey
         )
     }
 
-    func requestMembership(clubID: UUID, userID: UUID, conductAcceptedAt: Date?) async throws -> ClubMembershipState {
+    func patchDuprID(userID: UUID, duprID: String) async throws {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct DuprIDPatch: Encodable {
+            let duprID: String
+            enum CodingKeys: String, CodingKey { case duprID = "dupr_id" }
+        }
+
+        let _: [[String: String]] = try await send(
+            path: "profiles",
+            queryItems: [
+                .init(name: "id", value: "eq.\(userID.uuidString.lowercased())"),
+                .init(name: "select", value: "id")
+            ],
+            method: "PATCH",
+            body: try JSONEncoder().encode(DuprIDPatch(duprID: duprID)),
+            authBearerToken: authToken,
+            extraHeaders: [
+                "Prefer": "return=representation",
+                "Content-Type": "application/json"
+            ]
+        )
+    }
+
+    func requestMembership(clubID: UUID, userID: UUID, conductAcceptedAt: Date?, cancellationPolicyAcceptedAt: Date?) async throws -> ClubMembershipState {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
@@ -1265,7 +1541,8 @@ final class SupabaseService: ClubDataProviding {
         let payload = ClubMembershipInsertBody(
             clubID: clubID,
             userID: userID,
-            conductAcceptedAt: conductAcceptedAt.map { SupabaseDateWriter.string(from: $0) }
+            conductAcceptedAt: conductAcceptedAt.map { SupabaseDateWriter.string(from: $0) },
+            cancellationPolicyAcceptedAt: cancellationPolicyAcceptedAt.map { SupabaseDateWriter.string(from: $0) }
         )
 
         do {
@@ -1332,7 +1609,7 @@ final class SupabaseService: ClubDataProviding {
         }
 
         if makeAdmin {
-            let body = ClubAdminUpsertBody(clubID: clubID, userID: userID, role: "admin")
+            let body = ClubAdminUpsertBody(clubID: clubID, userID: userID, role: .admin)
             let _: [ClubAdminRow] = try await send(
                 path: "club_admins",
                 queryItems: [
@@ -1380,7 +1657,7 @@ final class SupabaseService: ClubDataProviding {
             }
         }
 
-        let _: [String: String]? = try? await send(
+        let _: [String: String]? = try await send(
             path: "rpc/admin_update_member_dupr",
             queryItems: [],
             method: "POST",
@@ -1401,6 +1678,7 @@ final class SupabaseService: ClubDataProviding {
             description: nilIfEmpty(draft.description),
             imageURL: draft.imageURLStringForSave ?? "",
             contactEmail: nilIfEmpty(draft.contactEmail),
+            contactPhone: nilIfEmpty(draft.contactPhone),
             website: nilIfEmpty(draft.website),
             managerName: nilIfEmpty(draft.managerName),
             membersOnly: draft.membersOnly,
@@ -1412,13 +1690,16 @@ final class SupabaseService: ClubDataProviding {
             state: nilIfEmpty(draft.state),
             postcode: nilIfEmpty(draft.postcode),
             country: nilIfEmpty(draft.country),
-            heroImageKey: draft.heroImageKey
+            heroImageKey: draft.heroImageKey,
+            customBannerURL: draft.customBannerURLStringForSave,
+            avatarBackgroundColor: draft.avatarBackgroundColor,
+            timezone: TimeZone.current.identifier
         )
 
         let createdRows: [ClubRow] = try await send(
             path: "clubs",
             queryItems: [
-                .init(name: "select", value: "id,name,description,image_url,contact_email,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,code_of_conduct")
+                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone")
             ],
             method: "POST",
             body: try JSONEncoder().encode([payload]),
@@ -1431,7 +1712,7 @@ final class SupabaseService: ClubDataProviding {
 
         guard let created = createdRows.first else { throw SupabaseServiceError.notFound }
 
-        let ownerAdminPayload = ClubAdminUpsertBody(clubID: created.id, userID: createdBy, role: "owner")
+        let ownerAdminPayload = ClubAdminUpsertBody(clubID: created.id, userID: createdBy, role: .owner)
         let _: [ClubAdminRow]? = try? await send(
             path: "club_admins",
             queryItems: [
@@ -1488,7 +1769,7 @@ final class SupabaseService: ClubDataProviding {
             maxSpots: max(draft.maxSpots, 1),
             courtCount: max(draft.courtCount, 1),
             feeAmount: feeAmount,
-            feeCurrency: nilIfEmpty(draft.feeCurrency) ?? "USD",
+            feeCurrency: "aud",
             venueId: draft.selectedVenueID,
             venueName: nilIfEmpty(draft.venueName),
             latitude: draft.venueLatitude,
@@ -1542,7 +1823,7 @@ final class SupabaseService: ClubDataProviding {
             maxSpots: max(draft.maxSpots, 1),
             courtCount: max(draft.courtCount, 1),
             feeAmount: feeAmount,
-            feeCurrency: "USD",
+            feeCurrency: "aud",
             venueId: draft.selectedVenueID,
             venueName: nilIfEmpty(draft.venueName),
             location: normalizedGameTextField(draft.location),
@@ -1631,6 +1912,7 @@ final class SupabaseService: ClubDataProviding {
             description: nilIfEmpty(draft.description),
             imageURL: draft.imageURLStringForSave ?? "",
             contactEmail: nilIfEmpty(draft.contactEmail),
+            contactPhone: nilIfEmpty(draft.contactPhone),
             website: nilIfEmpty(draft.website),
             managerName: nilIfEmpty(draft.managerName),
             membersOnly: draft.membersOnly,
@@ -1644,14 +1926,17 @@ final class SupabaseService: ClubDataProviding {
             country: nilIfEmpty(draft.country),
             clearCoordinates: draft.locationChanged,
             heroImageKey: draft.heroImageKey,
-            codeOfConduct: nilIfEmpty(draft.codeOfConduct)
+            customBannerURL: draft.customBannerURLStringForSave,
+            codeOfConduct: nilIfEmpty(draft.codeOfConduct),
+            cancellationPolicy: nilIfEmpty(draft.cancellationPolicy),
+            avatarBackgroundColor: draft.avatarBackgroundColor
         )
 
         let updatedRows: [ClubRow] = try await send(
             path: "clubs",
             queryItems: [
                 .init(name: "id", value: "eq.\(clubID.uuidString)"),
-                .init(name: "select", value: "id,name,description,image_url,contact_email,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,code_of_conduct")
+                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone")
             ],
             method: "PATCH",
             body: try JSONEncoder().encode(payload),
@@ -1676,22 +1961,21 @@ final class SupabaseService: ClubDataProviding {
             throw SupabaseServiceError.authenticationRequired
         }
 
-        let _: [ClubRow] = try await send(
-            path: "clubs",
-            queryItems: [
-                .init(name: "id", value: "eq.\(clubID.uuidString)"),
-                .init(name: "select", value: "id,name,description,image_url,contact_email,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,code_of_conduct")
-            ],
-            method: "DELETE",
-            body: nil,
+        // Direct DELETE fails when child tables (games, bookings, club_members, etc.)
+        // have FK constraints without ON DELETE CASCADE. Use the delete_club RPC which
+        // removes child records in dependency order before deleting the club row.
+        struct DeleteClubBody: Encodable { let p_club_id: String }
+        try await sendVoid(
+            path: "rpc/delete_club",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(DeleteClubBody(p_club_id: clubID.uuidString.lowercased())),
             authBearerToken: authToken,
-            extraHeaders: [
-                "Prefer": "return=representation"
-            ]
+            extraHeaders: ["Content-Type": "application/json"]
         )
     }
 
-    func createBooking(gameID: UUID, userID: UUID, status: String = "confirmed", waitlistPosition: Int? = nil, feePaid: Bool = false, stripePaymentIntentID: String? = nil, paymentMethod: String? = nil) async throws -> BookingRecord {
+    func createBooking(gameID: UUID, userID: UUID, status: String = "confirmed", waitlistPosition: Int? = nil, feePaid: Bool = false, stripePaymentIntentID: String? = nil, paymentMethod: String? = nil, platformFeeCents: Int? = nil, clubPayoutCents: Int? = nil, creditsAppliedCents: Int? = nil) async throws -> BookingRecord {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
@@ -1704,10 +1988,16 @@ final class SupabaseService: ClubDataProviding {
             waitlistPosition: waitlistPosition,
             feePaid: feePaid ? true : nil,
             stripePaymentIntentID: stripePaymentIntentID,
-            paymentMethod: paymentMethod
+            paymentMethod: paymentMethod,
+            platformFeeCents: platformFeeCents,
+            clubPayoutCents: clubPayoutCents,
+            creditsAppliedCents: creditsAppliedCents
         )
 
         do {
+            // INSERT with minimal return — avoids SELECT errors when Phase 1 columns
+            // (platform_fee_cents, club_payout_cents, credits_applied_cents) haven't
+            // been migrated yet.  We read back only the stable base columns.
             let rows: [BookingRow] = try await send(
                 path: "bookings",
                 queryItems: [
@@ -1722,10 +2012,106 @@ final class SupabaseService: ClubDataProviding {
                 ]
             )
             guard let row = rows.first else { throw SupabaseServiceError.notFound }
-            return row.toBookingRecord()
+            // Re-inject the payment breakdown we sent so the in-memory record is complete
+            // without requiring a round-trip fetch.
+            let base = row.toBookingRecord()
+            // Re-inject payment breakdown from the insert payload so the in-memory
+            // record is accurate without needing a second round-trip fetch.
+            return BookingRecord(
+                id: base.id,
+                gameID: base.gameID,
+                userID: base.userID,
+                state: base.state,
+                waitlistPosition: base.waitlistPosition,
+                createdAt: base.createdAt,
+                feePaid: base.feePaid,
+                paidAt: base.paidAt,
+                stripePaymentIntentID: base.stripePaymentIntentID,
+                paymentMethod: base.paymentMethod,
+                platformFeeCents: platformFeeCents,
+                clubPayoutCents: clubPayoutCents,
+                creditsAppliedCents: creditsAppliedCents,
+                holdExpiresAt: nil
+            )
         } catch let error as SupabaseServiceError {
             if case let .httpStatus(code, _) = error, code == 409 {
                 throw SupabaseServiceError.duplicateMembership
+            }
+            throw error
+        }
+    }
+
+    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool = false, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct BookGameParams: Encodable {
+            let pGameId: UUID
+            let pUserId: UUID
+            let pFeePaid: Bool
+            let pHoldForPayment: Bool
+            let pStripePiId: String?
+            let pPaymentMethod: String?
+            let pPlatformFeeCents: Int?
+            let pClubPayoutCents: Int?
+            let pCreditsAppliedCents: Int?
+            enum CodingKeys: String, CodingKey {
+                case pGameId = "p_game_id"
+                case pUserId = "p_user_id"
+                case pFeePaid = "p_fee_paid"
+                case pHoldForPayment = "p_hold_for_payment"
+                case pStripePiId = "p_stripe_pi_id"
+                case pPaymentMethod = "p_payment_method"
+                case pPlatformFeeCents = "p_platform_fee_cents"
+                case pClubPayoutCents = "p_club_payout_cents"
+                case pCreditsAppliedCents = "p_credits_applied_cents"
+            }
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(pGameId,          forKey: .pGameId)
+                try c.encode(pUserId,          forKey: .pUserId)
+                try c.encode(pFeePaid,         forKey: .pFeePaid)
+                try c.encode(pHoldForPayment,  forKey: .pHoldForPayment)
+                try c.encodeIfPresent(pStripePiId,           forKey: .pStripePiId)
+                try c.encodeIfPresent(pPaymentMethod,        forKey: .pPaymentMethod)
+                try c.encodeIfPresent(pPlatformFeeCents,     forKey: .pPlatformFeeCents)
+                try c.encodeIfPresent(pClubPayoutCents,      forKey: .pClubPayoutCents)
+                try c.encodeIfPresent(pCreditsAppliedCents,  forKey: .pCreditsAppliedCents)
+            }
+        }
+
+        let params = BookGameParams(
+            pGameId: gameID,
+            pUserId: userID,
+            pFeePaid: feePaid,
+            pHoldForPayment: holdForPayment,
+            pStripePiId: stripePaymentIntentID,
+            pPaymentMethod: paymentMethod,
+            pPlatformFeeCents: platformFeeCents,
+            pClubPayoutCents: clubPayoutCents,
+            pCreditsAppliedCents: creditsAppliedCents
+        )
+
+        do {
+            let encodedBody = try JSONEncoder().encode(params)
+            let rows: [BookingRow] = try await send(
+                path: "rpc/book_game",
+                queryItems: [],
+                method: "POST",
+                body: encodedBody,
+                authBearerToken: authToken,
+                extraHeaders: ["Content-Type": "application/json"]
+            )
+            guard let row = rows.first else { throw SupabaseServiceError.notFound }
+            return row.toBookingRecord()
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(code, body) = error {
+                if code == 409 { throw SupabaseServiceError.duplicateMembership }
+                if body.contains("game_not_found") { throw SupabaseServiceError.notFound }
+                if body.contains("membership_required") { throw SupabaseServiceError.membershipRequired }
+                if body.contains("dupr_required") { throw SupabaseServiceError.duprRequired }
             }
             throw error
         }
@@ -1737,23 +2123,43 @@ final class SupabaseService: ClubDataProviding {
             throw SupabaseServiceError.authenticationRequired
         }
 
-        let payload = BookingAdminInsertBody(gameID: gameID, userID: userID, status: status, waitlistPosition: waitlistPosition)
+        // Server-authoritative path. owner_create_booking() RPC takes a FOR UPDATE
+        // lock on the games row and decides confirmed vs waitlisted under the same
+        // capacity invariant as book_game(). The status / waitlistPosition args
+        // are ignored — kept on the signature for callers but the server is the
+        // source of truth.
+        struct OwnerCreateBookingParams: Encodable {
+            let pGameId: UUID
+            let pUserId: UUID
+            enum CodingKeys: String, CodingKey {
+                case pGameId = "p_game_id"
+                case pUserId = "p_user_id"
+            }
+        }
 
-        let rows: [BookingRow] = try await send(
-            path: "bookings",
-            queryItems: [
-                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method")
-            ],
-            method: "POST",
-            body: try JSONEncoder().encode([payload]),
-            authBearerToken: authToken,
-            extraHeaders: [
-                "Prefer": "return=representation",
-                "Content-Type": "application/json"
-            ]
-        )
-        guard let row = rows.first else { throw SupabaseServiceError.notFound }
-        return row.toBookingRecord()
+        let params = OwnerCreateBookingParams(pGameId: gameID, pUserId: userID)
+
+        do {
+            let rows: [BookingRow] = try await send(
+                path: "rpc/owner_create_booking",
+                queryItems: [],
+                method: "POST",
+                body: try JSONEncoder().encode(params),
+                authBearerToken: authToken,
+                extraHeaders: ["Content-Type": "application/json"]
+            )
+            guard let row = rows.first else { throw SupabaseServiceError.notFound }
+            return row.toBookingRecord()
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(code, body) = error {
+                if code == 409 || body.contains("duplicate_booking") {
+                    throw SupabaseServiceError.duplicateMembership
+                }
+                if body.contains("game_not_found") { throw SupabaseServiceError.notFound }
+                if body.contains("forbidden_not_admin") { throw SupabaseServiceError.authenticationRequired }
+            }
+            throw error
+        }
     }
 
     func removeMembership(clubID: UUID, userID: UUID) async throws {
@@ -1796,19 +2202,76 @@ final class SupabaseService: ClubDataProviding {
         )
     }
 
-    func cancelBooking(bookingID: UUID) async throws -> BookingRecord {
+    func cancelBookingWithCredit(bookingID: UUID) async throws -> CancellationResult {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
         }
 
-        let payload = BookingStatusUpdateBody(status: "cancelled")
+        struct RequestBody: Encodable {
+            let pBookingId: String
+            enum CodingKeys: String, CodingKey { case pBookingId = "p_booking_id" }
+        }
+        struct ResultRow: Decodable {
+            let creditIssuedCents: Int
+            let wasEligible: Bool
+            let newBalanceCents: Int
+            enum CodingKeys: String, CodingKey {
+                case creditIssuedCents = "credit_issued_cents"
+                case wasEligible       = "was_eligible"
+                case newBalanceCents   = "new_balance_cents"
+            }
+        }
 
+        let rows: [ResultRow] = try await send(
+            path: "rpc/cancel_booking_with_credit",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(RequestBody(pBookingId: bookingID.uuidString.lowercased())),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        guard let row = rows.first else { throw SupabaseServiceError.notFound }
+        return CancellationResult(
+            creditIssuedCents: row.creditIssuedCents,
+            wasEligible: row.wasEligible,
+            newBalanceCents: row.newBalanceCents
+        )
+    }
+
+    func confirmPendingBooking(bookingID: UUID, stripePaymentIntentID: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        let resolvedPaymentMethod: String = stripePaymentIntentID != nil ? "stripe"
+            : (creditsAppliedCents != nil ? "credits" : "stripe")
+        let payload = BookingConfirmPaymentBody(
+            status: "confirmed",
+            feePaid: stripePaymentIntentID != nil,
+            stripePaymentIntentID: stripePaymentIntentID,
+            paymentMethod: resolvedPaymentMethod,
+            platformFeeCents: platformFeeCents,
+            clubPayoutCents: clubPayoutCents,
+            creditsAppliedCents: creditsAppliedCents
+        )
+
+        // Three-layer server guard — all must match for the PATCH to apply:
+        //   1. id          — correct booking
+        //   2. status      — still pending_payment (not already confirmed or reverted)
+        //   3. hold_expires_at > now() — hold is still active at the moment of execution
+        // If any filter fails (0 rows returned) the hold has expired or been reverted
+        // and we throw holdExpired so the caller can show an appropriate message.
+        let nowISO = SupabaseDateWriter.string(from: Date())
         let rows: [BookingRow] = try await send(
             path: "bookings",
             queryItems: [
                 .init(name: "id", value: "eq.\(bookingID.uuidString)"),
-                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method")
+                .init(name: "status", value: "eq.pending_payment"),
+                .init(name: "hold_expires_at", value: "gt.\(nowISO)"),
+                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at")
             ],
             method: "PATCH",
             body: try JSONEncoder().encode(payload),
@@ -1819,7 +2282,7 @@ final class SupabaseService: ClubDataProviding {
             ]
         )
 
-        guard let row = rows.first else { throw SupabaseServiceError.notFound }
+        guard let row = rows.first else { throw SupabaseServiceError.holdExpired }
         return row.toBookingRecord()
     }
 
@@ -1837,7 +2300,7 @@ final class SupabaseService: ClubDataProviding {
             path: "bookings",
             queryItems: [
                 .init(name: "id", value: "eq.\(bookingID.uuidString)"),
-                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method")
+                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at")
             ],
             method: "PATCH",
             body: body,
@@ -1852,7 +2315,36 @@ final class SupabaseService: ClubDataProviding {
         return row.toBookingRecord()
     }
 
-    func upsertAttendanceCheckIn(gameID: UUID, bookingID: UUID, userID: UUID, checkedInBy: UUID) async throws {
+    func updateBookingPaymentMethod(bookingID: UUID, paymentMethod: String) async throws -> BookingRecord {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        let feePaid = paymentMethod == "cash" || paymentMethod == "stripe"
+        let payload: [String: Any] = ["payment_method": paymentMethod, "fee_paid": feePaid]
+        let body = try JSONSerialization.data(withJSONObject: payload, options: [])
+
+        let rows: [BookingRow] = try await send(
+            path: "bookings",
+            queryItems: [
+                .init(name: "id", value: "eq.\(bookingID.uuidString)"),
+                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at")
+            ],
+            method: "PATCH",
+            body: body,
+            authBearerToken: authToken,
+            extraHeaders: [
+                "Prefer": "return=representation",
+                "Content-Type": "application/json"
+            ]
+        )
+
+        guard let row = rows.first else { throw SupabaseServiceError.notFound }
+        return row.toBookingRecord()
+    }
+
+    func upsertAttendance(gameID: UUID, bookingID: UUID, userID: UUID, checkedInBy: UUID, status: String) async throws {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
@@ -1863,7 +2355,8 @@ final class SupabaseService: ClubDataProviding {
             bookingID: bookingID,
             userID: userID,
             checkedInAt: SupabaseDateWriter.string(from: Date()),
-            checkedInBy: checkedInBy
+            checkedInBy: checkedInBy,
+            attendanceStatus: status
         )
 
         let _: [GameAttendanceRow] = try await send(
@@ -1911,18 +2404,22 @@ final class SupabaseService: ClubDataProviding {
         let payload = ProfileUpsertRow(
             id: profile.id,
             email: profile.email,
+            firstName: profile.firstName,
+            lastName: profile.lastName,
             fullName: profile.fullName,
             phone: profile.phone,
             dateOfBirth: profile.dateOfBirth.map { Self.isoDateFormatter.string(from: $0) },
             emergencyContactName: profile.emergencyContactName,
             emergencyContactPhone: profile.emergencyContactPhone,
-            duprRating: profile.duprRating
+            duprRating: profile.duprRating,
+            duprID: profile.duprID,
+            avatarColorKey: profile.avatarColorKey
         )
 
         let rows: [ProfileRow] = try await send(
             path: "profiles",
             queryItems: [
-                .init(name: "select", value: "id,email,full_name,phone,date_of_birth,emergency_contact_name,emergency_contact_phone,dupr_rating"),
+                .init(name: "select", value: "id,email,first_name,last_name,full_name,phone,date_of_birth,emergency_contact_name,emergency_contact_phone,dupr_rating,dupr_id,avatar_color_key"),
                 .init(name: "on_conflict", value: "id")
             ],
             method: "POST",
@@ -1937,6 +2434,8 @@ final class SupabaseService: ClubDataProviding {
         guard let row = rows.first else { return profile }
         return UserProfile(
             id: row.id,
+            firstName: row.firstName,
+            lastName: row.lastName,
             fullName: row.fullName ?? profile.fullName,
             email: row.email,
             phone: row.phone,
@@ -1944,8 +2443,10 @@ final class SupabaseService: ClubDataProviding {
             emergencyContactName: row.emergencyContactName,
             emergencyContactPhone: row.emergencyContactPhone,
             duprRating: row.duprRating,
+            duprID: row.duprID,
             favoriteClubName: profile.favoriteClubName,
-            skillLevel: profile.skillLevel
+            skillLevel: profile.skillLevel,
+            avatarColorKey: row.avatarColorKey
         )
     }
 
@@ -1959,19 +2460,23 @@ final class SupabaseService: ClubDataProviding {
         let payload = ProfileUpsertRow(
             id: profile.id,
             email: profile.email,
+            firstName: profile.firstName,
+            lastName: profile.lastName,
             fullName: profile.fullName,
             phone: profile.phone,
             dateOfBirth: profile.dateOfBirth.map { Self.isoDateFormatter.string(from: $0) },
             emergencyContactName: profile.emergencyContactName,
             emergencyContactPhone: profile.emergencyContactPhone,
-            duprRating: profile.duprRating
+            duprRating: profile.duprRating,
+            duprID: profile.duprID,
+            avatarColorKey: profile.avatarColorKey
         )
 
         let rows: [ProfileRow] = try await send(
             path: "profiles",
             queryItems: [
                 .init(name: "id", value: "eq.\(profile.id.uuidString)"),
-                .init(name: "select", value: "id,email,full_name,phone,date_of_birth,emergency_contact_name,emergency_contact_phone,dupr_rating")
+                .init(name: "select", value: "id,email,first_name,last_name,full_name,phone,date_of_birth,emergency_contact_name,emergency_contact_phone,dupr_rating,dupr_id,avatar_color_key")
             ],
             method: "PATCH",
             body: try JSONEncoder().encode(payload),
@@ -1985,6 +2490,8 @@ final class SupabaseService: ClubDataProviding {
         guard let row = rows.first else { return profile }
         return UserProfile(
             id: row.id,
+            firstName: row.firstName,
+            lastName: row.lastName,
             fullName: row.fullName ?? profile.fullName,
             email: row.email,
             phone: row.phone,
@@ -1992,8 +2499,10 @@ final class SupabaseService: ClubDataProviding {
             emergencyContactName: row.emergencyContactName,
             emergencyContactPhone: row.emergencyContactPhone,
             duprRating: row.duprRating,
+            duprID: row.duprID,
             favoriteClubName: profile.favoriteClubName,
-            skillLevel: profile.skillLevel
+            skillLevel: profile.skillLevel,
+            avatarColorKey: row.avatarColorKey
         )
     }
 
@@ -2052,6 +2561,30 @@ final class SupabaseService: ClubDataProviding {
                 "Content-Type": "application/json"
             ]
         )
+        if let pushToken, !pushToken.isEmpty {
+            let pushTokenBody = try JSONSerialization.data(withJSONObject: [
+                "user_id": userID.uuidString,
+                "token": pushToken
+            ])
+
+            struct PushTokenRow: Decodable {
+                let id: UUID
+            }
+
+            let _: [PushTokenRow] = try await send(
+                path: "push_tokens",
+                queryItems: [
+                    .init(name: "select", value: "id")
+                ],
+                method: "POST",
+                body: pushTokenBody,
+                authBearerToken: authToken,
+                extraHeaders: [
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                    "Content-Type": "application/json"
+                ]
+            )
+        }
     }
 
     // MARK: - Notifications
@@ -2191,6 +2724,7 @@ final class SupabaseService: ClubDataProviding {
             let createdAtRaw: String?
             let reviewerName: String?
             let gameTitle: String?
+            let reviewerAvatarColorKey: String?
             enum CodingKeys: String, CodingKey {
                 case id, rating, comment
                 case gameID = "game_id"
@@ -2198,6 +2732,7 @@ final class SupabaseService: ClubDataProviding {
                 case createdAtRaw = "created_at"
                 case reviewerName = "reviewer_name"
                 case gameTitle = "game_title"
+                case reviewerAvatarColorKey = "reviewer_avatar_color_key"
             }
         }
 
@@ -2224,9 +2759,643 @@ final class SupabaseService: ClubDataProviding {
                 comment: $0.comment,
                 createdAt: $0.createdAtRaw.flatMap(SupabaseDateParser.parse),
                 reviewerName: $0.reviewerName,
-                gameTitle: $0.gameTitle
+                gameTitle: $0.gameTitle,
+                avatarColorKey: $0.reviewerAvatarColorKey
             )
         }
+    }
+
+    func fetchPendingReviewPrompt(userID: UUID) async throws -> PendingReviewPrompt? {
+        guard SupabaseConfig.isConfigured else { return nil }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Row: Decodable {
+            let gameID: UUID
+            let gameTitle: String
+            let gameDateTimeRaw: String?
+            let clubID: UUID
+            let clubName: String
+            enum CodingKeys: String, CodingKey {
+                case gameID = "game_id"
+                case gameTitle = "game_title"
+                case gameDateTimeRaw = "game_date_time"
+                case clubID = "club_id"
+                case clubName = "club_name"
+            }
+        }
+
+        struct Params: Encodable {
+            let pUserId: UUID
+            enum CodingKeys: String, CodingKey { case pUserId = "p_user_id" }
+        }
+
+        let rows: [Row] = try await send(
+            path: "rpc/get_pending_review_prompt",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pUserId: userID)),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        guard let row = rows.first else { return nil }
+        return PendingReviewPrompt(
+            id: row.gameID,
+            gameTitle: row.gameTitle,
+            gameDateTime: row.gameDateTimeRaw.flatMap(SupabaseDateParser.parse) ?? Date(),
+            clubID: row.clubID,
+            clubName: row.clubName
+        )
+    }
+
+    func dismissReviewPrompt(gameID: UUID) async throws {
+        guard SupabaseConfig.isConfigured else { return }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pGameId: UUID
+            enum CodingKeys: String, CodingKey { case pGameId = "p_game_id" }
+        }
+
+        try await sendVoid(
+            path: "rpc/dismiss_review_prompt",
+            body: try JSONEncoder().encode(Params(pGameId: gameID)),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+    }
+
+    func fetchClubRevenueSummary(clubID: UUID, days: Int?) async throws -> ClubRevenueSummary? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubId: UUID
+            let pDays: Int?
+            enum CodingKeys: String, CodingKey {
+                case pClubId = "p_club_id"
+                case pDays   = "p_days"
+            }
+        }
+
+        struct SummaryRow: Decodable {
+            let totalClubPayoutCents: Int
+            let totalPlatformFeeCents: Int
+            let paidBookingCount: Int
+            let freeBookingCount: Int
+            let currency: String
+            let asOfRaw: String?
+            enum CodingKeys: String, CodingKey {
+                case totalClubPayoutCents  = "total_club_payout_cents"
+                case totalPlatformFeeCents = "total_platform_fee_cents"
+                case paidBookingCount      = "paid_booking_count"
+                case freeBookingCount      = "free_booking_count"
+                case currency
+                case asOfRaw               = "as_of"
+            }
+        }
+
+        let rows: [SummaryRow] = try await send(
+            path: "rpc/get_club_revenue_summary",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pClubId: clubID, pDays: days)),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        guard let row = rows.first else { return nil }
+        return ClubRevenueSummary(
+            totalClubPayoutCents: row.totalClubPayoutCents,
+            totalPlatformFeeCents: row.totalPlatformFeeCents,
+            paidBookingCount: row.paidBookingCount,
+            freeBookingCount: row.freeBookingCount,
+            currency: row.currency,
+            asOf: row.asOfRaw.flatMap(SupabaseDateParser.parse) ?? Date()
+        )
+    }
+
+    func fetchClubFillRateSummary(clubID: UUID, days: Int?) async throws -> ClubFillRateSummary? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubId: UUID
+            let pDays: Int?
+            enum CodingKeys: String, CodingKey {
+                case pClubId = "p_club_id"
+                case pDays   = "p_days"
+            }
+        }
+
+        struct FillRateRow: Decodable {
+            let totalGamesCount: Int
+            let totalSpotsOffered: Int
+            let totalConfirmedBookings: Int
+            let averageFillRate: Double
+            let fullGamesCount: Int
+            let averagePlayersPerGame: Double
+            let cancellationRate: Double
+            let asOfRaw: String?
+            enum CodingKeys: String, CodingKey {
+                case totalGamesCount        = "total_games_count"
+                case totalSpotsOffered      = "total_spots_offered"
+                case totalConfirmedBookings = "total_confirmed_bookings"
+                case averageFillRate        = "average_fill_rate"
+                case fullGamesCount         = "full_games_count"
+                case averagePlayersPerGame  = "average_players_per_game"
+                case cancellationRate       = "cancellation_rate"
+                case asOfRaw                = "as_of"
+            }
+        }
+
+        let rows: [FillRateRow] = try await send(
+            path: "rpc/get_club_fill_rate_summary",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pClubId: clubID, pDays: days)),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        guard let row = rows.first else { return nil }
+        return ClubFillRateSummary(
+            totalGamesCount: row.totalGamesCount,
+            totalSpotsOffered: row.totalSpotsOffered,
+            totalConfirmedBookings: row.totalConfirmedBookings,
+            averageFillRate: row.averageFillRate,
+            fullGamesCount: row.fullGamesCount,
+            averagePlayersPerGame: row.averagePlayersPerGame,
+            cancellationRate: row.cancellationRate,
+            asOf: row.asOfRaw.flatMap(SupabaseDateParser.parse) ?? Date()
+        )
+    }
+
+    // MARK: - Phase 5B Analytics
+
+    func fetchClubAnalyticsKPIs(clubID: UUID, days: Int, startDate: Date? = nil, endDate: Date? = nil) async throws -> ClubAnalyticsKPIs? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubId:    UUID
+            let pDays:      Int
+            let pStartDate: String?
+            let pEndDate:   String?
+            enum CodingKeys: String, CodingKey {
+                case pClubId    = "p_club_id"
+                case pDays      = "p_days"
+                case pStartDate = "p_start_date"
+                case pEndDate   = "p_end_date"
+            }
+        }
+
+        struct Row: Decodable {
+            let currRevenueCents:        Int
+            let currBookingCount:        Int
+            let currFillRate:            Double
+            let currActivePlayers:       Int
+            let prevRevenueCents:        Int
+            let prevBookingCount:        Int
+            let prevFillRate:            Double
+            let prevActivePlayers:       Int
+            let cancellationRate:        Double
+            let repeatPlayerRate:        Double
+            let currency:                String
+            let asOfRaw:                 String?
+            // Revenue breakdown fields — default to 0 for clubs running the old RPC version
+            let currGrossRevenueCents:   Int?
+            let currPlatformFeeCents:    Int?
+            let currCreditsUsedCents:    Int?
+            let prevGrossRevenueCents:   Int?
+            let prevPlatformFeeCents:    Int?
+            let prevCreditsUsedCents:    Int?
+            let currCreditsReturnedCents: Int?
+            let currCreditReturnCount:   Int?
+            let currManualRevenueCents:  Int?
+            let prevManualRevenueCents:  Int?
+            enum CodingKeys: String, CodingKey {
+                case currRevenueCents        = "curr_revenue_cents"
+                case currBookingCount        = "curr_booking_count"
+                case currFillRate            = "curr_fill_rate"
+                case currActivePlayers       = "curr_active_players"
+                case prevRevenueCents        = "prev_revenue_cents"
+                case prevBookingCount        = "prev_booking_count"
+                case prevFillRate            = "prev_fill_rate"
+                case prevActivePlayers       = "prev_active_players"
+                case cancellationRate        = "cancellation_rate"
+                case repeatPlayerRate        = "repeat_player_rate"
+                case currency
+                case asOfRaw                 = "as_of"
+                case currGrossRevenueCents   = "curr_gross_revenue_cents"
+                case currPlatformFeeCents    = "curr_platform_fee_cents"
+                case currCreditsUsedCents    = "curr_credits_used_cents"
+                case prevGrossRevenueCents   = "prev_gross_revenue_cents"
+                case prevPlatformFeeCents    = "prev_platform_fee_cents"
+                case prevCreditsUsedCents    = "prev_credits_used_cents"
+                case currCreditsReturnedCents = "curr_credits_returned_cents"
+                case currCreditReturnCount   = "curr_credit_return_count"
+                case currManualRevenueCents  = "curr_manual_revenue_cents"
+                case prevManualRevenueCents  = "prev_manual_revenue_cents"
+            }
+        }
+
+        let rows: [Row] = try await send(
+            path: "rpc/get_club_analytics_kpis",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(
+                pClubId:    clubID,
+                pDays:      days,
+                pStartDate: startDate.map(SupabaseDateWriter.string(from:)),
+                pEndDate:   endDate.map(SupabaseDateWriter.string(from:))
+            )),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        guard let row = rows.first else { return nil }
+        return ClubAnalyticsKPIs(
+            currRevenueCents:        row.currRevenueCents,
+            currBookingCount:        row.currBookingCount,
+            currFillRate:            row.currFillRate,
+            currActivePlayers:       row.currActivePlayers,
+            prevRevenueCents:        row.prevRevenueCents,
+            prevBookingCount:        row.prevBookingCount,
+            prevFillRate:            row.prevFillRate,
+            prevActivePlayers:       row.prevActivePlayers,
+            cancellationRate:        row.cancellationRate,
+            repeatPlayerRate:        row.repeatPlayerRate,
+            currency:                row.currency.isEmpty ? "AUD" : row.currency.uppercased(),
+            asOf:                    row.asOfRaw.flatMap(SupabaseDateParser.parse) ?? Date(),
+            currGrossRevenueCents:   row.currGrossRevenueCents   ?? row.currRevenueCents,
+            currPlatformFeeCents:    row.currPlatformFeeCents    ?? 0,
+            currCreditsUsedCents:    row.currCreditsUsedCents    ?? 0,
+            prevGrossRevenueCents:   row.prevGrossRevenueCents   ?? row.prevRevenueCents,
+            prevPlatformFeeCents:    row.prevPlatformFeeCents    ?? 0,
+            prevCreditsUsedCents:    row.prevCreditsUsedCents    ?? 0,
+            currCreditsReturnedCents: row.currCreditsReturnedCents ?? 0,
+            currCreditReturnCount:   row.currCreditReturnCount   ?? 0,
+            currManualRevenueCents:  row.currManualRevenueCents  ?? 0,
+            prevManualRevenueCents:  row.prevManualRevenueCents  ?? 0
+        )
+    }
+
+    func fetchClubDashboardSummary(clubID: UUID) async throws -> ClubDashboardSummary? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubId: UUID
+            enum CodingKeys: String, CodingKey { case pClubId = "p_club_id" }
+        }
+
+        struct Row: Decodable {
+            let totalMembers:            Int
+            let memberGrowth30d:         Int
+            let monthlyActivePlayers30d: Int
+            let prevActivePlayers30d:    Int
+            let fillRate30d:             Double?   // nil when no completed games with valid capacity
+            let prevFillRate30d:         Double?   // nil when no prior-period games with valid capacity
+            let upcomingBookingsCount:   Int
+            enum CodingKeys: String, CodingKey {
+                case totalMembers            = "total_members"
+                case memberGrowth30d         = "member_growth_30d"
+                case monthlyActivePlayers30d = "monthly_active_players_30d"
+                case prevActivePlayers30d    = "prev_active_players_30d"
+                case fillRate30d             = "fill_rate_30d"
+                case prevFillRate30d         = "prev_fill_rate_30d"
+                case upcomingBookingsCount   = "upcoming_bookings_count"
+            }
+        }
+
+        let rows: [Row] = try await send(
+            path: "rpc/get_club_dashboard_summary",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pClubId: clubID)),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        guard let row = rows.first else { return nil }
+        return ClubDashboardSummary(
+            totalMembers:            row.totalMembers,
+            memberGrowth30d:         row.memberGrowth30d,
+            monthlyActivePlayers30d: row.monthlyActivePlayers30d,
+            prevActivePlayers30d:    row.prevActivePlayers30d,
+            fillRate30d:             row.fillRate30d,
+            prevFillRate30d:         row.prevFillRate30d,
+            upcomingBookingsCount:   row.upcomingBookingsCount
+        )
+    }
+
+    func fetchClubAnalyticsSupplemental(clubID: UUID, days: Int, startDate: Date? = nil, endDate: Date? = nil) async throws -> ClubAnalyticsSupplemental? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubId:    UUID
+            let pDays:      Int
+            let pStartDate: String?
+            let pEndDate:   String?
+            enum CodingKeys: String, CodingKey {
+                case pClubId    = "p_club_id"
+                case pDays      = "p_days"
+                case pStartDate = "p_start_date"
+                case pEndDate   = "p_end_date"
+            }
+        }
+
+        struct Row: Decodable {
+            let currMemberJoins:             Int
+            let prevMemberJoins:             Int
+            let totalActiveMembers:          Int
+            let currNewPlayers:              Int
+            let currGameCount:               Int
+            let currNoShowCount:             Int
+            let currCheckedCount:            Int
+            let currWaitlistCount:           Int
+            let currPaidBookings:            Int
+            let currFreeBookings:            Int
+            let avgRevPerPlayerCents:        Int
+            let currNoShowRate:              Double?  // nil when no attendance data
+            let currCreditBookingCount:      Int?
+            let currCompBookingCount:        Int?
+            let currTrulyFreeBookingCount:   Int?
+            let currCashBookingCount:        Int?
+            enum CodingKeys: String, CodingKey {
+                case currMemberJoins             = "curr_member_joins"
+                case prevMemberJoins             = "prev_member_joins"
+                case totalActiveMembers          = "total_active_members"
+                case currNewPlayers              = "curr_new_players"
+                case currGameCount               = "curr_game_count"
+                case currNoShowCount             = "curr_no_show_count"
+                case currCheckedCount            = "curr_checked_count"
+                case currWaitlistCount           = "curr_waitlist_count"
+                case currPaidBookings            = "curr_paid_bookings"
+                case currFreeBookings            = "curr_free_bookings"
+                case avgRevPerPlayerCents        = "avg_rev_per_player_cents"
+                case currNoShowRate              = "curr_no_show_rate"
+                case currCreditBookingCount      = "curr_credit_booking_count"
+                case currCompBookingCount        = "curr_comp_booking_count"
+                case currTrulyFreeBookingCount   = "curr_truly_free_booking_count"
+                case currCashBookingCount        = "curr_cash_booking_count"
+            }
+        }
+
+        let rows: [Row] = try await send(
+            path: "rpc/get_club_analytics_supplemental",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pClubId: clubID, pDays: days, pStartDate: startDate.map(SupabaseDateWriter.string(from:)), pEndDate: endDate.map(SupabaseDateWriter.string(from:)))),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        guard let row = rows.first else { return nil }
+        return ClubAnalyticsSupplemental(
+            currMemberJoins:             row.currMemberJoins,
+            prevMemberJoins:             row.prevMemberJoins,
+            totalActiveMembers:          row.totalActiveMembers,
+            currNewPlayers:              row.currNewPlayers,
+            currGameCount:               row.currGameCount,
+            currNoShowCount:             row.currNoShowCount,
+            currCheckedCount:            row.currCheckedCount,
+            currWaitlistCount:           row.currWaitlistCount,
+            currPaidBookings:            row.currPaidBookings,
+            currFreeBookings:            row.currFreeBookings,
+            avgRevPerPlayerCents:        row.avgRevPerPlayerCents,
+            noShowRate:                  row.currNoShowRate,
+            currCreditBookingCount:      row.currCreditBookingCount    ?? 0,
+            currCompBookingCount:        row.currCompBookingCount      ?? 0,
+            currTrulyFreeBookingCount:   row.currTrulyFreeBookingCount ?? 0,
+            currCashBookingCount:        row.currCashBookingCount      ?? 0
+        )
+    }
+
+    func fetchClubRevenueTrend(clubID: UUID, days: Int, startDate: Date? = nil, endDate: Date? = nil) async throws -> [ClubRevenueTrendPoint] {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubId:    UUID
+            let pDays:      Int
+            let pStartDate: String?
+            let pEndDate:   String?
+            enum CodingKeys: String, CodingKey {
+                case pClubId    = "p_club_id"
+                case pDays      = "p_days"
+                case pStartDate = "p_start_date"
+                case pEndDate   = "p_end_date"
+            }
+        }
+
+        struct TrendRow: Decodable {
+            let bucketDateRaw: String
+            let revenueCents:  Int
+            let bookingCount:  Int
+            let fillRate:      Double
+            enum CodingKeys: String, CodingKey {
+                case bucketDateRaw = "bucket_date"
+                case revenueCents  = "revenue_cents"
+                case bookingCount  = "booking_count"
+                case fillRate      = "fill_rate"
+            }
+        }
+
+        let rows: [TrendRow] = try await send(
+            path: "rpc/get_club_revenue_trend",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pClubId: clubID, pDays: days, pStartDate: startDate.map(SupabaseDateWriter.string(from:)), pEndDate: endDate.map(SupabaseDateWriter.string(from:)))),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        let dateParser = ISO8601DateFormatter()
+        dateParser.formatOptions = [.withFullDate]
+
+        return rows.compactMap { row in
+            guard let date = dateParser.date(from: row.bucketDateRaw)
+                          ?? SupabaseDateParser.parse(row.bucketDateRaw) else { return nil }
+            return ClubRevenueTrendPoint(
+                bucketDate:   date,
+                revenueCents: row.revenueCents,
+                bookingCount: row.bookingCount,
+                fillRate:     row.fillRate
+            )
+        }
+    }
+
+    func fetchClubTopGames(clubID: UUID, days: Int, startDate: Date? = nil, endDate: Date? = nil) async throws -> [ClubTopGame] {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubId:    UUID
+            let pDays:      Int
+            let pLimit:     Int
+            let pStartDate: String?
+            let pEndDate:   String?
+            enum CodingKeys: String, CodingKey {
+                case pClubId    = "p_club_id"
+                case pDays      = "p_days"
+                case pLimit     = "p_limit"
+                case pStartDate = "p_start_date"
+                case pEndDate   = "p_end_date"
+            }
+        }
+
+        // Pattern-level row (no game_id or game_date — see 20260426_analytics_top_games_time_to_fill.sql)
+        struct TopGameRow: Decodable {
+            let gameTitle:               String
+            let dayOfWeek:               Int
+            let hourOfDay:               Int
+            let occurrenceCount:         Int
+            let filledOccurrenceCount:   Int?
+            let avgConfirmed:            Double
+            let maxSpots:                Int?
+            let avgFillRate:             Double
+            let totalRevenueCents:       Int
+            let avgWaitlist:             Double
+            let avgTimeToFillMinutes:    Double?
+            let skillLevel:              String?
+            let gameFormat:              String?
+            enum CodingKeys: String, CodingKey {
+                case gameTitle               = "game_title"
+                case dayOfWeek               = "day_of_week"
+                case hourOfDay               = "hour_of_day"
+                case occurrenceCount         = "occurrence_count"
+                case filledOccurrenceCount   = "filled_occurrence_count"
+                case avgConfirmed            = "avg_confirmed"
+                case maxSpots                = "max_spots"
+                case avgFillRate             = "avg_fill_rate"
+                case totalRevenueCents       = "total_revenue_cents"
+                case avgWaitlist             = "avg_waitlist"
+                case avgTimeToFillMinutes    = "avg_time_to_fill_minutes"
+                case skillLevel              = "skill_level"
+                case gameFormat              = "game_format"
+            }
+        }
+
+        let rows: [TopGameRow] = try await send(
+            path: "rpc/get_club_top_games",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pClubId: clubID, pDays: days, pLimit: 5, pStartDate: startDate.map(SupabaseDateWriter.string(from:)), pEndDate: endDate.map(SupabaseDateWriter.string(from:)))),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        return rows.map { row in
+            ClubTopGame(
+                title:                   row.gameTitle,
+                dayOfWeek:               row.dayOfWeek,
+                hourOfDay:               row.hourOfDay,
+                occurrenceCount:         row.occurrenceCount,
+                filledOccurrenceCount:   row.filledOccurrenceCount ?? 0,
+                avgConfirmed:            row.avgConfirmed,
+                maxSpots:                row.maxSpots ?? 0,
+                avgFillRate:             row.avgFillRate,
+                totalRevenueCents:       row.totalRevenueCents,
+                avgWaitlist:             row.avgWaitlist,
+                avgTimeToFillMinutes:    row.avgTimeToFillMinutes,
+                skillLevel:              row.skillLevel,
+                gameFormat:              row.gameFormat
+            )
+        }
+    }
+
+    func fetchClubPeakTimes(clubID: UUID, days: Int, startDate: Date? = nil, endDate: Date? = nil) async throws -> [ClubPeakTime] {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubId:    UUID
+            let pDays:      Int
+            let pStartDate: String?
+            let pEndDate:   String?
+            enum CodingKeys: String, CodingKey {
+                case pClubId    = "p_club_id"
+                case pDays      = "p_days"
+                case pStartDate = "p_start_date"
+                case pEndDate   = "p_end_date"
+            }
+        }
+
+        struct PeakRow: Decodable {
+            let dayOfWeek:    Int
+            let hourOfDay:    Int
+            let avgConfirmed: Double
+            let gameCount:    Int
+            let avgFillRate:  Double
+            let avgWaitlist:  Double
+            enum CodingKeys: String, CodingKey {
+                case dayOfWeek    = "day_of_week"
+                case hourOfDay    = "hour_of_day"
+                case avgConfirmed = "avg_confirmed"
+                case gameCount    = "game_count"
+                case avgFillRate  = "avg_fill_rate"
+                case avgWaitlist  = "avg_waitlist"
+            }
+        }
+
+        let rows: [PeakRow] = try await send(
+            path: "rpc/get_club_peak_times",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pClubId: clubID, pDays: days, pStartDate: startDate.map(SupabaseDateWriter.string(from:)), pEndDate: endDate.map(SupabaseDateWriter.string(from:)))),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        return rows.map {
+            ClubPeakTime(
+                dayOfWeek:    $0.dayOfWeek,
+                hourOfDay:    $0.hourOfDay,
+                avgConfirmed: $0.avgConfirmed,
+                gameCount:    $0.gameCount,
+                avgFillRate:  $0.avgFillRate,
+                avgWaitlist:  $0.avgWaitlist
+            )
+        }
+    }
+
+    func fetchGame(gameID: UUID) async throws -> Game? {
+        guard SupabaseConfig.isConfigured else { return nil }
+        let rows: [GameRow] = try await send(
+            path: "games",
+            queryItems: [
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at"),
+                .init(name: "id", value: "eq.\(gameID.uuidString.lowercased())"),
+                .init(name: "limit", value: "1")
+            ],
+            method: "GET",
+            body: nil,
+            authBearerToken: resolvedAccessToken()
+        )
+        return rows.first.map { $0.toGame(confirmedCount: nil, waitlistCount: nil) }
     }
 
     func fetchGameClubID(gameID: UUID) async throws -> UUID? {
@@ -2262,10 +3431,27 @@ final class SupabaseService: ClubDataProviding {
         try await invokeEdgeFunction(name: "notify", body: try JSONEncoder().encode(request))
     }
 
-    func triggerGameCancelledNotify(gameID: UUID, gameTitle: String) async throws {
+    func triggerGameCancelledNotify(gameID: UUID, gameTitle: String, clubTimezone: String) async throws {
         guard SupabaseConfig.isConfigured else { return }
-        let request = GameCancelledNotifyRequest(gameID: gameID, gameTitle: gameTitle)
+        let request = GameCancelledNotifyRequest(gameID: gameID, gameTitle: gameTitle, clubTimezone: clubTimezone)
         try await invokeEdgeFunction(name: "game-cancelled-notify", body: try JSONEncoder().encode(request))
+    }
+
+    func triggerGamePublishedNotify(gameID: UUID, gameTitle: String, gameDateTime: Date, clubID: UUID, clubName: String, createdByUserID: UUID, skillLevel: String? = nil, clubTimezone: String) async throws {
+        guard SupabaseConfig.isConfigured else { return }
+        let request = GamePublishedNotifyRequest(
+            gameID: gameID,
+            gameTitle: gameTitle,
+            gameDateTime: gameDateTime,
+            clubID: clubID,
+            clubName: clubName,
+            createdByUserID: createdByUserID,
+            skillLevel: skillLevel,
+            clubTimezone: clubTimezone
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try await invokeEdgeFunction(name: "game-published-notify", body: try encoder.encode(request))
     }
 
     func triggerClubAnnouncementNotify(clubID: UUID, postID: UUID, posterUserID: UUID, clubName: String, posterName: String, postBody: String) async throws {
@@ -2281,8 +3467,11 @@ final class SupabaseService: ClubDataProviding {
         try await invokeEdgeFunction(name: "club-announcement-notify", body: try JSONEncoder().encode(request))
     }
 
-    func createPaymentIntent(amountCents: Int, currency: String, metadata: [String: String]) async throws -> String {
+    func createPaymentIntent(amountCents: Int, currency: String, clubID: UUID?, metadata: [String: String]) async throws -> PaymentIntentResult {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
         guard let baseURL = URL(string: SupabaseConfig.urlString) else {
             throw SupabaseServiceError.missingConfiguration
         }
@@ -2292,36 +3481,489 @@ final class SupabaseService: ClubDataProviding {
         struct PaymentIntentRequest: Encodable {
             let amount: Int
             let currency: String
+            let clubID: String?
             let metadata: [String: String]
+            enum CodingKeys: String, CodingKey {
+                case amount, currency, metadata
+                case clubID = "club_id"
+            }
         }
         struct PaymentIntentResponse: Decodable {
             let client_secret: String
+            let platform_fee_cents: Int?
+            let club_payout_cents: Int?
         }
 
         let body = try JSONEncoder().encode(PaymentIntentRequest(
             amount: amountCents,
             currency: currency,
+            clubID: clubID?.uuidString.lowercased(),
             metadata: metadata
         ))
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = body
-        // Use anon key for both headers — this function doesn't access user data,
-        // so the anon key is sufficient to pass the Supabase gateway.
         request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
-        request.setValue("Bearer \(SupabaseConfig.anonKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let msg = String(data: data, encoding: .utf8) ?? "Payment setup failed"
-            throw SupabaseServiceError.httpStatus(statusCode, msg)
+            // Promote 401 to a typed error so the caller can surface a sign-in message.
+            if statusCode == 401 { throw SupabaseServiceError.authenticationRequired }
+            // Parse {"error": "...", "error_code": "..."} from the edge function.
+            // Fall back to the raw body only if JSON parsing fails.
+            struct ErrorBody: Decodable {
+                let error: String?
+                let error_code: String?
+            }
+            let parsedMessage: String
+            if let parsed = try? JSONDecoder().decode(ErrorBody.self, from: data),
+               let msg = parsed.error, !msg.isEmpty {
+                parsedMessage = msg
+            } else {
+                parsedMessage = String(data: data, encoding: .utf8) ?? "Payment setup failed"
+            }
+            throw SupabaseServiceError.httpStatus(statusCode, parsedMessage)
         }
 
         let decoded = try JSONDecoder().decode(PaymentIntentResponse.self, from: data)
-        return decoded.client_secret
+        return PaymentIntentResult(
+            clientSecret: decoded.client_secret,
+            platformFeeCents: decoded.platform_fee_cents ?? 0,
+            clubPayoutCents: decoded.club_payout_cents ?? amountCents
+        )
+    }
+
+    func fetchClubStripeAccount(clubID: UUID) async throws -> ClubStripeAccount? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        let rows: [ClubStripeAccountRow] = try await send(
+            path: "club_stripe_accounts",
+            queryItems: [
+                .init(name: "club_id", value: "eq.\(clubID.uuidString)"),
+                .init(name: "select", value: "id,club_id,stripe_account_id,onboarding_complete,payouts_enabled,created_at"),
+                .init(name: "limit", value: "1")
+            ],
+            method: "GET",
+            body: nil,
+            authBearerToken: authToken
+        )
+        return rows.first.map { row in
+            ClubStripeAccount(
+                id: row.id,
+                clubID: row.clubID,
+                stripeAccountID: row.stripeAccountID,
+                onboardingComplete: row.onboardingComplete,
+                payoutsEnabled: row.payoutsEnabled,
+                createdAt: row.createdAtRaw.flatMap(SupabaseDateParser.parse)
+            )
+        }
+    }
+
+    func refreshStripeAccountStatus(clubID: UUID) async throws -> ClubStripeAccount? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        guard let baseURL = URL(string: SupabaseConfig.urlString) else {
+            throw SupabaseServiceError.missingConfiguration
+        }
+
+        let url = baseURL.appendingPathComponent("functions/v1/\(SupabaseConfig.stripeAccountStatusFunctionName)")
+
+        struct StatusRequest: Encodable {
+            let clubID: String
+            enum CodingKeys: String, CodingKey { case clubID = "club_id" }
+        }
+        struct StatusResponse: Decodable {
+            let stripeAccountID: String?
+            let onboardingComplete: Bool
+            let payoutsEnabled: Bool
+            enum CodingKeys: String, CodingKey {
+                case stripeAccountID = "stripe_account_id"
+                case onboardingComplete = "onboarding_complete"
+                case payoutsEnabled = "payouts_enabled"
+            }
+        }
+
+        let body = try JSONEncoder().encode(StatusRequest(clubID: clubID.uuidString.lowercased()))
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            // On any error fall back to the DB read performed by the caller's catch block
+            throw SupabaseServiceError.httpStatus(
+                (response as? HTTPURLResponse)?.statusCode ?? 0,
+                String(data: data, encoding: .utf8) ?? "Status refresh failed"
+            )
+        }
+
+        let decoded = try JSONDecoder().decode(StatusResponse.self, from: data)
+        guard let accountID = decoded.stripeAccountID else { return nil }
+
+        // Reconstruct a ClubStripeAccount from the response — we don't have id/createdAt from this endpoint
+        // so we fetch the full row from the DB to fill in the missing fields.
+        let rows: [ClubStripeAccountRow] = try await send(
+            path: "club_stripe_accounts",
+            queryItems: [
+                .init(name: "club_id", value: "eq.\(clubID.uuidString)"),
+                .init(name: "select", value: "id,club_id,stripe_account_id,onboarding_complete,payouts_enabled,created_at"),
+                .init(name: "limit", value: "1")
+            ],
+            method: "GET",
+            body: nil,
+            authBearerToken: authToken
+        )
+        if let row = rows.first {
+            return ClubStripeAccount(
+                id: row.id,
+                clubID: row.clubID,
+                stripeAccountID: accountID,
+                onboardingComplete: decoded.onboardingComplete,
+                payoutsEnabled: decoded.payoutsEnabled,
+                createdAt: row.createdAtRaw.flatMap(SupabaseDateParser.parse)
+            )
+        }
+        // Fallback: synthesise from the response without id/createdAt
+        return ClubStripeAccount(
+            id: UUID(),
+            clubID: clubID,
+            stripeAccountID: accountID,
+            onboardingComplete: decoded.onboardingComplete,
+            payoutsEnabled: decoded.payoutsEnabled,
+            createdAt: nil
+        )
+    }
+
+    func createConnectOnboarding(clubID: UUID, returnURL: String) async throws -> String {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        guard let baseURL = URL(string: SupabaseConfig.urlString) else {
+            throw SupabaseServiceError.missingConfiguration
+        }
+
+        let url = baseURL.appendingPathComponent("functions/v1/\(SupabaseConfig.connectOnboardingFunctionName)")
+
+        struct ConnectOnboardingRequest: Encodable {
+            let clubID: String
+            let returnURL: String
+            enum CodingKeys: String, CodingKey {
+                case clubID = "club_id"
+                case returnURL = "return_url"
+            }
+        }
+        struct ConnectOnboardingResponse: Decodable {
+            let onboarding_url: String
+        }
+
+        let body = try JSONEncoder().encode(ConnectOnboardingRequest(
+            clubID: clubID.uuidString,
+            returnURL: returnURL
+        ))
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let msg = String(data: data, encoding: .utf8) ?? "Connect onboarding failed"
+            throw SupabaseServiceError.httpStatus(statusCode, msg)
+        }
+
+        let decoded = try JSONDecoder().decode(ConnectOnboardingResponse.self, from: data)
+        return decoded.onboarding_url
+    }
+
+    // MARK: - Club Subscriptions (Phase 4)
+
+    func fetchClubSubscription(clubID: UUID) async throws -> ClubSubscription? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct ClubSubscriptionRow: Decodable {
+            let id: String
+            let club_id: String
+            let stripe_subscription_id: String
+            let plan_type: String
+            let status: String
+            let current_period_end: String?
+            let created_at: String?
+        }
+
+        let rows: [ClubSubscriptionRow] = try await send(
+            path: "club_subscriptions",
+            queryItems: [
+                .init(name: "club_id", value: "eq.\(clubID.uuidString)"),
+                .init(name: "select", value: "id,club_id,stripe_subscription_id,plan_type,status,current_period_end,created_at"),
+                .init(name: "limit", value: "1")
+            ],
+            method: "GET",
+            body: nil,
+            authBearerToken: authToken
+        )
+
+        guard let row = rows.first,
+              let id = UUID(uuidString: row.id),
+              let cid = UUID(uuidString: row.club_id) else { return nil }
+
+        return ClubSubscription(
+            id: id,
+            clubID: cid,
+            stripeSubscriptionID: row.stripe_subscription_id,
+            planType: row.plan_type,
+            status: row.status,
+            currentPeriodEnd: row.current_period_end.flatMap(SupabaseDateParser.parse),
+            createdAt: row.created_at.flatMap(SupabaseDateParser.parse)
+        )
+    }
+
+    func fetchClubEntitlements(clubID: UUID) async throws -> ClubEntitlements? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct EntitlementRow: Decodable {
+            let club_id: String
+            let plan_tier: String
+            let max_active_games: Int
+            let max_members: Int
+            let can_accept_payments: Bool
+            let analytics_access: Bool
+            let can_use_recurring_games: Bool
+            let can_use_delayed_publishing: Bool
+            let locked_features: [String]
+            let updated_at: String?
+        }
+
+        let rows: [EntitlementRow] = try await send(
+            path: "rpc/get_club_entitlements",
+            queryItems: [],
+            method: "POST",
+            body: try? JSONSerialization.data(withJSONObject: ["p_club_id": clubID.uuidString.lowercased()]),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        guard let row = rows.first,
+              let cid = UUID(uuidString: row.club_id) else { return nil }
+
+        return ClubEntitlements(
+            clubID: cid,
+            planTier: row.plan_tier,
+            maxActiveGames: row.max_active_games,
+            maxMembers: row.max_members,
+            canAcceptPayments: row.can_accept_payments,
+            analyticsAccess: row.analytics_access,
+            canUseRecurringGames: row.can_use_recurring_games,
+            canUseDelayedPublishing: row.can_use_delayed_publishing,
+            lockedFeatures: row.locked_features,
+            updatedAt: row.updated_at.flatMap(SupabaseDateParser.parse) ?? Date()
+        )
+    }
+
+    func createClubSubscription(clubID: UUID, priceID: String) async throws -> ClubSubscriptionResult {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        guard let baseURL = URL(string: SupabaseConfig.urlString) else {
+            throw SupabaseServiceError.missingConfiguration
+        }
+
+        let url = baseURL.appendingPathComponent("functions/v1/\(SupabaseConfig.createClubSubscriptionFunctionName)")
+
+        struct RequestBody: Encodable {
+            let club_id: String
+            let price_id: String
+        }
+        struct ResponseBody: Decodable {
+            let subscription_id: String
+            let status: String
+            let client_secret: String?
+        }
+
+        let body = try JSONEncoder().encode(RequestBody(club_id: clubID.uuidString, price_id: priceID))
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let msg = String(data: data, encoding: .utf8) ?? "Subscription creation failed"
+            throw SupabaseServiceError.httpStatus(statusCode, msg)
+        }
+
+        let decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
+        return ClubSubscriptionResult(
+            subscriptionID: decoded.subscription_id,
+            status: decoded.status,
+            clientSecret: decoded.client_secret
+        )
+    }
+
+    func cancelClubSubscription(clubID: UUID) async throws {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        guard let baseURL = URL(string: SupabaseConfig.urlString) else {
+            throw SupabaseServiceError.missingConfiguration
+        }
+
+        let url = baseURL.appendingPathComponent("functions/v1/\(SupabaseConfig.cancelClubSubscriptionFunctionName)")
+
+        struct RequestBody: Encodable {
+            let club_id: String
+        }
+
+        let body = try JSONEncoder().encode(RequestBody(club_id: clubID.uuidString))
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 || httpResponse.statusCode == 204 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let msg = String(data: data, encoding: .utf8) ?? "Subscription cancellation failed"
+            throw SupabaseServiceError.httpStatus(statusCode, msg)
+        }
+    }
+
+    // MARK: - Credits (Phase 2)
+
+    func fetchCreditBalance(userID: UUID, clubID: UUID) async throws -> Int {
+        guard SupabaseConfig.isConfigured else { return 0 }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else { return 0 }
+        struct CreditRow: Decodable { let amount_cents: Int }
+        let rows: [CreditRow] = try await send(
+            path: "player_credits",
+            queryItems: [
+                .init(name: "select", value: "amount_cents"),
+                .init(name: "user_id", value: "eq.\(userID.uuidString.lowercased())"),
+                .init(name: "club_id", value: "eq.\(clubID.uuidString.lowercased())"),
+                .init(name: "currency", value: "eq.aud")
+            ],
+            method: "GET",
+            body: nil,
+            authBearerToken: authToken
+        )
+        // Sum all matching rows — normally one row per (user, club, currency),
+        // but summing is a safe fallback if the unique constraint ever fails.
+        return rows.reduce(0) { $0 + $1.amount_cents }
+    }
+
+    func applyCredits(userID: UUID, bookingID: UUID, amountCents: Int, clubID: UUID) async throws -> Bool {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        guard amountCents > 0 else { return false }
+
+        // Fetch live balance — we need it to compute the new value for the PATCH.
+        let currentBalance = try await fetchCreditBalance(userID: userID, clubID: clubID)
+        guard currentBalance >= amountCents else { return false }
+
+        let newBalance = currentBalance - amountCents
+        struct UpdateBody: Encodable { let amount_cents: Int }
+        let body = try JSONEncoder().encode(UpdateBody(amount_cents: newBalance))
+
+        // Direct table PATCH — avoids PostgREST schema-cache issues with RPCs.
+        // The `amount_cents=gte.{amountCents}` filter is an atomic safety net:
+        // if another request already drained the balance the UPDATE matches 0 rows.
+        try await sendVoid(
+            path: "player_credits",
+            queryItems: [
+                .init(name: "user_id",      value: "eq.\(userID.uuidString.lowercased())"),
+                .init(name: "club_id",      value: "eq.\(clubID.uuidString.lowercased())"),
+                .init(name: "currency",     value: "eq.aud"),
+                .init(name: "amount_cents", value: "gte.\(amountCents)")
+            ],
+            method: "PATCH",
+            body: body,
+            authBearerToken: authToken
+        )
+        return true
+    }
+
+
+    // MARK: - Waitlist Promotion (Phase 3)
+
+    func promoteWaitlistPlayer(gameID: UUID, bookingID: UUID, holdMinutes: Int) async throws -> Bool {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        // NOTE: The promote_waitlist_player RPC returns PGRST202 — PostgREST's schema cache
+        // does not pick up this function (same pattern as use_credits / issue_cancellation_credit).
+        // Reimplemented as a direct PATCH on bookings, same approach as applyCredits.
+        //
+        // Atomicity: the status=eq.waitlisted filter means the PATCH only applies if the
+        // booking is still waitlisted — if the DB trigger promote_top_waitlisted() already
+        // promoted it (fires on confirmed→cancelled), the PATCH affects 0 rows and we return
+        // false, which the caller treats as a safe no-op.
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        let holdExpiry = iso.string(from: Date().addingTimeInterval(Double(holdMinutes) * 60))
+        let nowStr     = iso.string(from: Date())
+
+        let body = try JSONSerialization.data(withJSONObject: [
+            "status":            "pending_payment",
+            "waitlist_position": NSNull(),
+            "hold_expires_at":   holdExpiry,
+            "promoted_at":       nowStr
+        ])
+
+        let rows: [BookingRow] = try await send(
+            path: "bookings",
+            queryItems: [
+                .init(name: "id",     value: "eq.\(bookingID.uuidString.lowercased())"),
+                .init(name: "status", value: "eq.waitlisted"),
+                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at")
+            ],
+            method: "PATCH",
+            body: body,
+            authBearerToken: authToken,
+            extraHeaders: [
+                "Prefer":       "return=representation",
+                "Content-Type": "application/json"
+            ]
+        )
+
+        // true  = booking was waitlisted and is now promoted to pending_payment
+        // false = booking was no longer waitlisted (trigger already handled it, or it was cancelled)
+        return !rows.isEmpty
     }
 
     func fetchClubAdminUserIDs(clubID: UUID) async throws -> [UUID] {
@@ -2342,18 +3984,204 @@ final class SupabaseService: ClubDataProviding {
 
     private func invokeEdgeFunction(name: String, body: Data) async throws {
         guard let baseURL = URL(string: SupabaseConfig.urlString) else { return }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else { return }
         let url = baseURL.appendingPathComponent("functions/v1/\(name)")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = body
         request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
-        request.setValue("Bearer \(SupabaseConfig.anonKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        print("[EdgeFunction] → \(name) payload: \(String(data: body, encoding: .utf8) ?? "(unreadable)")")
         let (data, response) = try await session.data(for: request)
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         let responseText = String(data: data, encoding: .utf8) ?? "(no body)"
-        print("[EdgeFunction] ← \(name) \(statusCode): \(responseText)")
+        guard (200...299).contains(statusCode) else {
+            print("[EdgeFunction] ← \(name) \(statusCode): \(responseText)")
+            throw SupabaseServiceError.httpStatus(statusCode, responseText)
+        }
+    }
+
+    // MARK: - Notification Preferences
+
+    func fetchNotificationPreferences(userID: UUID) async throws -> NotificationPreferences? {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        let rows: [NotificationPreferences] = try await send(
+            path: "notification_preferences",
+            queryItems: [
+                .init(name: "user_id", value: "eq.\(userID.uuidString.lowercased())"),
+                .init(name: "select", value: "booking_confirmed_push,booking_confirmed_email,new_game_push,new_game_email,waitlist_push,waitlist_email,chat_push")
+            ],
+            method: "GET",
+            body: nil,
+            authBearerToken: authToken
+        )
+        return rows.first
+    }
+
+    func saveNotificationPreferences(userID: UUID, prefs: NotificationPreferences) async throws {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct UpsertBody: Encodable {
+            let userID: String
+            let bookingConfirmedPush:  Bool
+            let bookingConfirmedEmail: Bool
+            let newGamePush:           Bool
+            let newGameEmail:          Bool
+            let waitlistPush:          Bool
+            let waitlistEmail:         Bool
+            let chatPush:              Bool
+            enum CodingKeys: String, CodingKey {
+                case userID                = "user_id"
+                case bookingConfirmedPush  = "booking_confirmed_push"
+                case bookingConfirmedEmail = "booking_confirmed_email"
+                case newGamePush           = "new_game_push"
+                case newGameEmail          = "new_game_email"
+                case waitlistPush          = "waitlist_push"
+                case waitlistEmail         = "waitlist_email"
+                case chatPush              = "chat_push"
+            }
+        }
+
+        let body = UpsertBody(
+            userID: userID.uuidString.lowercased(),
+            bookingConfirmedPush:  prefs.bookingConfirmedPush,
+            bookingConfirmedEmail: prefs.bookingConfirmedEmail,
+            newGamePush:           prefs.newGamePush,
+            newGameEmail:          prefs.newGameEmail,
+            waitlistPush:          prefs.waitlistPush,
+            waitlistEmail:         prefs.waitlistEmail,
+            chatPush:              prefs.chatPush
+        )
+
+        try await sendVoid(
+            path: "notification_preferences",
+            queryItems: [.init(name: "on_conflict", value: "user_id")],
+            method: "POST",
+            body: try JSONEncoder().encode(body),
+            authBearerToken: authToken,
+            extraHeaders: [
+                "Prefer": "resolution=merge-duplicates",
+                "Content-Type": "application/json"
+            ]
+        )
+    }
+
+    // MARK: - Avatar Palettes
+
+    func fetchAvatarPalettes() async throws -> [AvatarPaletteRow] {
+        guard SupabaseConfig.isConfigured else { return [] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else { return [] }
+        return try await send(
+            path: "avatar_palettes",
+            queryItems: [
+                .init(name: "select", value: "palette_key,palette_name,category,gradient_start_hex,gradient_end_hex,is_default,display_order"),
+                .init(name: "is_active", value: "eq.true"),
+                .init(name: "order",  value: "display_order.asc")
+            ],
+            method: "GET",
+            body: nil,
+            authBearerToken: authToken
+        )
+    }
+
+    // MARK: - Plan Tier Limits
+
+    func fetchPlanTierLimits() async throws -> [String: PlanTierLimits] {
+        guard SupabaseConfig.isConfigured else { return [:] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else { return [:] }
+
+        struct Row: Decodable {
+            let plan_tier: String
+            let max_active_games: Int
+            let max_members: Int
+            let can_accept_payments: Bool
+            let analytics_access: Bool
+            let can_use_recurring_games: Bool
+            let can_use_delayed_publishing: Bool
+        }
+
+        let rows: [Row] = try await send(
+            path: "rpc/get_plan_tier_limits",
+            queryItems: [],
+            method: "POST",
+            body: try? JSONSerialization.data(withJSONObject: [:]),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        return Dictionary(uniqueKeysWithValues: rows.map { row in
+            (row.plan_tier, PlanTierLimits(
+                planTier: row.plan_tier,
+                maxActiveGames: row.max_active_games,
+                maxMembers: row.max_members,
+                canAcceptPayments: row.can_accept_payments,
+                analyticsAccess: row.analytics_access,
+                canUseRecurringGames: row.can_use_recurring_games,
+                canUseDelayedPublishing: row.can_use_delayed_publishing
+            ))
+        })
+    }
+
+    func fetchSubscriptionPlans() async throws -> [SubscriptionPlan] {
+        guard SupabaseConfig.isConfigured else { return [] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else { return [] }
+
+        struct Row: Decodable {
+            let plan_id: String
+            let display_name: String
+            let stripe_price_id: String
+            let display_price: String
+            let billing_interval: String
+            let sort_order: Int
+        }
+
+        let rows: [Row] = try await send(
+            path: "rpc/get_subscription_plans",
+            queryItems: [],
+            method: "POST",
+            body: try? JSONSerialization.data(withJSONObject: [:]),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        return rows.map { row in
+            SubscriptionPlan(
+                planID: row.plan_id,
+                displayName: row.display_name,
+                stripePriceID: row.stripe_price_id,
+                displayPrice: row.display_price,
+                billingInterval: row.billing_interval,
+                sortOrder: row.sort_order
+            )
+        }
+    }
+
+    // MARK: - App Config
+
+    func fetchAppConfig() async throws -> [String: String] {
+        guard SupabaseConfig.isConfigured else { return [:] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else { return [:] }
+
+        struct Row: Decodable {
+            let key: String
+            let value: String
+        }
+
+        let rows: [Row] = try await send(
+            path: "app_config",
+            queryItems: [URLQueryItem(name: "select", value: "key,value")],
+            method: "GET",
+            body: nil,
+            authBearerToken: authToken
+        )
+
+        return Dictionary(uniqueKeysWithValues: rows.map { ($0.key, $0.value) })
     }
 
     // MARK: - REST
@@ -2396,6 +4224,43 @@ final class SupabaseService: ClubDataProviding {
         } catch {
             throw SupabaseServiceError.decoding(error.localizedDescription)
         }
+    }
+
+    /// Variant of `send` for RPCs that return VOID (HTTP 204 No Content).
+    /// Throws on network errors and non-2xx status codes so failures are visible.
+    private func sendVoid(
+        path: String,
+        queryItems: [URLQueryItem] = [],
+        method: String = "POST",
+        body: Data?,
+        authBearerToken: String?,
+        extraHeaders: [String: String] = [:]
+    ) async throws {
+        let request = try buildRequest(
+            path: path,
+            queryItems: queryItems,
+            method: method,
+            body: body,
+            authBearerToken: authBearerToken,
+            extraHeaders: extraHeaders
+        )
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw SupabaseServiceError.network(error.localizedDescription)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SupabaseServiceError.network("Non-HTTP response")
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let bodyString = String(data: data, encoding: .utf8) ?? "<no body>"
+            throw SupabaseServiceError.httpStatus(httpResponse.statusCode, bodyString)
+        }
+        // 204 No Content is expected for VOID RPCs — nothing to decode
     }
 
     private func sendAuth<T: Decodable>(
@@ -2460,6 +4325,9 @@ final class SupabaseService: ClubDataProviding {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.httpBody = body
+        // Never serve stale data from the local HTTP cache — PostgREST GET responses
+        // can be cached by URLSession and cause feature-gate state to lag after DB writes.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
         request.setValue("public", forHTTPHeaderField: "Accept-Profile")
 
@@ -2654,7 +4522,7 @@ final class SupabaseService: ClubDataProviding {
                 counts.confirmed += 1
             case .waitlisted:
                 counts.waitlisted += 1
-            case .none, .cancelled, .unknown:
+            case .none, .cancelled, .unknown, .pendingPayment:
                 break
             }
             result[row.gameID] = counts
@@ -2690,14 +4558,16 @@ final class SupabaseService: ClubDataProviding {
         switch state {
         case .confirmed:
             return 0
-        case .waitlisted:
+        case .pendingPayment:
             return 1
-        case .unknown:
+        case .waitlisted:
             return 2
-        case .cancelled:
+        case .unknown:
             return 3
-        case .none:
+        case .cancelled:
             return 4
+        case .none:
+            return 5
         }
     }
 
@@ -2859,6 +4729,54 @@ final class SupabaseService: ClubDataProviding {
             ]
         )
     }
+
+    func updateClubVenueName(clubID: UUID, venueName: String) async throws {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        let patch = ClubVenueNamePatch(venue_name: venueName)
+        let _: [ClubRow] = try await send(
+            path: "clubs",
+            queryItems: [
+                .init(name: "id", value: "eq.\(clubID.uuidString)"),
+                .init(name: "select", value: "id")
+            ],
+            method: "PATCH",
+            body: try JSONEncoder().encode(patch),
+            authBearerToken: authToken,
+            extraHeaders: [
+                "Prefer": "return=representation",
+                "Content-Type": "application/json"
+            ]
+        )
+    }
+
+    func demoteOtherPrimaryVenues(clubID: UUID, exceptVenueID: UUID) async throws {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        struct Patch: Encodable {
+            let is_primary: Bool
+        }
+        let _: [ClubVenueRow] = try await send(
+            path: "club_venues",
+            queryItems: [
+                .init(name: "club_id",    value: "eq.\(clubID.uuidString)"),
+                .init(name: "id",         value: "neq.\(exceptVenueID.uuidString)"),
+                .init(name: "is_primary", value: "eq.true"),
+                .init(name: "select",     value: "id")
+            ],
+            method: "PATCH",
+            body: try JSONEncoder().encode(Patch(is_primary: false)),
+            authBearerToken: authToken,
+            extraHeaders: [
+                "Prefer": "return=representation",
+                "Content-Type": "application/json"
+            ]
+        )
+    }
 }
 
 // MARK: - DTOs
@@ -2899,6 +4817,7 @@ private struct ClubRow: Decodable {
     let description: String?
     let imageURLString: String?
     let contactEmail: String?
+    let contactPhone: String?
     let website: String?
     let managerName: String?
     let membersOnly: Bool
@@ -2914,7 +4833,12 @@ private struct ClubRow: Decodable {
     let latitude: Double?
     let longitude: Double?
     let heroImageKey: String?
+    let customBannerURLString: String?
     let codeOfConduct: String?
+    let cancellationPolicy: String?
+    let stripeConnectID: String?
+    let avatarBackgroundColorHex: String?
+    let timezone: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -2922,6 +4846,7 @@ private struct ClubRow: Decodable {
         case description
         case imageURLString = "image_url"
         case contactEmail = "contact_email"
+        case contactPhone = "contact_phone"
         case website
         case managerName = "manager_name"
         case membersOnly = "members_only"
@@ -2937,13 +4862,19 @@ private struct ClubRow: Decodable {
         case latitude
         case longitude
         case heroImageKey = "hero_image_key"
+        case customBannerURLString = "custom_banner_url"
         case codeOfConduct = "code_of_conduct"
+        case cancellationPolicy = "cancellation_policy"
+        case stripeConnectID = "stripe_connect_id"
+        case avatarBackgroundColorHex = "avatar_background_color"
+        case timezone
     }
 
     func toClub(memberCount: Int, seedMembers: [ClubMember], seedTags: [String]) -> Club {
         let safeName = Self.sanitizedText(name, maxLength: 120) ?? "Club"
         let safeDescription = Self.sanitizedText(description, maxLength: 2000) ?? "No club description yet."
         let safeContactEmail = Self.sanitizedText(contactEmail, maxLength: 320) ?? "No contact email listed"
+        let safeContactPhone = Self.sanitizedText(contactPhone, maxLength: 30)
         let safeWebsite = Self.sanitizedText(website, maxLength: 260)
         let safeManagerName = Self.sanitizedText(managerName, maxLength: 160)
         let safeImageURL = Self.sanitizedURL(imageURLString)
@@ -2967,6 +4898,7 @@ private struct ClubRow: Decodable {
             memberCount: memberCount,
             description: safeDescription,
             contactEmail: safeContactEmail,
+            contactPhone: safeContactPhone,
             address: derivedAddress,
             imageSystemName: "building.2.crop.circle.fill",
             imageURL: safeImageURL,
@@ -2987,7 +4919,12 @@ private struct ClubRow: Decodable {
             latitude: latitude,
             longitude: longitude,
             heroImageKey: heroImageKey,
-            codeOfConduct: codeOfConduct
+            customBannerURL: Self.sanitizedURL(customBannerURLString),
+            codeOfConduct: codeOfConduct,
+            cancellationPolicy: cancellationPolicy,
+            stripeConnectID: stripeConnectID,
+            avatarBackgroundColor: avatarBackgroundColorHex,
+            timezone: timezone ?? "Australia/Perth"
         )
     }
 
@@ -3019,7 +4956,7 @@ private struct ClubRow: Decodable {
         guard let trimmed = sanitizedText(raw, maxLength: 2048) else { return nil }
         guard let url = URL(string: trimmed) else { return nil }
         guard let scheme = url.scheme?.lowercased() else { return nil }
-        let isAllowed = scheme == "http" || scheme == "https" || scheme == "bookadink-avatar"
+        let isAllowed = scheme == "http" || scheme == "https"
         return isAllowed ? url : nil
     }
 }
@@ -3053,6 +4990,7 @@ private struct ClubJoinRequestRow: Decodable {
     let status: String
     let requestedAtRaw: String?
     let conductAcceptedAtRaw: String?
+    let cancellationPolicyAcceptedAtRaw: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -3061,6 +4999,7 @@ private struct ClubJoinRequestRow: Decodable {
         case status
         case requestedAtRaw = "requested_at"
         case conductAcceptedAtRaw = "conduct_accepted_at"
+        case cancellationPolicyAcceptedAtRaw = "cancellation_policy_accepted_at"
     }
 }
 
@@ -3071,6 +5010,10 @@ private struct OwnerProfileLiteRow: Decodable {
     let phone: String?
     let emergencyContactName: String?
     let emergencyContactPhone: String?
+    let duprRating: Double?
+    let duprUpdatedAtRaw: String?
+    let duprUpdatedByName: String?
+    let avatarColorKey: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -3079,6 +5022,10 @@ private struct OwnerProfileLiteRow: Decodable {
         case phone
         case emergencyContactName = "emergency_contact_name"
         case emergencyContactPhone = "emergency_contact_phone"
+        case duprRating = "dupr_rating"
+        case duprUpdatedAtRaw = "dupr_updated_at"
+        case duprUpdatedByName = "dupr_updated_by_name"
+        case avatarColorKey = "avatar_color_key"
     }
 }
 
@@ -3086,18 +5033,20 @@ private struct ClubDirectoryProfileRow: Decodable {
     let id: UUID
     let fullName: String?
     let duprRating: Double?
+    let avatarColorKey: String?
 
     enum CodingKeys: String, CodingKey {
         case id
         case fullName = "full_name"
         case duprRating = "dupr_rating"
+        case avatarColorKey = "avatar_color_key"
     }
 }
 
 private struct ClubAdminRow: Decodable {
     let clubID: UUID
     let userID: UUID
-    let role: String?
+    let role: ClubAdminRole?
 
     enum CodingKeys: String, CodingKey {
         case clubID = "club_id"
@@ -3109,12 +5058,14 @@ private struct ClubAdminRow: Decodable {
 private struct ClubMembershipInsertBody: Encodable {
     let clubID: UUID
     let userID: UUID
-    let conductAcceptedAt: String?  // ISO 8601 string for Supabase timestamptz
+    let conductAcceptedAt: String?
+    let cancellationPolicyAcceptedAt: String?
 
     enum CodingKeys: String, CodingKey {
         case clubID = "club_id"
         case userID = "user_id"
         case conductAcceptedAt = "conduct_accepted_at"
+        case cancellationPolicyAcceptedAt = "cancellation_policy_accepted_at"
     }
 }
 
@@ -3145,7 +5096,7 @@ private struct ClubMembershipDecisionUpdateBody: Encodable {
 private struct ClubAdminUpsertBody: Encodable {
     let clubID: UUID
     let userID: UUID
-    let role: String
+    let role: ClubAdminRole
 
     enum CodingKeys: String, CodingKey {
         case clubID = "club_id"
@@ -3157,42 +5108,58 @@ private struct ClubAdminUpsertBody: Encodable {
 private struct ProfileUpsertRow: Encodable {
     let id: UUID
     let email: String
+    let firstName: String?
+    let lastName: String?
     let fullName: String
     let phone: String?
     let dateOfBirth: String?
     let emergencyContactName: String?
     let emergencyContactPhone: String?
     let duprRating: Double?
+    let duprID: String?
+    let avatarColorKey: String?
 
     enum CodingKeys: String, CodingKey {
         case id, email
+        case firstName = "first_name"
+        case lastName = "last_name"
         case fullName = "full_name"
         case phone
         case dateOfBirth = "date_of_birth"
         case emergencyContactName = "emergency_contact_name"
         case emergencyContactPhone = "emergency_contact_phone"
         case duprRating = "dupr_rating"
+        case duprID = "dupr_id"
+        case avatarColorKey = "avatar_color_key"
     }
 }
 
 private struct ProfileRow: Decodable {
     let id: UUID
     let email: String
+    let firstName: String?
+    let lastName: String?
     let fullName: String?
     let phone: String?
     let dateOfBirth: String?
     let emergencyContactName: String?
     let emergencyContactPhone: String?
     let duprRating: Double?
+    let duprID: String?
+    let avatarColorKey: String?
 
     enum CodingKeys: String, CodingKey {
         case id, email
+        case firstName = "first_name"
+        case lastName = "last_name"
         case fullName = "full_name"
         case phone
         case dateOfBirth = "date_of_birth"
         case emergencyContactName = "emergency_contact_name"
         case emergencyContactPhone = "emergency_contact_phone"
         case duprRating = "dupr_rating"
+        case duprID = "dupr_id"
+        case avatarColorKey = "avatar_color_key"
     }
 }
 
@@ -3248,18 +5215,6 @@ private struct GameRow: Decodable {
     }
 
     func toGame(confirmedCount: Int?, waitlistCount: Int?) -> Game {
-        // Backward compat: old rows may have stored "singles"/"doubles" in game_format
-        let normalizedFormat = gameFormat.caseInsensitiveCompare("ladder") == .orderedSame ? "king_of_court" : gameFormat
-        let derivedGameType: String
-        if let gt = gameType {
-            derivedGameType = gt
-        } else if normalizedFormat == "singles" || normalizedFormat == "doubles" {
-            derivedGameType = normalizedFormat
-        } else {
-            derivedGameType = "doubles"
-        }
-        let displayFormat = (normalizedFormat == "singles" || normalizedFormat == "doubles") ? "open_play" : normalizedFormat
-
         return Game(
             id: id,
             clubID: clubID,
@@ -3269,8 +5224,8 @@ private struct GameRow: Decodable {
             dateTime: SupabaseDateParser.parse(dateTimeRaw) ?? Date(),
             durationMinutes: durationMinutes,
             skillLevel: skillLevel,
-            gameFormat: displayFormat,
-            gameType: derivedGameType,
+            gameFormat: gameFormat,
+            gameType: gameType ?? "doubles",
             maxSpots: maxSpots,
             feeAmount: feeAmount,
             feeCurrency: feeCurrency,
@@ -3313,6 +5268,7 @@ private struct GameInsertRow: Encodable {
     let gameType: String
     let recurrenceGroupID: UUID?
     let publishAt: String?
+    let status: String = "upcoming"
 
     enum CodingKeys: String, CodingKey {
         case clubID = "club_id"
@@ -3336,6 +5292,7 @@ private struct GameInsertRow: Encodable {
         case gameType = "game_type"
         case recurrenceGroupID = "recurrence_group_id"
         case publishAt = "publish_at"
+        case status
     }
 }
 
@@ -3431,6 +5388,10 @@ private struct BookingRow: Decodable {
     let paidAtRaw: String?
     let stripePaymentIntentID: String?
     let paymentMethod: String?
+    let platformFeeCents: Int?
+    let clubPayoutCents: Int?
+    let creditsAppliedCents: Int?
+    let holdExpiresAtRaw: String?
     let gameRow: GameRow?
 
     enum CodingKeys: String, CodingKey {
@@ -3444,6 +5405,10 @@ private struct BookingRow: Decodable {
         case paidAtRaw = "paid_at"
         case stripePaymentIntentID = "stripe_payment_intent_id"
         case paymentMethod = "payment_method"
+        case platformFeeCents = "platform_fee_cents"
+        case clubPayoutCents = "club_payout_cents"
+        case creditsAppliedCents = "credits_applied_cents"
+        case holdExpiresAtRaw = "hold_expires_at"
         case gameRow = "games"
     }
 
@@ -3458,7 +5423,11 @@ private struct BookingRow: Decodable {
             feePaid: feePaid ?? false,
             paidAt: paidAtRaw.flatMap(SupabaseDateParser.parse),
             stripePaymentIntentID: stripePaymentIntentID,
-            paymentMethod: paymentMethod
+            paymentMethod: paymentMethod,
+            platformFeeCents: platformFeeCents,
+            clubPayoutCents: clubPayoutCents,
+            creditsAppliedCents: creditsAppliedCents,
+            holdExpiresAt: holdExpiresAtRaw.flatMap(SupabaseDateParser.parse)
         )
     }
 }
@@ -3471,6 +5440,9 @@ private struct BookingInsertBody: Encodable {
     let feePaid: Bool?
     let stripePaymentIntentID: String?
     let paymentMethod: String?
+    let platformFeeCents: Int?
+    let clubPayoutCents: Int?
+    let creditsAppliedCents: Int?
 
     enum CodingKeys: String, CodingKey {
         case gameID = "game_id"
@@ -3480,6 +5452,46 @@ private struct BookingInsertBody: Encodable {
         case feePaid = "fee_paid"
         case stripePaymentIntentID = "stripe_payment_intent_id"
         case paymentMethod = "payment_method"
+        case platformFeeCents = "platform_fee_cents"
+        case clubPayoutCents = "club_payout_cents"
+        case creditsAppliedCents = "credits_applied_cents"
+    }
+
+    // Skip nil optional fields entirely so PostgREST doesn't error on columns
+    // that haven't been migrated yet ("column X does not exist").
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(gameID,  forKey: .gameID)
+        try c.encode(userID,  forKey: .userID)
+        try c.encode(status,  forKey: .status)
+        try c.encodeIfPresent(waitlistPosition,      forKey: .waitlistPosition)
+        try c.encodeIfPresent(feePaid,               forKey: .feePaid)
+        try c.encodeIfPresent(stripePaymentIntentID, forKey: .stripePaymentIntentID)
+        try c.encodeIfPresent(paymentMethod,         forKey: .paymentMethod)
+        try c.encodeIfPresent(platformFeeCents,      forKey: .platformFeeCents)
+        try c.encodeIfPresent(clubPayoutCents,       forKey: .clubPayoutCents)
+        try c.encodeIfPresent(creditsAppliedCents,   forKey: .creditsAppliedCents)
+    }
+}
+
+/// PATCH body used to confirm a pending_payment booking after successful Stripe payment.
+private struct BookingConfirmPaymentBody: Encodable {
+    let status: String
+    let feePaid: Bool
+    let stripePaymentIntentID: String?
+    let paymentMethod: String
+    let platformFeeCents: Int?
+    let clubPayoutCents: Int?
+    let creditsAppliedCents: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case feePaid = "fee_paid"
+        case stripePaymentIntentID = "stripe_payment_intent_id"
+        case paymentMethod = "payment_method"
+        case platformFeeCents = "platform_fee_cents"
+        case clubPayoutCents = "club_payout_cents"
+        case creditsAppliedCents = "credits_applied_cents"
     }
 }
 
@@ -3510,10 +5522,12 @@ private struct GameStatusUpdateRow: Encodable {
 private struct GameAttendanceRow: Decodable {
     let bookingID: UUID
     let paymentStatus: String?
+    let attendanceStatus: String?
 
     enum CodingKeys: String, CodingKey {
         case bookingID = "booking_id"
         case paymentStatus = "payment_status"
+        case attendanceStatus = "attendance_status"
     }
 }
 
@@ -3523,6 +5537,7 @@ private struct GameAttendanceUpsertBody: Encodable {
     let userID: UUID
     let checkedInAt: String
     let checkedInBy: UUID
+    let attendanceStatus: String
 
     enum CodingKeys: String, CodingKey {
         case gameID = "game_id"
@@ -3530,6 +5545,7 @@ private struct GameAttendanceUpsertBody: Encodable {
         case userID = "user_id"
         case checkedInAt = "checked_in_at"
         case checkedInBy = "checked_in_by"
+        case attendanceStatus = "attendance_status"
     }
 }
 
@@ -3538,6 +5554,7 @@ private struct ClubOwnerUpdateRow: Encodable {
     let description: String?
     let imageURL: String
     let contactEmail: String?
+    let contactPhone: String?
     let website: String?
     let managerName: String?
     let membersOnly: Bool
@@ -3553,12 +5570,16 @@ private struct ClubOwnerUpdateRow: Encodable {
     /// invalidating stale coordinates after an address change.
     let clearCoordinates: Bool
     let heroImageKey: String?
+    let customBannerURL: String?
     let codeOfConduct: String?
+    let cancellationPolicy: String?
+    let avatarBackgroundColor: String?
 
     enum CodingKeys: String, CodingKey {
         case name, description
         case imageURL = "image_url"
         case contactEmail = "contact_email"
+        case contactPhone = "contact_phone"
         case website
         case managerName = "manager_name"
         case membersOnly = "members_only"
@@ -3569,28 +5590,35 @@ private struct ClubOwnerUpdateRow: Encodable {
         case suburb, state, postcode, country
         case latitude, longitude
         case heroImageKey = "hero_image_key"
+        case customBannerURL = "custom_banner_url"
         case codeOfConduct = "code_of_conduct"
+        case cancellationPolicy = "cancellation_policy"
+        case avatarBackgroundColor = "avatar_background_color"
     }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(name,             forKey: .name)
-        try c.encode(description,      forKey: .description)
-        try c.encode(imageURL,         forKey: .imageURL)
-        try c.encode(contactEmail,     forKey: .contactEmail)
-        try c.encode(website,          forKey: .website)
-        try c.encode(managerName,      forKey: .managerName)
-        try c.encode(membersOnly,      forKey: .membersOnly)
-        try c.encode(winCondition,     forKey: .winCondition)
-        try c.encode(defaultCourtCount, forKey: .defaultCourtCount)
-        try c.encode(venueName,        forKey: .venueName)
-        try c.encode(streetAddress,    forKey: .streetAddress)
-        try c.encode(suburb,           forKey: .suburb)
-        try c.encode(state,            forKey: .state)
-        try c.encode(postcode,         forKey: .postcode)
-        try c.encode(country,          forKey: .country)
-        try c.encode(heroImageKey,     forKey: .heroImageKey)
-        try c.encode(codeOfConduct,    forKey: .codeOfConduct)
+        try c.encode(name,                  forKey: .name)
+        try c.encode(description,           forKey: .description)
+        try c.encode(imageURL,              forKey: .imageURL)
+        try c.encode(contactEmail,          forKey: .contactEmail)
+        try c.encode(contactPhone,          forKey: .contactPhone)
+        try c.encode(website,               forKey: .website)
+        try c.encode(managerName,           forKey: .managerName)
+        try c.encode(membersOnly,           forKey: .membersOnly)
+        try c.encode(winCondition,          forKey: .winCondition)
+        try c.encode(defaultCourtCount,     forKey: .defaultCourtCount)
+        try c.encode(venueName,             forKey: .venueName)
+        try c.encode(streetAddress,         forKey: .streetAddress)
+        try c.encode(suburb,                forKey: .suburb)
+        try c.encode(state,                 forKey: .state)
+        try c.encode(postcode,              forKey: .postcode)
+        try c.encode(country,               forKey: .country)
+        try c.encode(heroImageKey,          forKey: .heroImageKey)
+        try c.encode(customBannerURL,       forKey: .customBannerURL)
+        try c.encode(codeOfConduct,         forKey: .codeOfConduct)
+        try c.encode(cancellationPolicy,    forKey: .cancellationPolicy)
+        try c.encode(avatarBackgroundColor, forKey: .avatarBackgroundColor)
         if clearCoordinates {
             try c.encodeNil(forKey: .latitude)
             try c.encodeNil(forKey: .longitude)
@@ -3603,6 +5631,7 @@ private struct ClubInsertRow: Encodable {
     let description: String?
     let imageURL: String
     let contactEmail: String?
+    let contactPhone: String?
     let website: String?
     let managerName: String?
     let membersOnly: Bool
@@ -3615,12 +5644,16 @@ private struct ClubInsertRow: Encodable {
     let postcode: String?
     let country: String?
     let heroImageKey: String?
+    let customBannerURL: String?
+    let avatarBackgroundColor: String?
+    let timezone: String
 
     enum CodingKeys: String, CodingKey {
         case name
         case description
         case imageURL = "image_url"
         case contactEmail = "contact_email"
+        case contactPhone = "contact_phone"
         case website
         case managerName = "manager_name"
         case membersOnly = "members_only"
@@ -3633,6 +5666,9 @@ private struct ClubInsertRow: Encodable {
         case postcode
         case country
         case heroImageKey = "hero_image_key"
+        case customBannerURL = "custom_banner_url"
+        case avatarBackgroundColor = "avatar_background_color"
+        case timezone
     }
 }
 
@@ -3641,17 +5677,25 @@ private struct ClubCoordinatePatch: Encodable {
     let longitude: Double
 }
 
+private struct ClubVenueNamePatch: Encodable {
+    let venue_name: String
+}
+
 private struct ClubChatPushHookRequest: Encodable {
     let clubID: UUID
     let actorUserID: UUID
     let event: String
     let referenceID: UUID?
+    let postAuthorID: UUID?
+    let content: String?
 
     enum CodingKeys: String, CodingKey {
         case clubID = "club_id"
         case actorUserID = "actor_user_id"
         case event
         case referenceID = "reference_id"
+        case postAuthorID = "post_author_id"
+        case content
     }
 }
 
@@ -3669,8 +5713,10 @@ private struct BookingConfirmedPushRequest: Encodable {
 
 private struct FeedPostRow: Decodable {
     let id: UUID
-    let userID: UUID
-    let content: String
+    // user_id is ON DELETE SET NULL — null when the poster deleted their account
+    let userID: UUID?
+    // content is null for image-only posts in some DB configurations
+    let content: String?
     let imageURLString: String?
     let imageURLStrings: [String]?
     let createdAtRaw: String?
@@ -3706,8 +5752,10 @@ private struct FeedPostRow: Decodable {
 private struct FeedCommentRow: Decodable {
     let id: UUID
     let postID: UUID
-    let userID: UUID
-    let content: String
+    // user_id is ON DELETE SET NULL — null when the commenter deleted their account
+    let userID: UUID?
+    // content is null defensively — should always be present but guard against it
+    let content: String?
     let createdAtRaw: String?
     let parentID: UUID?
 
@@ -3866,6 +5914,8 @@ private enum BookingStateMapper {
             return .waitlisted(position: waitlistPosition)
         case "cancelled", "canceled":
             return .cancelled
+        case "pending_payment":
+            return .pendingPayment
         default:
             if waitlistPosition != nil {
                 return .waitlisted(position: waitlistPosition)
@@ -3952,10 +6002,12 @@ private struct NotifyRequest: Encodable {
 private struct GameCancelledNotifyRequest: Encodable {
     let gameID: UUID
     let gameTitle: String
+    let clubTimezone: String
 
     enum CodingKeys: String, CodingKey {
         case gameID = "game_id"
         case gameTitle = "game_title"
+        case clubTimezone = "club_timezone"
     }
 }
 
@@ -3974,6 +6026,28 @@ private struct ClubAnnouncementNotifyRequest: Encodable {
         case clubName = "club_name"
         case posterName = "poster_name"
         case postBody = "post_body"
+    }
+}
+
+private struct GamePublishedNotifyRequest: Encodable {
+    let gameID: UUID
+    let gameTitle: String
+    let gameDateTime: Date
+    let clubID: UUID
+    let clubName: String
+    let createdByUserID: UUID
+    let skillLevel: String?
+    let clubTimezone: String
+
+    enum CodingKeys: String, CodingKey {
+        case gameID = "game_id"
+        case gameTitle = "game_title"
+        case gameDateTime = "game_date_time"
+        case clubID = "club_id"
+        case clubName = "club_name"
+        case createdByUserID = "created_by_user_id"
+        case skillLevel = "skill_level"
+        case clubTimezone = "club_timezone"
     }
 }
 
@@ -4081,5 +6155,53 @@ private struct ClubVenueUpdateRow: Encodable {
             try c.encode(newLatitude,  forKey: .latitude)
             try c.encode(newLongitude, forKey: .longitude)
         }
+    }
+}
+
+// MARK: - Avatar Palette rows
+
+/// Decodable row matching the avatar_palettes table.
+/// Non-private so AppState and the protocol can reference the type.
+struct AvatarPaletteRow: Decodable {
+    let paletteKey:       String
+    let paletteName:      String
+    let category:         String
+    let gradientStartHex: String
+    let gradientEndHex:   String
+    let isDefault:        Bool
+    let displayOrder:     Int
+
+    enum CodingKeys: String, CodingKey {
+        case paletteKey       = "palette_key"
+        case paletteName      = "palette_name"
+        case category
+        case gradientStartHex = "gradient_start_hex"
+        case gradientEndHex   = "gradient_end_hex"
+        case isDefault        = "is_default"
+        case displayOrder     = "display_order"
+    }
+
+    func toEntry() -> AvatarGradients.Entry {
+        AvatarGradients.Entry(key: paletteKey, name: paletteName, start: gradientStartHex, end: gradientEndHex)
+    }
+}
+
+// MARK: - Stripe Connect rows
+
+private struct ClubStripeAccountRow: Decodable {
+    let id: UUID
+    let clubID: UUID
+    let stripeAccountID: String
+    let onboardingComplete: Bool
+    let payoutsEnabled: Bool
+    let createdAtRaw: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case clubID = "club_id"
+        case stripeAccountID = "stripe_account_id"
+        case onboardingComplete = "onboarding_complete"
+        case payoutsEnabled = "payouts_enabled"
+        case createdAtRaw = "created_at"
     }
 }

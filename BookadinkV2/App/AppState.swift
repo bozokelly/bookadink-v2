@@ -4,15 +4,26 @@ import os
 import UIKit
 import UserNotifications
 
+/// The result of a successful cancellation credit issued to a user.
+/// Published by `cancelBooking` when the server confirms a credit was issued.
+struct CancellationCreditResult: Equatable {
+    let clubID: UUID
+    let clubName: String?
+    let creditedCents: Int
+    let newBalanceCents: Int
+}
+
 @MainActor
 final class AppState: ObservableObject {
     private enum StorageKeys {
+        static let noShowBookingIDs = "bookadink.owner.noShowBookingIDs"
         static let authSession = "bookadink.auth.session"
         static let checkedInBookingIDs = "bookadink.owner.checkedInBookingIDs"
         static let clubNewsNotificationsEnabled = "bookadink.clubNews.notificationsEnabled"
         static let duprIDByUserID = "bookadink.profile.duprIDByUserID"
         static let duprRatingsByUserID = "bookadink.profile.duprRatingsByUserID"
         static let duprHistoryByUserID = "bookadink.profile.duprHistoryByUserID"
+        static let pinnedClubIDs = "bookadink.home.pinnedClubIDs"
     }
 
     private let dataProvider: ClubDataProviding
@@ -36,13 +47,14 @@ final class AppState: ObservableObject {
     @Published var allUpcomingGames: [Game] = []
     @Published var bookings: [BookingWithGame] = []
     @Published var attendeesByGameID: [UUID: [GameAttendee]] = [:]
+    @Published var pinnedClubIDs: [UUID] = []
     @Published var membershipStatesByClubID: [UUID: ClubMembershipState] = [:]
     @Published var ownerJoinRequestsByClubID: [UUID: [ClubJoinRequest]] = [:]
     @Published var ownerMembersByClubID: [UUID: [ClubOwnerMember]] = [:]
     @Published var clubDirectoryMembersByClubID: [UUID: [ClubDirectoryMember]] = [:]
     @Published var clubNewsPostsByClubID: [UUID: [ClubNewsPost]] = [:]
     @Published var clubNewsReportsByClubID: [UUID: [ClubNewsModerationReport]] = [:]
-    @Published var clubAdminRoleByClubID: [UUID: String] = [:]
+    @Published var clubAdminRoleByClubID: [UUID: ClubAdminRole] = [:]
     @Published var requestingMembershipClubIDs: Set<UUID> = []
     @Published var removingMembershipClubIDs: Set<UUID> = []
     @Published var loadingOwnerJoinRequestClubIDs: Set<UUID> = []
@@ -67,13 +79,32 @@ final class AppState: ObservableObject {
     @Published var isDeletingClubIDs: Set<UUID> = []
     @Published var reviewsByClubID: [UUID: [GameReview]] = [:]
     @Published var loadingReviewsClubIDs: Set<UUID> = []
+    @Published var pendingReviewPrompt: PendingReviewPrompt? = nil
+    @Published var revenueSummaryByClubID: [UUID: ClubRevenueSummary] = [:]
+    @Published var loadingRevenueSummaryClubIDs: Set<UUID> = []
+    @Published var fillRateSummaryByClubID: [UUID: ClubFillRateSummary] = [:]
+    @Published var loadingFillRateSummaryClubIDs: Set<UUID> = []
+
+    // Dashboard summary — lightweight metrics, all plan tiers
+    @Published var dashboardSummaryByClubID: [UUID: ClubDashboardSummary] = [:]
+
+    // Phase 5B — Advanced Analytics
+    @Published var analyticsKPIsByClubID: [UUID: ClubAnalyticsKPIs] = [:]
+    @Published var analyticsSupplementalByClubID: [UUID: ClubAnalyticsSupplemental] = [:]
+    @Published var revenueTrendByClubID: [UUID: [ClubRevenueTrendPoint]] = [:]
+    @Published var topGamesByClubID: [UUID: [ClubTopGame]] = [:]
+    @Published var peakTimesByClubID: [UUID: [ClubPeakTime]] = [:]
+    @Published var loadingAnalyticsClubIDs: Set<UUID> = []
+    /// Last analytics fetch error per club. Nil when last fetch succeeded or hasn't run yet.
+    @Published var analyticsErrorByClubID: [UUID: String] = [:]
     @Published var clubVenuesByClubID: [UUID: [ClubVenue]] = [:]
     @Published var loadingClubVenueIDs: Set<UUID> = []
     @Published var savingClubVenueIDs: Set<UUID> = []
     @Published var deletingClubVenueIDs: Set<UUID> = []
     // reminderGameIDs, calendarGameIDs, exportingCalendarGameIDs live on scheduleStore.
-    @Published var checkedInBookingIDs: Set<UUID> = []
-    /// Maps bookingID → payment_status ("unpaid" | "cash" | "stripe") for checked-in attendees.
+    @Published var checkedInBookingIDs: Set<UUID> = []       // attendance_status = 'attended'
+    @Published var noShowBookingIDs: Set<UUID> = []           // attendance_status = 'no_show'
+    /// Maps bookingID → payment_status ("unpaid" | "cash" | "stripe") for attendance rows.
     @Published var attendancePaymentByBookingID: [UUID: String] = [:]
     @Published var isLoadingClubs = false
     @Published var loadingClubGameIDs: Set<UUID> = []
@@ -85,6 +116,41 @@ final class AppState: ObservableObject {
     @Published var isLoadingNotifications = false
     @Published var isLoadingBookings = false
     @Published var bookingsErrorMessage: String? = nil
+    // Stripe Connect
+    @Published var isCreatingConnectOnboarding = false
+    @Published var connectOnboardingError: String? = nil
+    /// Cached Stripe account status keyed by club ID. Views observe this to re-render after refresh.
+    /// Absent key means not yet fetched or no account created. Non-nil value = account exists.
+    @Published var stripeAccountByClubID: [UUID: ClubStripeAccount] = [:]
+    /// Set when the app returns from Stripe onboarding so the onboarding view can react immediately.
+    @Published var pendingConnectReturnClubID: UUID? = nil
+    /// "complete" or "refresh" (link expired). Valid only while pendingConnectReturnClubID is non-nil.
+    @Published var pendingConnectReturnStatus: String = "complete"
+    // Club Subscriptions (Phase 4)
+    @Published var subscriptionsByClubID: [UUID: ClubSubscription] = [:]
+    @Published var entitlementsByClubID: [UUID: ClubEntitlements] = [:]
+    /// Canonical plan tier limit definitions fetched from get_plan_tier_limits() at launch.
+    /// Keyed by plan tier string ("free", "starter", "pro"). Empty until first successful fetch.
+    @Published var planTierLimits: [String: PlanTierLimits] = [:]
+    /// Server-authoritative subscription plan catalogue from get_subscription_plans().
+    /// Contains Stripe price IDs and display prices. Empty until first successful fetch.
+    /// Clients must never hardcode these values — use subscriptionPriceID(for:) and
+    /// subscriptionDisplayPrice(for:) helpers instead.
+    @Published var subscriptionPlans: [SubscriptionPlan] = []
+    /// Server-authoritative runtime config from app_config table.
+    /// nil = not yet loaded. Features that depend on config values must check for nil.
+    @Published var gameReminderOffsetMinutes: Int? = nil
+    @Published var isCreatingSubscription = false
+    @Published var subscriptionError: String? = nil
+    // Credits (Phase 2) — club-scoped: keyed by club UUID
+    @Published var creditBalanceByClubID: [UUID: Int] = [:]
+    @Published var lastCancellationCredit: CancellationCreditResult? = nil
+    /// Set to the club UUID whenever a booking is confirmed (Stripe or credits or free).
+    /// Analytics views observe this to refresh after a player books into a game.
+    @Published var lastConfirmedBookingClubID: UUID? = nil
+    /// Set to the club UUID whenever an attendance record is created, updated, or deleted.
+    /// Analytics views observe this to refresh no-show counts after check-in changes.
+    @Published var lastAttendanceUpdateClubID: UUID? = nil
     @Published var clubsLoadErrorMessage: String? = nil
     @Published var isUsingLiveClubData = false
     @Published var isAuthenticating = false
@@ -111,8 +177,8 @@ final class AppState: ObservableObject {
     @Published var isPerformingPostSignInBootstrap = false
     @Published var duprID: String? = nil
     @Published var duprDoublesRating: Double? = nil
-    @Published var duprSinglesRating: Double? = nil
     @Published var mutedClubChatIDs: Set<UUID> = []
+    @Published var notificationPreferences: NotificationPreferences = .init()
     @Published var remotePushTokenHex: String? = nil
     @Published var remotePushRegistrationErrorMessage: String? = nil
     private var clubNewsPrimedClubIDs: Set<UUID> = []
@@ -122,10 +188,10 @@ final class AppState: ObservableObject {
     private var clubChatRealtimeClients: [UUID: SupabaseClubChatRealtimeClient] = [:]
     private var clubChatRealtimeRefreshTasks: [UUID: Task<Void, Never>] = [:]
     private var duprIDByUserID: [UUID: String] = [:]
-    private var duprRatingsByUserID: [UUID: (doubles: Double?, singles: Double?)] = [:]
+    private var duprRatingsByUserID: [UUID: Double?] = [:]
 
     func duprDoublesRating(for userID: UUID) -> Double? {
-        duprRatingsByUserID[userID]?.doubles
+        duprRatingsByUserID[userID] ?? nil
     }
     private var duprHistoryByUserID: [UUID: [DUPREntry]] = [:]
     @Published var duprHistory: [DUPREntry] = []
@@ -139,18 +205,31 @@ final class AppState: ObservableObject {
         syncCurrentUserDUPRIDFromStore()
         syncCurrentUserDUPRRatingsFromStore()
         syncDUPRHistoryToCurrentUser()
-        restoreCheckedInBookingIDs()
+        // Attendance state (checkedInBookingIDs / noShowBookingIDs) is intentionally NOT
+        // restored from UserDefaults here. DB is the source of truth; state is synced
+        // from fetchAttendanceRecords on every refreshAttendees call. Restoring stale
+        // UserDefaults attendance would show incorrect state before the first DB sync,
+        // breaking multi-device consistency when two staff devices share a game.
         restoreClubNewsNotificationPreference()
+        restorePinnedClubIDs()
 
         Task {
             if authState == .signedIn {
                 _ = await refreshSessionIfPossible(silent: true)
             }
-            await refreshClubs()
+            // Load palette definitions, plan limits, subscription plans, and app config concurrently.
+            async let palettes: Void = loadAvatarPalettes()
+            async let clubs: Void = refreshClubs()
+            async let tierLimits: Void = fetchPlanTierLimits()
+            async let subPlans: Void = fetchSubscriptionPlans()
+            async let appCfg: Void = fetchAppConfig()
+            _ = await (palettes, clubs, tierLimits, subPlans, appCfg)
             if authState == .signedIn {
                 await loadProfileFromBackendIfAvailable()
+                await loadNotificationPreferencesIfNeeded()
                 await refreshBookings(silent: true)
                 await refreshUpcomingGames()
+                await fetchPendingReviewPrompt()
             }
             isInitialBootstrapComplete = true
         }
@@ -183,7 +262,6 @@ final class AppState: ObservableObject {
         profile = nil
         duprID = nil
         duprDoublesRating = nil
-        duprSinglesRating = nil
         gamesByClubID = [:]
         allUpcomingGames = []
         bookings = []
@@ -229,6 +307,7 @@ final class AppState: ObservableObject {
         ownerBookingUpdatingIDs = []
         scheduleStore.clearAll()
         checkedInBookingIDs = []
+        noShowBookingIDs = []
         authErrorMessage = nil
         authInfoMessage = nil
         profileSaveErrorMessage = nil
@@ -245,6 +324,7 @@ final class AppState: ObservableObject {
         clubNewsReportsErrorByClubID = [:]
         clubDirectoryErrorByClubID = [:]
         notifications = []
+        pendingReviewPrompt = nil
         dataProvider.setAccessToken(nil)
         clearPersistedSession()
         persistCheckedInBookingIDs()
@@ -283,7 +363,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    func completeProfile(name: String, homeClub: String?, skillLevel: SkillLevel, avatarPresetID: String?) async {
+    func completeProfile(firstName: String, lastName: String, homeClub: String?, skillLevel: SkillLevel) async {
         let userID = authUserID ?? UUID()
         authUserID = userID
         syncCurrentUserDUPRIDFromStore()
@@ -291,11 +371,13 @@ final class AppState: ObservableObject {
 
         let draft = UserProfile(
             id: userID,
-            fullName: name,
+            firstName: firstName,
+            lastName: lastName,
+            fullName: "\(firstName) \(lastName)",
             email: authEmail ?? "preview@bookadink.app",
             favoriteClubName: homeClub,
             skillLevel: skillLevel,
-            avatarPresetID: avatarPresetID
+            avatarColorKey: nil
         )
         profile = draft
 
@@ -455,8 +537,37 @@ final class AppState: ObservableObject {
 
     func isClubAdmin(for club: Club) -> Bool {
         if club.createdByUserID == authUserID { return true }
-        guard let role = clubAdminRoleByClubID[club.id]?.lowercased() else { return false }
-        return role == "owner" || role == "admin"
+        guard let role = clubAdminRoleByClubID[club.id] else { return false }
+        return role == .owner || role == .admin
+    }
+
+    // MARK: - Pinned Clubs
+
+    func isClubPinned(_ club: Club) -> Bool {
+        pinnedClubIDs.contains(club.id)
+    }
+
+    /// Toggles the pin state for a club. Enforces a maximum of 3 pinned clubs.
+    /// Returns false if the pin was rejected due to the cap being reached.
+    @discardableResult
+    func togglePinClub(_ club: Club) -> Bool {
+        if let idx = pinnedClubIDs.firstIndex(of: club.id) {
+            pinnedClubIDs.remove(at: idx)
+        } else {
+            guard pinnedClubIDs.count < 3 else { return false }
+            pinnedClubIDs.append(club.id)
+        }
+        persistPinnedClubIDs()
+        return true
+    }
+
+    private func persistPinnedClubIDs() {
+        UserDefaults.standard.set(pinnedClubIDs.map(\.uuidString), forKey: StorageKeys.pinnedClubIDs)
+    }
+
+    func restorePinnedClubIDs() {
+        guard let raw = UserDefaults.standard.array(forKey: StorageKeys.pinnedClubIDs) as? [String] else { return }
+        pinnedClubIDs = raw.compactMap(UUID.init(uuidString:))
     }
 
     /// True only for the club owner — not regular admins.
@@ -464,8 +575,8 @@ final class AppState: ObservableObject {
     /// Admins can only manage regular (non-admin) members.
     func isClubOwner(for club: Club) -> Bool {
         if club.createdByUserID == authUserID { return true }
-        guard let role = clubAdminRoleByClubID[club.id]?.lowercased() else { return false }
-        return role == "owner"
+        guard let role = clubAdminRoleByClubID[club.id] else { return false }
+        return role == .owner
     }
 
     func bookingState(for game: Game) -> BookingState {
@@ -504,6 +615,17 @@ final class AppState: ObservableObject {
         checkedInBookingIDs.contains(bookingID)
     }
 
+    func isNoShow(bookingID: UUID) -> Bool {
+        noShowBookingIDs.contains(bookingID)
+    }
+
+    /// Returns 'attended', 'no_show', or 'unmarked'.
+    func attendanceStatus(bookingID: UUID) -> String {
+        if checkedInBookingIDs.contains(bookingID) { return "attended" }
+        if noShowBookingIDs.contains(bookingID) { return "no_show" }
+        return "unmarked"
+    }
+
     func isOwnerSavingGame(_ game: Game) -> Bool {
         ownerSavingGameIDs.contains(game.id)
     }
@@ -537,17 +659,28 @@ final class AppState: ObservableObject {
         duprIDByUserID[userID] = normalized
         duprID = normalized
         persistDUPRIDStore()
+        // Persist to Supabase so book_game() server gate can enforce DUPR requirements.
+        // DB constraint rejects values outside ^[A-Z0-9-]+$ or without a digit —
+        // surface the error so the caller knows the value was not persisted server-side.
+        Task {
+            do {
+                try await dataProvider.patchDuprID(userID: userID, duprID: normalized)
+            } catch {
+                await MainActor.run {
+                    profileSaveErrorMessage = "DUPR ID saved locally but couldn't sync to server: \(AppCopy.friendlyError(error.localizedDescription))"
+                }
+            }
+        }
         return nil
     }
 
-    /// Saves DUPR ratings for the current user. Returns an error string on failure, nil on success.
-    func saveDUPRRatings(doubles: Double?, singles: Double?) -> String? {
-        guard let userID = authUserID else { return "Sign in to save your DUPR ratings." }
-        if let d = doubles, (d < 1.0 || d > 8.0) { return "Doubles rating must be between 1.0 and 8.0." }
-        if let s = singles, (s < 1.0 || s > 8.0) { return "Singles rating must be between 1.0 and 8.0." }
-        duprRatingsByUserID[userID] = (doubles: doubles, singles: singles)
+    /// Saves the DUPR rating for the current user. Returns an error string on failure, nil on success.
+    /// Callers must validate exactly 3 decimal places at the text-input layer before invoking this.
+    func saveDUPRRatings(doubles: Double?, singles: Double? = nil) -> String? {
+        guard let userID = authUserID else { return "Sign in to save your DUPR rating." }
+        if let d = doubles, (d < 2.0 || d > 8.0) { return "DUPR rating must be between 2.000 and 8.000." }
+        duprRatingsByUserID[userID] = doubles
         duprDoublesRating = doubles
-        duprSinglesRating = singles
         persistDUPRRatingsStore()
         if let d = doubles {
             appendDUPREntry(rating: d, context: "DUPR sync")
@@ -681,10 +814,11 @@ final class AppState: ObservableObject {
                     self.scheduleClubChatRealtimeRefresh(for: club, includeModeration: includeModeration, immediate: true)
                 case .postgresChange:
                     self.scheduleClubChatRealtimeRefresh(for: club, includeModeration: includeModeration, immediate: false)
-                case let .error(message):
-                    if self.clubNewsErrorByClubID[club.id] == nil {
-                        self.clubNewsErrorByClubID[club.id] = AppCopy.friendlyError(message)
-                    }
+                case .error:
+                    // Realtime subscription errors are transient — the client auto-reconnects
+                    // after 3 seconds. Do not surface them as a blocking UI error banner;
+                    // the user would see a spurious "something went wrong" on every reconnect.
+                    break
                 case .disconnected:
                     break
                 }
@@ -736,10 +870,30 @@ final class AppState: ObservableObject {
             } else {
                 clubAdminRoleByClubID.removeValue(forKey: club.id)
             }
-            telemetry("refresh_admin_role_success club_id=\(club.id.uuidString) role=\(role ?? "none") duration_ms=\(elapsedMilliseconds(since: startedAt))")
+            telemetry("refresh_admin_role_success club_id=\(club.id.uuidString) role=\(role?.rawValue ?? "none") duration_ms=\(elapsedMilliseconds(since: startedAt))")
         } catch {
             // Non-fatal; owner check still works.
             telemetry("refresh_admin_role_error club_id=\(club.id.uuidString) duration_ms=\(elapsedMilliseconds(since: startedAt)) message=\(error.localizedDescription)")
+        }
+    }
+
+    func uploadClubAvatarImage(_ data: Data, clubID: UUID) async throws -> URL {
+        try await dataProvider.uploadClubAvatarImage(data, clubID: clubID)
+    }
+
+    func uploadClubBannerImage(_ data: Data, clubID: UUID) async throws -> URL {
+        try await dataProvider.uploadClubBannerImage(data, clubID: clubID)
+    }
+
+    /// Deletes a club avatar or banner image from Supabase storage.
+    /// Only acts on URLs that belong to our managed bucket; silently skips all others.
+    /// Fire-and-forget safe — errors are swallowed and logged.
+    func deleteClubStorageImageIfManaged(_ url: URL?) async {
+        guard let url else { return }
+        do {
+            try await dataProvider.deleteClubStorageImage(at: url)
+        } catch {
+            telemetry("deleteClubStorageImage failed url=\(url.absoluteString) error=\(error.localizedDescription)")
         }
     }
 
@@ -774,7 +928,7 @@ final class AppState: ObservableObject {
                 }
             }
 
-            try await withAuthRetry {
+            let createdPostID = try await withAuthRetry {
                 try await self.dataProvider.createClubNewsPost(
                     clubID: club.id,
                     userID: authUserID,
@@ -787,7 +941,7 @@ final class AppState: ObservableObject {
                 // Fan-out: notification row + push for every club member
                 try? await dataProvider.triggerClubAnnouncementNotify(
                     clubID: club.id,
-                    postID: club.id, // used as reference; post ID not returned by createClubNewsPost
+                    postID: createdPostID ?? club.id,
                     posterUserID: authUserID,
                     clubName: club.name,
                     posterName: profile?.fullName ?? "A club member",
@@ -799,7 +953,9 @@ final class AppState: ObservableObject {
                         clubID: club.id,
                         actorUserID: authUserID,
                         event: "new_post",
-                        referenceID: nil
+                        referenceID: createdPostID,
+                        postAuthorID: nil,
+                        content: trimmed
                     )
                 }
             }
@@ -870,6 +1026,7 @@ final class AppState: ObservableObject {
             postID: post.id,
             userID: authUserID,
             authorName: profile?.fullName ?? "You",
+            avatarColorKey: profile?.avatarColorKey,
             content: trimmed,
             createdAt: Date(),
             parentID: parentCommentID
@@ -879,7 +1036,7 @@ final class AppState: ObservableObject {
         }
 
         do {
-            try await withAuthRetry {
+            let createdCommentID = try await withAuthRetry {
                 try await self.dataProvider.createClubNewsComment(
                     postID: post.id,
                     userID: authUserID,
@@ -891,8 +1048,10 @@ final class AppState: ObservableObject {
                 try await self.dataProvider.triggerClubChatPushHook(
                     clubID: club.id,
                     actorUserID: authUserID,
-                    event: "new_comment",
-                    referenceID: post.id
+                    event: "comment_on_post",
+                    referenceID: createdCommentID,
+                    postAuthorID: post.userID,
+                    content: trimmed
                 )
             }
             // Background refresh replaces the temp comment with the real server row
@@ -1055,6 +1214,9 @@ final class AppState: ObservableObject {
             mutedClubChatIDs.remove(clubID)
             Task { await prepareClubChatPushNotificationsIfNeeded() }
         }
+        // Clear any stale error so re-renders triggered by the @Published mutedClubChatIDs
+        // change don't resurface an old error banner.
+        clubNewsErrorByClubID[clubID] = nil
         persistClubNewsNotificationPreference()
     }
 
@@ -1099,7 +1261,11 @@ final class AppState: ObservableObject {
                     try await self.dataProvider.updateProfilePushToken(userID: authUserID, pushToken: tokenHex)
                 }
             } catch {
-                // Non-fatal for current UX; local notifications continue to work.
+                // 409 = token already stored (push_tokens has no unique constraint yet, upsert
+                // sees a conflict). The token IS registered — not an error worth surfacing.
+                if case let SupabaseServiceError.httpStatus(code, _) = error, code == 409 { return }
+                // Other failures are non-fatal (local notifications still work) but worth showing
+                // so the user knows push alerts may not arrive.
                 await MainActor.run {
                     self.remotePushRegistrationErrorMessage = AppCopy.friendlyError(error.localizedDescription)
                 }
@@ -1118,6 +1284,14 @@ final class AppState: ObservableObject {
             pendingDeepLink = link
             return
         }
+        // Stripe Connect return — signal the onboarding view and refresh status.
+        // Don't set pendingDeepLink since there's nothing to navigate to.
+        if case .connectReturn(let clubID, let status) = link {
+            pendingConnectReturnStatus = status
+            pendingConnectReturnClubID = clubID
+            Task { await refreshStripeAccountStatus(for: clubID) }
+            return
+        }
         pendingDeepLink = link
     }
 
@@ -1134,26 +1308,41 @@ final class AppState: ObservableObject {
             }
             attendeesByGameID[game.id] = loaded
 
-            let syncedAttendanceMap: [UUID: String]
+            let syncedRecords: AttendanceRecords
             do {
-                syncedAttendanceMap = try await withAuthRetry {
-                    try await self.dataProvider.fetchCheckedInBookingIDs(gameID: game.id)
+                syncedRecords = try await withAuthRetry {
+                    try await self.dataProvider.fetchAttendanceRecords(gameID: game.id)
                 }
             } catch {
-                // If attendance policy is not available to this user, keep cached check-ins.
-                let cached = checkedInBookingIDs.intersection(Set(loaded.map(\.booking.id)))
-                syncedAttendanceMap = Dictionary(uniqueKeysWithValues: cached.map { ($0, attendancePaymentByBookingID[$0] ?? "unpaid") })
+                // If attendance policy is not available to this user, keep cached state.
+                let loadedBookingIDs = Set(loaded.map(\.booking.id))
+                let cachedAttended = checkedInBookingIDs.intersection(loadedBookingIDs)
+                let cachedNoShow   = noShowBookingIDs.intersection(loadedBookingIDs)
+                var statusMap: [UUID: String] = [:]
+                for id in cachedAttended { statusMap[id] = "attended" }
+                for id in cachedNoShow   { statusMap[id] = "no_show" }
+                let paymentMap = Dictionary(uniqueKeysWithValues: cachedAttended.map { ($0, attendancePaymentByBookingID[$0] ?? "unpaid") })
+                syncedRecords = AttendanceRecords(attendanceStatusByBookingID: statusMap, paymentByBookingID: paymentMap)
             }
 
-            let syncedCheckedInIDs = Set(syncedAttendanceMap.keys)
             let currentGameBookingIDs = Set(loaded.map(\.booking.id))
-            let removedForThisGame = previousBookingIDs.subtracting(currentGameBookingIDs)
+            let removedForThisGame    = previousBookingIDs.subtracting(currentGameBookingIDs)
+
+            // Clear stale entries for removed and previously-known bookings in this game
             checkedInBookingIDs.subtract(removedForThisGame)
+            noShowBookingIDs.subtract(removedForThisGame)
             checkedInBookingIDs.subtract(previousBookingIDs.intersection(currentGameBookingIDs))
-            checkedInBookingIDs.formUnion(syncedCheckedInIDs)
-            // Update payment statuses for this game
+            noShowBookingIDs.subtract(previousBookingIDs.intersection(currentGameBookingIDs))
+
+            // Apply synced attendance state
+            for (bookingID, status) in syncedRecords.attendanceStatusByBookingID {
+                if status == "attended"  { checkedInBookingIDs.insert(bookingID) }
+                else if status == "no_show" { noShowBookingIDs.insert(bookingID) }
+            }
+
+            // Update payment statuses
             for id in removedForThisGame { attendancePaymentByBookingID.removeValue(forKey: id) }
-            for (bookingID, status) in syncedAttendanceMap { attendancePaymentByBookingID[bookingID] = status }
+            for (bookingID, status) in syncedRecords.paymentByBookingID { attendancePaymentByBookingID[bookingID] = status }
             persistCheckedInBookingIDs()
         } catch {
             bookingsErrorMessage = error.localizedDescription
@@ -1333,8 +1522,13 @@ final class AppState: ObservableObject {
                     emergencyContactPhone: member.emergencyContactPhone,
                     isAdmin: makeAdmin,
                     isOwner: member.isOwner,
-                    adminRole: makeAdmin ? "admin" : nil,
-                    conductAcceptedAt: member.conductAcceptedAt
+                    adminRole: makeAdmin ? ClubAdminRole.admin : nil,
+                    conductAcceptedAt: member.conductAcceptedAt,
+                    cancellationPolicyAcceptedAt: member.cancellationPolicyAcceptedAt,
+                    duprRating: member.duprRating,
+                    duprUpdatedAt: member.duprUpdatedAt,
+                    duprUpdatedByName: member.duprUpdatedByName,
+                    avatarColorKey: member.avatarColorKey
                 )
             }
             ownerMembersByClubID[club.id] = current.sorted { lhs, rhs in
@@ -1395,13 +1589,316 @@ final class AppState: ObservableObject {
         }
     }
 
-    func createPaymentIntent(amountCents: Int, currency: String, metadata: [String: String]) async throws -> String {
+    func createPaymentIntent(amountCents: Int, currency: String, clubID: UUID?, metadata: [String: String]) async throws -> PaymentIntentResult {
         try await withAuthRetry {
             try await self.dataProvider.createPaymentIntent(
                 amountCents: amountCents,
                 currency: currency,
+                clubID: clubID,
                 metadata: metadata
             )
+        }
+    }
+
+    // MARK: - Credits (Phase 2)
+
+    /// Returns the credit balance for the given club (0 if none).
+    func creditBalance(for clubID: UUID) -> Int {
+        creditBalanceByClubID[clubID] ?? 0
+    }
+
+    /// Fetches the latest credit balance from the DB for a specific club and updates `creditBalanceByClubID`.
+    func refreshCreditBalance(for clubID: UUID) async {
+        guard let userID = authUserID else { return }
+        do {
+            let balance = try await withAuthRetry {
+                try await self.dataProvider.fetchCreditBalance(userID: userID, clubID: clubID)
+            }
+            await MainActor.run { self.creditBalanceByClubID[clubID] = balance }
+        } catch {
+            // Non-critical — swallow silently; balance shows as 0
+        }
+    }
+
+    /// Calculates how many cents of credit to apply to a game booking and the
+    /// remaining amount the player must pay via Stripe.
+    /// - Parameters:
+    ///   - amountCents: The full game fee in cents.
+    ///   - clubID: The club whose credit balance to draw from.
+    ///   - applyCredits: When `false`, skips credit lookup and returns the full amount (toggle off).
+    /// - Returns: `(creditsToApply, remainingCents)` where `remainingCents` is the Stripe charge amount.
+    func creditOffset(for amountCents: Int, clubID: UUID, applyCredits: Bool = true) async -> (creditsToApply: Int, remainingCents: Int) {
+        guard applyCredits else { return (0, amountCents) }
+        let balance = creditBalance(for: clubID)
+        let creditsToApply = min(balance, amountCents)
+        let remaining = amountCents - creditsToApply
+        return (creditsToApply, remaining)
+    }
+
+    // MARK: - Confirm pending payment (Phase 3)
+
+    /// Transitions a `pending_payment` booking to `confirmed` after successful payment.
+    /// Used for promoted waitlist players completing their held spot.
+    func confirmPendingBooking(bookingID: UUID, stripePaymentIntentID: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?, clubID: UUID) async {
+        // Client-side fast-fail: catch expired holds before hitting the server.
+        // The server enforces this too (hold_expires_at > now() filter), but
+        // failing locally avoids a wasted network round trip and gives instant feedback.
+        if let holdExp = bookings.first(where: { $0.booking.id == bookingID })?.booking.holdExpiresAt,
+           holdExp <= Date() {
+            bookingsErrorMessage = SupabaseServiceError.holdExpired.errorDescription
+            await refreshBookings(silent: false)
+            return
+        }
+
+        do {
+            let updated = try await withAuthRetry {
+                try await self.dataProvider.confirmPendingBooking(
+                    bookingID: bookingID,
+                    stripePaymentIntentID: stripePaymentIntentID,
+                    platformFeeCents: platformFeeCents,
+                    clubPayoutCents: clubPayoutCents,
+                    creditsAppliedCents: creditsAppliedCents
+                )
+            }
+            // Update local cache
+            if let idx = bookings.firstIndex(where: { $0.booking.id == bookingID }) {
+                let existingGame = bookings[idx].game
+                bookings[idx] = BookingWithGame(booking: updated, game: existingGame)
+            }
+            // Deduct credits if applied (same pattern as requestBooking)
+            if let credits = creditsAppliedCents, credits > 0, let userID = authUserID {
+                let cid = clubID
+                // Optimistic update: reflect the deduction immediately in the UI.
+                creditBalanceByClubID[cid] = max(0, (creditBalanceByClubID[cid] ?? 0) - credits)
+                Task {
+                    _ = try? await self.dataProvider.applyCredits(
+                        userID: userID,
+                        bookingID: bookingID,
+                        amountCents: credits,
+                        clubID: cid
+                    )
+                    // Confirm with authoritative DB value.
+                    await self.refreshCreditBalance(for: cid)
+                }
+            }
+            await refreshBookings(silent: true)
+            // Refresh attendees + game spot count so the player list and fill bar update immediately.
+            if let bookingWithGame = bookings.first(where: { $0.booking.id == bookingID }),
+               let game = bookingWithGame.game {
+                await refreshAttendees(for: game)
+                if let club = clubs.first(where: { $0.id == game.clubID }) {
+                    await refreshGames(for: club)
+                }
+            }
+        } catch SupabaseServiceError.holdExpired {
+            // Hold expired between client check and server PATCH — refresh to show correct state.
+            bookingsErrorMessage = SupabaseServiceError.holdExpired.errorDescription
+            await refreshBookings(silent: false)
+        } catch {
+            bookingsErrorMessage = "Could not confirm booking: \(error.localizedDescription)"
+        }
+    }
+
+    /// Creates a PaymentIntent on demand for a deferred payment scenario (e.g. waitlist promotion).
+    /// Call this when the player actively returns to the app and chooses to complete payment.
+    /// Does NOT insert a booking — that is handled by the caller after PaymentSheet completion.
+    func createDeferredPaymentIntent(for game: Game) async throws -> PaymentIntentResult {
+        let amountCents = Int(((game.feeAmount ?? 0) * 100).rounded())
+        let (_, remaining) = await creditOffset(for: amountCents, clubID: game.clubID)
+
+        return try await withAuthRetry {
+            try await self.dataProvider.createPaymentIntent(
+                amountCents: remaining,
+                currency: "aud",
+                clubID: game.clubID,
+                metadata: ["game_id": game.id.uuidString, "game_title": game.title, "deferred": "true"]
+            )
+        }
+    }
+
+    func fetchClubStripeAccount(for clubID: UUID) async throws -> ClubStripeAccount? {
+        try await withAuthRetry {
+            try await self.dataProvider.fetchClubStripeAccount(clubID: clubID)
+        }
+    }
+
+    func createConnectOnboarding(for club: Club) async -> String? {
+        isCreatingConnectOnboarding = true
+        connectOnboardingError = nil
+        defer { isCreatingConnectOnboarding = false }
+        do {
+            let returnURL = "bookadink://connect-return"
+            return try await withAuthRetry {
+                try await self.dataProvider.createConnectOnboarding(
+                    clubID: club.id,
+                    returnURL: returnURL
+                )
+            }
+        } catch {
+            connectOnboardingError = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Fetches the live Stripe account state from the backend and caches it in `stripeAccountByClubID`.
+    /// Called on return from Stripe onboarding (via deep link) and on explicit user "Check Status" taps.
+    func refreshStripeAccountStatus(for clubID: UUID) async {
+        do {
+            let account = try await withAuthRetry {
+                try await self.dataProvider.refreshStripeAccountStatus(clubID: clubID)
+            }
+            await MainActor.run {
+                if let account {
+                    stripeAccountByClubID[clubID] = account
+                } else {
+                    stripeAccountByClubID.removeValue(forKey: clubID)
+                }
+            }
+        } catch {
+            // Non-fatal — fall back to a direct DB read so we still show something
+            let account = try? await withAuthRetry {
+                try await self.dataProvider.fetchClubStripeAccount(clubID: clubID)
+            }
+            await MainActor.run {
+                if let account {
+                    stripeAccountByClubID[clubID] = account
+                }
+            }
+        }
+    }
+
+    // MARK: - Club Subscriptions (Phase 4)
+
+    func fetchClubSubscription(for clubID: UUID) async {
+        do {
+            let sub = try await withAuthRetry {
+                try await self.dataProvider.fetchClubSubscription(clubID: clubID)
+            }
+            await MainActor.run {
+                if let sub { subscriptionsByClubID[clubID] = sub }
+                else { subscriptionsByClubID.removeValue(forKey: clubID) }
+            }
+        } catch {
+            // Non-fatal: subscription is just not shown
+        }
+    }
+
+    /// Fetches entitlements for a club and stores them in entitlementsByClubID.
+    ///
+    /// On error or missing row, the dict is left unchanged — a missing entry is treated
+    /// as fully blocked by FeatureGateService (deny by default). No silent access on failure.
+    func fetchClubEntitlements(for clubID: UUID) async {
+        do {
+            let entitlements = try await withAuthRetry {
+                try await self.dataProvider.fetchClubEntitlements(clubID: clubID)
+            }
+            await MainActor.run {
+                if let entitlements {
+                    entitlementsByClubID[clubID] = entitlements
+                }
+                // Intentional: nil result (no row found) does not update the dict.
+                // entitlementsByClubID[clubID] == nil → FeatureGateService returns .blocked.
+            }
+        } catch {
+            // Intentional: fetch errors do not update the dict.
+            // Keeps paid features locked if connectivity is lost mid-session.
+        }
+    }
+
+    /// Fetches canonical plan tier limits from get_plan_tier_limits() and caches them.
+    /// Called once at bootstrap. Silently no-ops on error — UI falls back to inline defaults.
+    func fetchPlanTierLimits() async {
+        do {
+            let limits = try await withAuthRetry {
+                try await self.dataProvider.fetchPlanTierLimits()
+            }
+            await MainActor.run {
+                planTierLimits = limits
+            }
+        } catch {
+            // Silent: paywall falls back to hardcoded fallback strings if this fails.
+        }
+    }
+
+    /// Fetches active subscription plan definitions from get_subscription_plans() and caches them.
+    /// Called once at bootstrap. On error subscriptionPlans remains empty — paywalls show
+    /// a loading state and disable the subscribe button until plans arrive.
+    func fetchSubscriptionPlans() async {
+        do {
+            let plans = try await withAuthRetry {
+                try await self.dataProvider.fetchSubscriptionPlans()
+            }
+            await MainActor.run {
+                subscriptionPlans = plans
+            }
+        } catch {
+            // subscriptionPlans stays empty; paywall disables subscribe buttons.
+        }
+    }
+
+    /// Returns the Stripe price ID for the given plan ID, or nil if plans haven't loaded yet.
+    func subscriptionPriceID(for planID: String) -> String? {
+        subscriptionPlans.first(where: { $0.planID == planID })?.stripePriceID
+    }
+
+    /// Returns the display price string for the given plan ID, or nil if plans haven't loaded.
+    func subscriptionDisplayPrice(for planID: String) -> String? {
+        subscriptionPlans.first(where: { $0.planID == planID })?.displayPrice
+    }
+
+    /// Fetches server-authoritative runtime config from the app_config table.
+    /// Called once at bootstrap. Sets gameReminderOffsetMinutes from the DB value.
+    /// On error gameReminderOffsetMinutes remains nil — callers must handle the nil case.
+    func fetchAppConfig() async {
+        do {
+            let config = try await withAuthRetry {
+                try await self.dataProvider.fetchAppConfig()
+            }
+            await MainActor.run {
+                if let raw = config["game_reminder_offset_minutes"], let minutes = Int(raw), minutes > 0 {
+                    gameReminderOffsetMinutes = minutes
+                }
+            }
+        } catch {
+            // gameReminderOffsetMinutes stays nil; caller surfaces the nil case to the user.
+        }
+    }
+
+    func createClubSubscription(for club: Club, priceID: String) async -> ClubSubscriptionResult? {
+        isCreatingSubscription = true
+        subscriptionError = nil
+        defer { isCreatingSubscription = false }
+        do {
+            let result = try await withAuthRetry {
+                try await self.dataProvider.createClubSubscription(clubID: club.id, priceID: priceID)
+            }
+            // Refresh local subscription cache
+            await fetchClubSubscription(for: club.id)
+            // For the upgrade path the Edge Function derives entitlements synchronously
+            // before returning, so the DB row is already correct — fetch it now so the
+            // UI unlocks without waiting for any caller to do a second round-trip.
+            if result.status == "active" {
+                await fetchClubEntitlements(for: club.id)
+            }
+            return result
+        } catch {
+            subscriptionError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func cancelClubSubscription(for club: Club) async {
+        subscriptionError = nil
+        do {
+            try await withAuthRetry {
+                try await self.dataProvider.cancelClubSubscription(clubID: club.id)
+            }
+            // Refresh both caches so the UI immediately shows "cancels at period end"
+            // and entitlements remain at the paid tier until the period ends.
+            await fetchClubSubscription(for: club.id)
+            await fetchClubEntitlements(for: club.id)
+        } catch {
+            subscriptionError = error.localizedDescription
         }
     }
 
@@ -1412,6 +1909,10 @@ final class AppState: ObservableObject {
             try await withAuthRetry {
                 try await self.dataProvider.adminUpdateMemberDUPR(memberUserID: member.userID, rating: rating)
             }
+            // Update in-memory cache so the attendee list and directory reflect
+            // the new value immediately without a full refresh.
+            duprRatingsByUserID[member.userID] = rating
+            persistDUPRRatingsStore()
             ownerToolsInfoMessage = "DUPR updated to \(String(format: "%.3f", rating)) for \(member.memberName)."
         } catch {
             ownerToolsErrorMessage = "Failed to update DUPR: \(error.localizedDescription)"
@@ -1486,7 +1987,7 @@ final class AppState: ObservableObject {
                 return nil
             }.max() ?? 0
             waitlistPosition = maxPosition + 1
-        case .none, .unknown:
+        case .none, .unknown, .pendingPayment:
             return
         }
 
@@ -1500,7 +2001,7 @@ final class AppState: ObservableObject {
             }
 
             if var rows = attendeesByGameID[game.id], let index = rows.firstIndex(where: { $0.booking.id == attendee.booking.id }) {
-                rows[index] = GameAttendee(booking: updated, userName: rows[index].userName, userEmail: rows[index].userEmail)
+                rows[index] = GameAttendee(booking: updated, userName: rows[index].userName, userEmail: rows[index].userEmail, duprRating: rows[index].duprRating, avatarColorKey: rows[index].avatarColorKey)
                 attendeesByGameID[game.id] = rows
             }
             if let index = bookings.firstIndex(where: { $0.booking.id == attendee.booking.id }) {
@@ -1508,6 +2009,7 @@ final class AppState: ObservableObject {
             }
             if case .cancelled = targetState {
                 checkedInBookingIDs.remove(attendee.booking.id)
+                noShowBookingIDs.remove(attendee.booking.id)
                 persistCheckedInBookingIDs()
             }
 
@@ -1518,7 +2020,7 @@ final class AppState: ObservableObject {
                 gameOwnerInfoByID[game.id] = "\(attendee.userName) moved to waitlist."
             case .cancelled:
                 gameOwnerInfoByID[game.id] = "\(attendee.userName)'s booking cancelled."
-            case .none, .unknown:
+            case .none, .unknown, .pendingPayment:
                 gameOwnerInfoByID[game.id] = "Booking updated."
             }
 
@@ -1548,33 +2050,29 @@ final class AppState: ObservableObject {
         gameOwnerInfoByID.removeValue(forKey: game.id)
 
         do {
-            // Determine if the game is already at or over capacity
-            let currentConfirmed = gameAttendees(for: game).filter {
-                if case .confirmed = $0.booking.state { return true }; return false
-            }.count
-            let gameFull = currentConfirmed >= game.maxSpots
-
-            let nextWaitlistPos: Int? = gameFull ? {
-                let maxPos = gameAttendees(for: game).compactMap { row -> Int? in
-                    if case let .waitlisted(p) = row.booking.state { return p }; return nil
-                }.max() ?? 0
-                return maxPos + 1
-            }() : nil
-
+            // Server (owner_create_booking RPC) decides confirmed vs waitlisted
+            // under a games-row FOR UPDATE lock — the same invariant book_game()
+            // uses (confirmed + pending_payment <= max_spots). The status/position
+            // returned in the booking record is authoritative.
             let booking = try await withAuthRetry {
                 try await self.dataProvider.ownerCreateBooking(
                     gameID: game.id,
                     userID: member.userID,
-                    status: gameFull ? "waitlisted" : "confirmed",
-                    waitlistPosition: nextWaitlistPos
+                    status: "confirmed",      // ignored by RPC; kept for signature compat
+                    waitlistPosition: nil      // ignored by RPC; kept for signature compat
                 )
             }
-            let attendee = GameAttendee(booking: booking, userName: member.memberName, userEmail: member.memberEmail)
+            let attendee = GameAttendee(booking: booking, userName: member.memberName, userEmail: member.memberEmail, duprRating: nil, avatarColorKey: member.avatarColorKey)
             var rows = attendeesByGameID[game.id] ?? []
             rows.append(attendee)
             attendeesByGameID[game.id] = rows
 
-            gameOwnerInfoByID[game.id] = gameFull
+            // Use the server-returned state, not a pre-call client estimate.
+            let placedOnWaitlist: Bool = {
+                if case .waitlisted = booking.state { return true }
+                return false
+            }()
+            gameOwnerInfoByID[game.id] = placedOnWaitlist
                 ? "\(member.memberName) added to the waitlist (game is full)."
                 : "\(member.memberName) added to the game."
 
@@ -1593,7 +2091,9 @@ final class AppState: ObservableObject {
         }
     }
 
-    func toggleCheckIn(for game: Game, attendee: GameAttendee) async {
+    /// Sets attendance for a player. status: 'attended' | 'no_show' | nil (removes record = unmarked).
+    /// Optimistic: local state updates immediately. Backend saves in background. Reverts on failure.
+    func setAttendance(for game: Game, attendee: GameAttendee, status: String?) async {
         gameOwnerErrorByID.removeValue(forKey: game.id)
         gameOwnerInfoByID.removeValue(forKey: game.id)
 
@@ -1602,33 +2102,60 @@ final class AppState: ObservableObject {
             return
         }
 
+        // Capture previous state for rollback
+        let wasAttended = checkedInBookingIDs.contains(attendee.booking.id)
+        let wasNoShow   = noShowBookingIDs.contains(attendee.booking.id)
+
+        // Optimistic update — row changes immediately before network call
+        checkedInBookingIDs.remove(attendee.booking.id)
+        noShowBookingIDs.remove(attendee.booking.id)
+        switch status {
+        case "attended":  checkedInBookingIDs.insert(attendee.booking.id)
+        case "no_show":   noShowBookingIDs.insert(attendee.booking.id)
+        default:          break  // nil = remove row (unmarked)
+        }
+        persistCheckedInBookingIDs()
+
         ownerBookingUpdatingIDs.insert(attendee.booking.id)
         defer { ownerBookingUpdatingIDs.remove(attendee.booking.id) }
 
         do {
-            if checkedInBookingIDs.contains(attendee.booking.id) {
+            if let status {
                 try await withAuthRetry {
-                    try await self.dataProvider.deleteAttendanceCheckIn(bookingID: attendee.booking.id)
-                }
-                checkedInBookingIDs.remove(attendee.booking.id)
-                gameOwnerInfoByID[game.id] = "Check-in removed."
-            } else {
-                try await withAuthRetry {
-                    try await self.dataProvider.upsertAttendanceCheckIn(
+                    try await self.dataProvider.upsertAttendance(
                         gameID: game.id,
                         bookingID: attendee.booking.id,
                         userID: attendee.booking.userID,
-                        checkedInBy: authUserID
+                        checkedInBy: authUserID,
+                        status: status
                     )
                 }
-                checkedInBookingIDs.insert(attendee.booking.id)
-                gameOwnerInfoByID[game.id] = "\(attendee.userName) checked in."
+                lastAttendanceUpdateClubID = game.clubID
+                switch status {
+                case "attended":  gameOwnerInfoByID[game.id] = "\(attendee.userName) marked attended."
+                case "no_show":   gameOwnerInfoByID[game.id] = "\(attendee.userName) marked no show."
+                default:          break
+                }
+            } else {
+                try await withAuthRetry {
+                    try await self.dataProvider.deleteAttendanceCheckIn(bookingID: attendee.booking.id)
+                }
+                lastAttendanceUpdateClubID = game.clubID
+                gameOwnerInfoByID[game.id] = "Attendance removed."
             }
-            persistCheckedInBookingIDs()
-            await refreshAttendees(for: game)
         } catch {
-            gameOwnerErrorByID[game.id] = error.localizedDescription
+            // Revert optimistic update on failure
+            checkedInBookingIDs.remove(attendee.booking.id)
+            noShowBookingIDs.remove(attendee.booking.id)
+            if wasAttended { checkedInBookingIDs.insert(attendee.booking.id) }
+            if wasNoShow   { noShowBookingIDs.insert(attendee.booking.id) }
+            persistCheckedInBookingIDs()
+            gameOwnerErrorByID[game.id] = "Could not update attendance."
+            return
         }
+        // Reconcile from DB after the write so any DB-side side effects (triggers,
+        // concurrent admin updates) are reflected without requiring a manual refresh.
+        await refreshAttendees(for: game)
     }
 
     func paymentStatus(for bookingID: UUID) -> String {
@@ -1651,7 +2178,38 @@ final class AppState: ObservableObject {
             attendancePaymentByBookingID[attendee.booking.id] = status
         } catch {
             gameOwnerErrorByID[game.id] = "Could not update payment: \(error.localizedDescription)"
+            return
         }
+        await refreshAttendees(for: game)
+    }
+
+    /// Updates the `payment_method` (and `fee_paid`) on a booking record for upcoming games.
+    /// Stripe-paid bookings must never be passed here — enforced at the call site.
+    func updateBookingPaymentMethod(for game: Game, attendee: GameAttendee, method: String) async {
+        gameOwnerErrorByID.removeValue(forKey: game.id)
+
+        ownerBookingUpdatingIDs.insert(attendee.booking.id)
+        defer { ownerBookingUpdatingIDs.remove(attendee.booking.id) }
+
+        do {
+            let updated = try await withAuthRetry {
+                try await self.dataProvider.updateBookingPaymentMethod(
+                    bookingID: attendee.booking.id,
+                    paymentMethod: method
+                )
+            }
+            if var rows = attendeesByGameID[game.id],
+               let idx = rows.firstIndex(where: { $0.booking.id == attendee.booking.id }) {
+                rows[idx] = GameAttendee(booking: updated, userName: rows[idx].userName, userEmail: rows[idx].userEmail, duprRating: rows[idx].duprRating, avatarColorKey: rows[idx].avatarColorKey)
+                attendeesByGameID[game.id] = rows
+            }
+        } catch {
+            gameOwnerErrorByID[game.id] = "Could not update payment: \(error.localizedDescription)"
+            return
+        }
+        await refreshAttendees(for: game)
+        // Signal analytics to refresh — payment method changes affect revenue KPIs
+        lastAttendanceUpdateClubID = game.clubID
     }
 
     func ownerMoveWaitlistAttendee(for game: Game, attendee: GameAttendee, directionUp: Bool) async {
@@ -1761,6 +2319,7 @@ final class AppState: ObservableObject {
                     )
                 }
                 checkedInBookingIDs.remove(attendee.booking.id)
+                noShowBookingIDs.remove(attendee.booking.id)
             }
             persistCheckedInBookingIDs()
             gameOwnerInfoByID[game.id] = "Cleared waitlist."
@@ -1801,6 +2360,31 @@ final class AppState: ObservableObject {
 
         let repeatCount = draft.repeatWeekly ? max(draft.repeatCount, 1) : 1
 
+        // Gate: check active game limit before creating.
+        // Active = not cancelled, date in future. Scheduled (unpublished) games count.
+        // For a recurring batch, check that all instances fit within the limit.
+        let now = Date()
+        let currentActiveCount = (gamesByClubID[club.id] ?? [])
+            .filter { $0.status != "cancelled" && $0.dateTime > now }
+            .count
+        let gateResult = FeatureGateService.canCreateGame(
+            entitlementsByClubID[club.id],
+            currentActiveGameCount: currentActiveCount + repeatCount - 1
+        )
+        if case .blocked(let reason) = gateResult {
+            ownerToolsErrorMessage = reason
+            return false
+        }
+
+        // Gate: fee requires payment eligibility.
+        let draftFeeForCreate = Double(draft.feeAmountText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        if draftFeeForCreate > 0 {
+            if case .blocked(let reason) = FeatureGateService.canAcceptPayments(entitlementsByClubID[club.id]) {
+                ownerToolsErrorMessage = reason
+                return false
+            }
+        }
+
         isCreatingOwnerGame = true
         defer { isCreatingOwnerGame = false }
 
@@ -1839,10 +2423,30 @@ final class AppState: ObservableObject {
             current.sort { $0.dateTime < $1.dateTime }
             gamesByClubID[club.id] = current
             ownerToolsInfoMessage = repeatCount > 1 ? "\(repeatCount) weekly games created." : "Game created."
+
+            // Notify club members when the game is published immediately (no delay).
+            // Delayed-publish games are not live yet — skip until they go public.
+            if draft.publishAt == nil, let firstGame = createdGames.first, let creatorID = authUserID {
+                try? await dataProvider.triggerGamePublishedNotify(
+                    gameID: firstGame.id,
+                    gameTitle: firstGame.title,
+                    gameDateTime: firstGame.dateTime,
+                    clubID: club.id,
+                    clubName: club.name,
+                    createdByUserID: creatorID,
+                    skillLevel: draft.skillLevelRaw == "all" ? nil : draft.skillLevelRaw,
+                    clubTimezone: club.timezone
+                )
+            }
+
             await refreshGames(for: club)
             return true
         } catch {
-            ownerToolsErrorMessage = error.localizedDescription
+            if let sub = subscriptionsByClubID[club.id], sub.isPastDue {
+                ownerToolsErrorMessage = "Your subscription payment failed. Update your payment method in Plan & Billing to restore access."
+            } else {
+                ownerToolsErrorMessage = error.localizedDescription
+            }
             return false
         }
     }
@@ -1850,6 +2454,11 @@ final class AppState: ObservableObject {
     func updateGameForClub(_ club: Club, game: Game, draft: ClubOwnerGameDraft, scope: RecurringGameScope = .singleEvent) async -> Bool {
         ownerToolsErrorMessage = nil
         ownerToolsInfoMessage = nil
+
+        guard !game.startsInPast else {
+            ownerToolsErrorMessage = "Past games cannot be edited."
+            return false
+        }
 
         let trimmedTitle = draft.title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTitle.isEmpty else {
@@ -1865,6 +2474,15 @@ final class AppState: ObservableObject {
         if let pa = draft.publishAt, pa <= Date() {
             ownerToolsErrorMessage = "Publish time must be in the future."
             return false
+        }
+
+        // Gate: fee requires payment eligibility.
+        let draftFeeForUpdate = Double(draft.feeAmountText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        if draftFeeForUpdate > 0 {
+            if case .blocked(let reason) = FeatureGateService.canAcceptPayments(entitlementsByClubID[club.id]) {
+                ownerToolsErrorMessage = reason
+                return false
+            }
         }
 
         ownerSavingGameIDs.insert(game.id)
@@ -1892,6 +2510,26 @@ final class AppState: ObservableObject {
                 // Propagate into bookings right away — no network call needed.
                 syncGameIntoBookings(merged)
                 ownerToolsInfoMessage = "Game updated."
+                // Notify confirmed + waitlisted players of the change (non-blocking)
+                let updatedGame = merged
+                Task {
+                    // Compute which fields changed so the edge function can build specific copy
+                    var changedFields: [String] = []
+                    if abs(draft.startDate.timeIntervalSince(game.dateTime)) > 60 { changedFields.append("date_time") }
+                    if draft.venueName.trimmingCharacters(in: .whitespacesAndNewlines) != (game.venueName ?? "") { changedFields.append("venue_name") }
+                    let newFee = Double(draft.feeAmountText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+                    if abs(newFee - (game.feeAmount ?? 0)) > 0.001 { changedFields.append("fee_amount") }
+                    if draft.maxSpots != game.maxSpots { changedFields.append("max_spots") }
+                    try? await self.dataProvider.triggerGameUpdatedNotify(
+                        gameID: updatedGame.id,
+                        clubID: club.id,
+                        gameTitle: updatedGame.title,
+                        clubName: club.name,
+                        gameDateTime: updatedGame.dateTime,
+                        changedFields: changedFields,
+                        clubTimezone: club.timezone
+                    )
+                }
             } else if let recurrenceGroupID = game.recurrenceGroupID {
                 let series = try await withAuthRetry {
                     try await self.dataProvider.fetchGamesInSeries(recurrenceGroupID: recurrenceGroupID)
@@ -1978,7 +2616,8 @@ final class AppState: ObservableObject {
             if effectiveScope == .singleEvent {
                 try? await dataProvider.triggerGameCancelledNotify(
                     gameID: game.id,
-                    gameTitle: game.title
+                    gameTitle: game.title,
+                    clubTimezone: club.timezone
                 )
             }
 
@@ -2179,7 +2818,7 @@ final class AppState: ObservableObject {
         stopClubChatRealtime(for: club)
     }
 
-    func requestMembership(for club: Club, conductAcceptedAt: Date? = nil) async {
+    func requestMembership(for club: Club, conductAcceptedAt: Date? = nil, cancellationPolicyAcceptedAt: Date? = nil) async {
         membershipErrorMessage = nil
         membershipInfoMessage = nil
         let currentState = membershipState(for: club)
@@ -2195,7 +2834,7 @@ final class AppState: ObservableObject {
 
         do {
             let status = try await withAuthRetry {
-                try await self.dataProvider.requestMembership(clubID: club.id, userID: userID, conductAcceptedAt: conductAcceptedAt)
+                try await self.dataProvider.requestMembership(clubID: club.id, userID: userID, conductAcceptedAt: conductAcceptedAt, cancellationPolicyAcceptedAt: cancellationPolicyAcceptedAt)
             }
             membershipStatesByClubID[club.id] = status
             membershipInfoMessage = (status == .pending) ? "Membership request sent." : "Club membership updated."
@@ -2284,7 +2923,39 @@ final class AppState: ObservableObject {
         }
     }
 
-    func requestBooking(for game: Game, stripePaymentIntentID: String? = nil) async {
+    /// Creates a `pending_payment` booking with a 30-min hold before the Stripe PaymentSheet
+    /// is shown. The booking_id is used by `create-payment-intent` (Gate 0.5) to scope the
+    /// Stripe idempotency key to `pi-{booking_id}-{amount}`, preventing reuse of an already-
+    /// charged PI on rebook (paymentIntentInTerminalState).
+    ///
+    /// Returns the booking record so the caller can set `pendingBookingIDForConfirm`.
+    /// Throws `SupabaseServiceError.duplicateMembership` when the user already has an active
+    /// booking for this game — callers should fall back to the existing pending_payment booking.
+    func reservePaidBooking(for game: Game, creditsAppliedCents: Int?) async throws -> BookingRecord {
+        guard let userID = authUserID else { throw SupabaseServiceError.authenticationRequired }
+        let created = try await withAuthRetry {
+            try await self.dataProvider.bookGame(
+                gameID: game.id,
+                userID: userID,
+                feePaid: false,
+                holdForPayment: true,
+                stripePaymentIntentID: nil,
+                paymentMethod: nil,
+                platformFeeCents: nil,
+                clubPayoutCents: nil,
+                creditsAppliedCents: creditsAppliedCents
+            )
+        }
+        // Update local cache so bookingState(for:) reflects pending_payment immediately.
+        if let idx = bookings.firstIndex(where: { $0.booking.gameID == game.id }) {
+            bookings[idx] = BookingWithGame(booking: created, game: bookings[idx].game ?? game)
+        } else {
+            bookings.append(BookingWithGame(booking: created, game: game))
+        }
+        return created
+    }
+
+    func requestBooking(for game: Game, stripePaymentIntentID: String? = nil, platformFeeCents: Int? = nil, clubPayoutCents: Int? = nil, creditsAppliedCents: Int? = nil) async {
         bookingsErrorMessage = nil
         bookingInfoMessage = nil
         guard !game.startsInPast else {
@@ -2333,22 +3004,32 @@ final class AppState: ObservableObject {
         defer { requestingBookingGameIDs.remove(game.id) }
 
         do {
-            // Determine booking status from live in-memory game state.
-            // This avoids relying on a DB trigger and correctly waitlists when full.
-            let liveGame = gamesByClubID[game.clubID]?.first(where: { $0.id == game.id }) ?? game
-            let gameFull = liveGame.isFull
-            let waitlistPos: Int? = gameFull ? (liveGame.waitlistCount ?? 0) + 1 : nil
-            let bookingStatus = gameFull ? "waitlisted" : "confirmed"
+            // Fast-fail guard: paid games that appear available require proof of payment.
+            // Use liveGame.isFull as a hint only — if the game looks full the user is likely
+            // joining the waitlist and doesn't need payment upfront. The server is authoritative
+            // on status; this guard only prevents a clearly missing payment on a non-full game.
+            let liveGameIsFull = (gamesByClubID[game.clubID]?.first(where: { $0.id == game.id }) ?? game).isFull
+            if !liveGameIsFull,
+               let fee = game.feeAmount, fee > 0,
+               stripePaymentIntentID == nil,
+               creditsAppliedCents == nil {
+                bookingsErrorMessage = "Payment is required to book this game. Please try again."
+                return
+            }
 
+            // Server atomically determines confirmed vs waitlisted using FOR UPDATE locking
+            // on the games row — no client-side race condition on isFull.
             let created = try await withAuthRetry {
-                try await self.dataProvider.createBooking(
+                try await self.dataProvider.bookGame(
                     gameID: game.id,
                     userID: userID,
-                    status: bookingStatus,
-                    waitlistPosition: waitlistPos,
                     feePaid: stripePaymentIntentID != nil,
+                    holdForPayment: false,
                     stripePaymentIntentID: stripePaymentIntentID,
-                    paymentMethod: stripePaymentIntentID != nil ? "stripe" : nil
+                    paymentMethod: stripePaymentIntentID != nil ? "stripe" : (creditsAppliedCents != nil ? "credits" : nil),
+                    platformFeeCents: platformFeeCents,
+                    clubPayoutCents: clubPayoutCents,
+                    creditsAppliedCents: creditsAppliedCents
                 )
             }
 
@@ -2358,14 +3039,39 @@ final class AppState: ObservableObject {
             } else {
                 bookings.append(BookingWithGame(booking: created, game: game))
             }
+
+            // Signal analytics views to refresh (confirmed bookings only — not waitlist)
+            if created.state == .confirmed {
+                lastConfirmedBookingClubID = game.clubID
+            }
+
+            // Deduct credits atomically (non-blocking) when credits were applied
+            if let credits = creditsAppliedCents, credits > 0 {
+                let bookingID = created.id
+                let clubID = game.clubID
+                // Optimistic update: reflect the deduction immediately in the UI.
+                creditBalanceByClubID[clubID] = max(0, (creditBalanceByClubID[clubID] ?? 0) - credits)
+                Task {
+                    _ = try? await self.dataProvider.applyCredits(
+                        userID: userID,
+                        bookingID: bookingID,
+                        amountCents: credits,
+                        clubID: clubID
+                    )
+                    // Confirm with authoritative DB value.
+                    await self.refreshCreditBalance(for: clubID)
+                }
+            }
+
             switch created.state {
             case .waitlisted:
                 bookingInfoMessage = "You have been added to the waitlist."
                 Task {
+                    let waitlistBody = "You're on the waitlist for \(game.title) · \(game.dateTime.formatted(date: .abbreviated, time: .shortened)). We'll notify you if a spot opens."
                     try? await self.dataProvider.triggerNotify(
                         userID: userID,
-                        title: "Added to Waitlist",
-                        body: "You're on the waitlist for \(game.title). We'll notify you if a spot opens.",
+                        title: "Added to waitlist",
+                        body: waitlistBody,
                         type: "booking_waitlisted",
                         referenceID: game.id,
                         sendPush: true
@@ -2375,21 +3081,28 @@ final class AppState: ObservableObject {
             case .confirmed:
                 bookingInfoMessage = "Booking confirmed."
                 Task {
+                    // Push comes from booking-confirmed edge function (includes formatted time + venue)
                     try? await self.dataProvider.triggerBookingConfirmedPush(
                         gameID: game.id,
                         bookingID: created.id,
                         userID: userID
                     )
+                    // In-app notification row (sendPush: false avoids double push)
+                    let venue = game.venueName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let locationSuffix = venue.isEmpty ? "" : " · \(venue)"
+                    let confirmedBody = "You're booked for \(game.title) · \(game.dateTime.formatted(date: .abbreviated, time: .shortened))\(locationSuffix)"
                     try? await self.dataProvider.triggerNotify(
                         userID: userID,
-                        title: "Booking Confirmed",
-                        body: "You're booked for \(game.title) on \(game.dateTime.formatted(date: .abbreviated, time: .shortened)).",
+                        title: "Booking confirmed",
+                        body: confirmedBody,
                         type: "booking_confirmed",
                         referenceID: game.id,
                         sendPush: false
                     )
                     await self.refreshNotifications()
                 }
+            case .pendingPayment:
+                bookingInfoMessage = "Booking reserved — complete payment to confirm your spot."
             case .cancelled, .none, .unknown:
                 bookingInfoMessage = "Booking updated."
             }
@@ -2405,11 +3118,34 @@ final class AppState: ObservableObject {
                 bookingsErrorMessage = "You already have a booking for this game."
             case .authenticationRequired:
                 authInfoMessage = "Please sign in again to book a game."
+            case .membershipRequired:
+                let isPending = clubs.first(where: { $0.id == game.clubID })
+                    .map { membershipState(for: $0) == .pending } ?? false
+                bookingsErrorMessage = isPending
+                    ? "Your club join request is still pending. You can book once approved."
+                    : "You must be an approved club member to book this game."
+            case .duprRequired:
+                bookingsErrorMessage = "Add and confirm your DUPR ID before booking this game."
             default:
                 bookingsErrorMessage = serviceError.localizedDescription
             }
         } catch {
             bookingsErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Immediately releases a `pending_payment` booking that was never paid
+    /// (e.g. user cancelled the PaymentSheet). Frees the held spot so other players
+    /// can book right away instead of waiting for the 30-minute cron expiry.
+    /// Best-effort: errors are swallowed because local state is already reset by the caller.
+    func releasePendingPaymentBooking(bookingID: UUID, game: Game) async {
+        _ = try? await withAuthRetry {
+            try await self.dataProvider.cancelBookingWithCredit(bookingID: bookingID)
+        }
+        bookings.removeAll { $0.booking.id == bookingID }
+        await refreshBookings(silent: true)
+        if let club = clubs.first(where: { $0.id == game.clubID }) {
+            await refreshGames(for: club)
         }
     }
 
@@ -2428,19 +3164,52 @@ final class AppState: ObservableObject {
         defer { cancellingBookingIDs.remove(game.id) }
 
         do {
-            let cancelled = try await withAuthRetry {
-                try await self.dataProvider.cancelBooking(bookingID: booking.id)
+            // Single server-authoritative call: cancels the booking, applies the 6-hour
+            // window check, computes the refund amount, and issues the credit atomically.
+            // No client-side refund math — the server returns the authoritative result.
+            let result = try await withAuthRetry {
+                try await self.dataProvider.cancelBookingWithCredit(bookingID: booking.id)
             }
 
+            // Optimistic local update using pre-cancel booking data with cancelled state.
             if let idx = bookings.firstIndex(where: { $0.booking.id == booking.id }) {
                 let existingGame = bookings[idx].game ?? game
-                bookings[idx] = BookingWithGame(booking: cancelled, game: existingGame)
+                let cancelledRecord = BookingRecord(
+                    id: booking.id,
+                    gameID: booking.gameID,
+                    userID: booking.userID,
+                    state: .cancelled,
+                    waitlistPosition: booking.waitlistPosition,
+                    createdAt: booking.createdAt,
+                    feePaid: booking.feePaid,
+                    paidAt: booking.paidAt,
+                    stripePaymentIntentID: booking.stripePaymentIntentID,
+                    paymentMethod: booking.paymentMethod,
+                    platformFeeCents: booking.platformFeeCents,
+                    clubPayoutCents: booking.clubPayoutCents,
+                    creditsAppliedCents: booking.creditsAppliedCents,
+                    holdExpiresAt: nil
+                )
+                bookings[idx] = BookingWithGame(booking: cancelledRecord, game: existingGame)
             }
 
             if scheduleStore.reminderGameIDs.contains(game.id) {
                 LocalNotificationManager.shared.cancelGameReminder(gameID: game.id)
                 scheduleStore.reminderGameIDs.remove(game.id)
                 scheduleStore.persistReminderGameIDs()
+            }
+
+            // Apply server-returned credit result — no fetch required.
+            let clubID = game.clubID
+            creditBalanceByClubID[clubID] = result.newBalanceCents
+            if result.creditIssuedCents > 0 {
+                let clubName = clubs.first(where: { $0.id == clubID })?.name
+                lastCancellationCredit = CancellationCreditResult(
+                    clubID: clubID,
+                    clubName: clubName,
+                    creditedCents: result.creditIssuedCents,
+                    newBalanceCents: result.newBalanceCents
+                )
             }
 
             bookingInfoMessage = "Booking cancelled."
@@ -2492,10 +3261,12 @@ final class AppState: ObservableObject {
             allUpcomingGames.removeAll { $0.id == game.id }
 
             // Notify all booked players
+            let clubTZ = clubs.first(where: { $0.id == game.clubID })?.timezone ?? "Australia/Perth"
             try? await withAuthRetry {
                 try await self.dataProvider.triggerGameCancelledNotify(
                     gameID: game.id,
-                    gameTitle: game.title
+                    gameTitle: game.title,
+                    clubTimezone: clubTZ
                 )
             }
 
@@ -2559,49 +3330,90 @@ final class AppState: ObservableObject {
 
         guard !waitlisted.isEmpty else { return }
 
-        var promotedNames: [String] = []
+        let isPaidGame = (game.feeAmount ?? 0) > 0
 
-        for attendee in waitlisted.prefix(openSlots) {
-            do {
-                let updated = try await withAuthRetry {
-                    try await self.dataProvider.ownerUpdateBooking(
-                        bookingID: attendee.booking.id,
-                        status: "confirmed",
-                        waitlistPosition: nil
-                    )
-                }
-                promotedNames.append(attendee.userName)
-                if let bookingIndex = bookings.firstIndex(where: { $0.booking.id == attendee.booking.id }) {
-                    bookings[bookingIndex] = BookingWithGame(booking: updated, game: bookings[bookingIndex].game)
-                }
-                let promotedUserID = attendee.booking.userID
-                Task {
-                    try? await self.dataProvider.triggerNotify(
-                        userID: promotedUserID,
-                        title: "You're In!",
-                        body: "A spot opened up — you've been moved from the waitlist to confirmed for \(game.title).",
-                        type: "waitlist_promoted",
-                        referenceID: game.id,
-                        sendPush: true
-                    )
-                }
-            } catch {
-                gameOwnerErrorByID[game.id] = error.localizedDescription
-                break
+        if isPaidGame {
+            // Phase 3: paid games — promote one player to pending_payment with a timed hold.
+            // The DB RPC is idempotent: won't create a second hold while one is still active.
+            if let first = waitlisted.first {
+                await promoteWaitlistPlayerForPaidGame(game: game, attendee: first)
             }
-        }
-
-        guard !promotedNames.isEmpty else { return }
-
-        if promotedNames.count == 1 {
-            gameOwnerInfoByID[game.id] = "\(promotedNames[0]) was auto-promoted from the waitlist."
         } else {
-            gameOwnerInfoByID[game.id] = "Auto-promoted \(promotedNames.count) players from the waitlist."
+            // Free games: keep existing direct-confirm behavior, promote up to openSlots.
+            var promotedNames: [String] = []
+            for attendee in waitlisted.prefix(openSlots) {
+                do {
+                    let updated = try await withAuthRetry {
+                        try await self.dataProvider.ownerUpdateBooking(
+                            bookingID: attendee.booking.id,
+                            status: "confirmed",
+                            waitlistPosition: nil
+                        )
+                    }
+                    promotedNames.append(attendee.userName)
+                    if let bookingIndex = bookings.firstIndex(where: { $0.booking.id == attendee.booking.id }) {
+                        bookings[bookingIndex] = BookingWithGame(booking: updated, game: bookings[bookingIndex].game)
+                    }
+                    let promotedUserID = attendee.booking.userID
+                    Task {
+                        try? await self.dataProvider.triggerNotify(
+                            userID: promotedUserID,
+                            title: "You're In!",
+                            body: "A spot opened up — you've been moved from the waitlist to confirmed for \(game.title).",
+                            type: "waitlist_promoted",
+                            referenceID: game.id,
+                            sendPush: true
+                        )
+                    }
+                } catch {
+                    gameOwnerErrorByID[game.id] = error.localizedDescription
+                    break
+                }
+            }
+            guard !promotedNames.isEmpty else { return }
+            if promotedNames.count == 1 {
+                gameOwnerInfoByID[game.id] = "\(promotedNames[0]) was auto-promoted from the waitlist."
+            } else {
+                gameOwnerInfoByID[game.id] = "Auto-promoted \(promotedNames.count) players from the waitlist."
+            }
         }
 
         await refreshAttendees(for: game)
         await refreshGames(for: club)
         await refreshBookings(silent: true)
+    }
+
+    // Hold window in minutes — must match v_hold_minutes in DB trigger.
+    private let waitlistHoldMinutes = 30
+
+    private func promoteWaitlistPlayerForPaidGame(game: Game, attendee: GameAttendee) async {
+        do {
+            let success = try await withAuthRetry {
+                try await self.dataProvider.promoteWaitlistPlayer(
+                    gameID: game.id,
+                    bookingID: attendee.booking.id,
+                    holdMinutes: self.waitlistHoldMinutes
+                )
+            }
+            guard success else {
+                // Slot is full, booking no longer waitlisted, or an active hold already exists.
+                return
+            }
+            gameOwnerInfoByID[game.id] = "\(attendee.userName) offered the spot — awaiting payment (\(waitlistHoldMinutes) min hold)."
+            let promotedUserID = attendee.booking.userID
+            Task {
+                try? await self.dataProvider.triggerNotify(
+                    userID: promotedUserID,
+                    title: "⚠️ Action required: complete your booking",
+                    body: "A spot opened in \(game.title). Pay now to confirm your place — your hold expires in \(waitlistHoldMinutes) minutes.",
+                    type: "waitlist_promoted",
+                    referenceID: game.id,
+                    sendPush: true
+                )
+            }
+        } catch {
+            gameOwnerErrorByID[game.id] = error.localizedDescription
+        }
     }
 
     private func bookingStateIsConfirmed(_ state: BookingState) -> Bool {
@@ -2636,12 +3448,22 @@ final class AppState: ObservableObject {
             return
         }
 
+        guard let offsetMinutes = gameReminderOffsetMinutes else {
+            bookingInfoMessage = "Reminder config hasn't loaded yet. Please try again in a moment."
+            return
+        }
+
         do {
             let clubName = clubs.first(where: { $0.id == game.clubID })?.name ?? ""
-            _ = try await LocalNotificationManager.shared.scheduleGameReminder(for: game, clubName: clubName)
+            _ = try await LocalNotificationManager.shared.scheduleGameReminder(
+                for: game,
+                offsetMinutes: offsetMinutes,
+                clubName: clubName
+            )
             scheduleStore.reminderGameIDs.insert(game.id)
             scheduleStore.persistReminderGameIDs()
-            bookingInfoMessage = "Reminder set — you'll be notified 1 hour before the game."
+            let hours = offsetMinutes / 60
+            bookingInfoMessage = "Reminder set — you'll be notified \(hours) hour\(hours == 1 ? "" : "s") before the game."
         } catch {
             bookingInfoMessage = error.localizedDescription
         }
@@ -2740,6 +3562,7 @@ final class AppState: ObservableObject {
         defer { isPerformingPostSignInBootstrap = false }
         await refreshClubs()
         await loadProfileFromBackendIfAvailable()
+        await loadNotificationPreferencesIfNeeded()
         await refreshMemberships()
         await refreshBookings(silent: true)
         await refreshUpcomingGames()
@@ -2766,12 +3589,18 @@ final class AppState: ObservableObject {
         notifications.filter { !$0.read }.count
     }
 
+    private func syncBadgeCount() {
+        let count = unreadNotificationCount
+        UNUserNotificationCenter.current().setBadgeCount(count) { _ in }
+    }
+
     func refreshNotifications() async {
         guard authState == .signedIn, let userID = authUserID else { return }
         isLoadingNotifications = true
         defer { isLoadingNotifications = false }
         if let fetched = try? await withAuthRetry({ try await self.dataProvider.fetchNotifications(userID: userID) }) {
             notifications = fetched
+            syncBadgeCount()
         }
     }
 
@@ -2780,24 +3609,65 @@ final class AppState: ObservableObject {
         if let idx = notifications.firstIndex(where: { $0.id == notification.id }) {
             notifications[idx].read = true
         }
+        syncBadgeCount()
         try? await dataProvider.markNotificationRead(id: notification.id)
     }
 
     func markAllNotificationsRead() async {
         guard let userID = authUserID else { return }
         notifications = notifications.map { var copy = $0; copy.read = true; return copy }
+        syncBadgeCount()
         try? await dataProvider.markAllNotificationsRead(userID: userID)
     }
 
     func clearAllNotifications() async {
         guard let userID = authUserID else { return }
         notifications = []
+        syncBadgeCount()
         try? await dataProvider.deleteAllNotifications(userID: userID)
     }
 
     func submitReview(gameID: UUID, rating: Int, comment: String?) async throws {
         guard let userID = authUserID else { return }
         try await dataProvider.submitReview(gameID: gameID, userID: userID, rating: rating, comment: comment)
+        // Don't nil pendingReviewPrompt here — the sheet is still showing the success state.
+        // The onDismiss handler calls dismissReviewPrompt(gameID:) which refreshes the prompt.
+    }
+
+    /// Fetches the highest-priority pending review from the server and publishes it.
+    /// Called at bootstrap and after the review sheet closes (via dismissReviewPrompt).
+    func fetchPendingReviewPrompt() async {
+        guard authState == .signedIn, let userID = authUserID else { return }
+        let prompt = try? await dataProvider.fetchPendingReviewPrompt(userID: userID)
+        await MainActor.run { pendingReviewPrompt = prompt }
+    }
+
+    /// Called when the review sheet closes (submitted or dismissed without submitting).
+    /// Marks the game as dismissed server-side (idempotent for submitted games since the
+    /// reviews table check takes priority), then checks for the next pending prompt.
+    func dismissReviewPrompt(gameID: UUID) async {
+        await MainActor.run {
+            if pendingReviewPrompt?.id == gameID { pendingReviewPrompt = nil }
+        }
+        try? await dataProvider.dismissReviewPrompt(gameID: gameID)
+        // After dismiss/submit, check if another review is pending.
+        await fetchPendingReviewPrompt()
+    }
+
+    /// Resolves a Game by ID. Checks memory caches first; falls back to a DB fetch.
+    /// Used by deep-link navigation when a game notification arrives before the club's
+    /// games have been loaded (e.g. new_game push received from the lock screen).
+    func resolveGame(id: UUID) async -> Game? {
+        // 1. Check upcoming games cache
+        if let game = gamesByClubID.values.flatMap({ $0 }).first(where: { $0.id == id }) {
+            return game
+        }
+        // 2. Check bookings cache (includes booked past games)
+        if let game = bookings.first(where: { $0.booking.gameID == id })?.game {
+            return game
+        }
+        // 3. Fetch from DB — game not in any memory cache
+        return try? await dataProvider.fetchGame(gameID: id)
     }
 
     /// Resolves the club for a game ID. Checks memory caches first; falls back to a
@@ -2830,6 +3700,111 @@ final class AppState: ObservableObject {
         loadingReviewsClubIDs.remove(clubID)
     }
 
+    func fetchClubRevenueSummary(for clubID: UUID, days: Int?) async {
+        guard !loadingRevenueSummaryClubIDs.contains(clubID) else { return }
+        loadingRevenueSummaryClubIDs.insert(clubID)
+        do {
+            let summary = try await withAuthRetry {
+                try await self.dataProvider.fetchClubRevenueSummary(clubID: clubID, days: days)
+            }
+            if let summary {
+                revenueSummaryByClubID[clubID] = summary
+            }
+        } catch {
+            // Error is surfaced via nil in revenueSummaryByClubID — UI shows empty state
+        }
+        loadingRevenueSummaryClubIDs.remove(clubID)
+    }
+
+    func fetchClubFillRateSummary(for clubID: UUID, days: Int?) async {
+        guard !loadingFillRateSummaryClubIDs.contains(clubID) else { return }
+        loadingFillRateSummaryClubIDs.insert(clubID)
+        do {
+            let summary = try await withAuthRetry {
+                try await self.dataProvider.fetchClubFillRateSummary(clubID: clubID, days: days)
+            }
+            if let summary {
+                fillRateSummaryByClubID[clubID] = summary
+            }
+        } catch {
+            // Error is surfaced via nil in fillRateSummaryByClubID — UI shows empty state
+        }
+        loadingFillRateSummaryClubIDs.remove(clubID)
+    }
+
+    // MARK: - Phase 5B Analytics
+
+    /// Fetches all advanced analytics data for the given club and period concurrently.
+    /// Sets loadingAnalyticsClubIDs while in-flight; populates four published dicts on completion.
+    func fetchClubAdvancedAnalytics(for clubID: UUID, days: Int, startDate: Date? = nil, endDate: Date? = nil) async {
+        guard !loadingAnalyticsClubIDs.contains(clubID) else { return }
+        loadingAnalyticsClubIDs.insert(clubID)
+        // Core analytics — fetched concurrently. A failure here leaves the view empty.
+        analyticsErrorByClubID.removeValue(forKey: clubID)
+        do {
+            async let kpis     = withAuthRetry { try await self.dataProvider.fetchClubAnalyticsKPIs(clubID: clubID, days: days, startDate: startDate, endDate: endDate) }
+            async let trend    = withAuthRetry { try await self.dataProvider.fetchClubRevenueTrend(clubID: clubID, days: days, startDate: startDate, endDate: endDate) }
+            async let topGames = withAuthRetry { try await self.dataProvider.fetchClubTopGames(clubID: clubID, days: days, startDate: startDate, endDate: endDate) }
+            async let peaks    = withAuthRetry { try await self.dataProvider.fetchClubPeakTimes(clubID: clubID, days: days, startDate: startDate, endDate: endDate) }
+
+            let k = try await kpis
+            let t = try await trend
+            let g = try await topGames
+            let p = try await peaks
+
+            if let k { analyticsKPIsByClubID[clubID] = k }
+            revenueTrendByClubID[clubID] = t
+            topGamesByClubID[clubID]     = g
+            peakTimesByClubID[clubID]    = p
+        } catch {
+            analyticsErrorByClubID[clubID] = error.localizedDescription
+        }
+
+        // Supplemental analytics — isolated so a missing/failing RPC never blocks core data.
+        // Sections that depend on this data show "—" gracefully when it's absent.
+        do {
+            if let s = try await withAuthRetry({ try await self.dataProvider.fetchClubAnalyticsSupplemental(clubID: clubID, days: days, startDate: startDate, endDate: endDate) }) {
+                analyticsSupplementalByClubID[clubID] = s
+            }
+        } catch {
+            // Non-fatal — deploy get_club_analytics_supplemental migration to enable these sections.
+        }
+        loadingAnalyticsClubIDs.remove(clubID)
+    }
+
+    /// Fetches the lightweight dashboard summary for a club.
+    /// Available on all plan tiers — no analytics entitlement required.
+    func loadDashboardSummary(for clubID: UUID) async {
+        do {
+            if let summary = try await withAuthRetry({ try await self.dataProvider.fetchClubDashboardSummary(clubID: clubID) }) {
+                dashboardSummaryByClubID[clubID] = summary
+            }
+        } catch {
+            // Non-fatal — dashboard shows "—" for unloaded metrics.
+        }
+    }
+
+    private func loadNotificationPreferencesIfNeeded() async {
+        guard authState == .signedIn, let userID = authUserID else { return }
+        do {
+            if let prefs = try await dataProvider.fetchNotificationPreferences(userID: userID) {
+                await MainActor.run { notificationPreferences = prefs }
+            }
+        } catch {
+            // Non-fatal — defaults (all on) remain in effect.
+        }
+    }
+
+    func saveNotificationPreferences() async {
+        guard let userID = authUserID else { return }
+        let prefs = notificationPreferences
+        do {
+            try await dataProvider.saveNotificationPreferences(userID: userID, prefs: prefs)
+        } catch {
+            // Silently ignore — preference is still applied locally this session.
+        }
+    }
+
     private func loadProfileFromBackendIfAvailable() async {
         guard authState == .signedIn, let userID = authUserID else { return }
         do {
@@ -2842,6 +3817,8 @@ final class AppState: ObservableObject {
                 let currentSkill = profile?.skillLevel ?? .beginner
                 profile = UserProfile(
                     id: fetchedProfile.id,
+                    firstName: fetchedProfile.firstName,
+                    lastName: fetchedProfile.lastName,
                     fullName: trimmedName,
                     email: fetchedProfile.email,
                     phone: fetchedProfile.phone,
@@ -2849,29 +3826,38 @@ final class AppState: ObservableObject {
                     emergencyContactName: fetchedProfile.emergencyContactName,
                     emergencyContactPhone: fetchedProfile.emergencyContactPhone,
                     duprRating: fetchedProfile.duprRating,
+                    duprID: fetchedProfile.duprID,
                     favoriteClubName: currentFavoriteClub,
                     skillLevel: currentSkill,
-                    avatarPresetID: profile?.avatarPresetID
+                    avatarColorKey: fetchedProfile.avatarColorKey
                 )
                 authEmail = fetchedProfile.email
                 // Sync Supabase DUPR value → UserDefaults so admin-applied updates
                 // are reflected on the member's device after next profile load.
-                if let rating = fetchedProfile.duprRating {
-                    _ = saveDUPRRatings(doubles: rating, singles: duprSinglesRating)
+                // Always sync — including nil — so cleared ratings don't linger in cache.
+                _ = saveDUPRRatings(doubles: fetchedProfile.duprRating)
+                // Sync DUPR ID from DB → local state (authoritative source for server gate).
+                if let dbDuprID = fetchedProfile.duprID, !dbDuprID.trimmingCharacters(in: .whitespaces).isEmpty {
+                    duprIDByUserID[userID] = dbDuprID
+                    duprID = dbDuprID
+                    persistDUPRIDStore()
                 }
+
             }
         } catch {
             // Avoid blocking the UI; auth is valid even if profile row is missing.
         }
     }
 
-    func saveProfilePersonalInfo(fullName: String, phone: String?, dateOfBirth: Date?, duprRating: Double?) async {
+    func saveProfilePersonalInfo(firstName: String? = nil, lastName: String? = nil, fullName: String, phone: String?, dateOfBirth: Date?, duprRating: Double?) async {
         guard var current = profile else { return }
         let trimmed = fullName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             profileSaveErrorMessage = "Full name is required."
             return
         }
+        if let f = firstName { current.firstName = f }
+        if let l = lastName { current.lastName = l }
         current.fullName = trimmed
         current.phone = phone
         current.dateOfBirth = dateOfBirth
@@ -2882,11 +3868,29 @@ final class AppState: ObservableObject {
         do {
             let updated = try await withAuthRetry { try await self.dataProvider.patchProfile(current) }
             profile = updated
-            if let rating = duprRating {
-                // Keep UserDefaults DUPR store in sync with the Supabase value.
-                // Preserve the existing singles rating; only update doubles.
-                _ = saveDUPRRatings(doubles: rating, singles: duprSinglesRating)
-            }
+            // Sync UserDefaults from the value Supabase actually stored (not the raw input),
+            // so the cache always reflects the true DB value.
+            _ = saveDUPRRatings(doubles: updated.duprRating)
+        } catch {
+            profileSaveErrorMessage = AppCopy.friendlyError(error.localizedDescription)
+        }
+    }
+
+    func loadAvatarPalettes() async {
+        guard let rows = try? await dataProvider.fetchAvatarPalettes(), !rows.isEmpty else { return }
+        let cache = Dictionary(uniqueKeysWithValues: rows.map { ($0.paletteKey, $0.toEntry()) })
+        await MainActor.run { AvatarGradients.liveCache = cache }
+    }
+
+    func saveAvatarColorKey(_ key: String?) async {
+        guard var current = profile else { return }
+        current.avatarColorKey = key
+        isSavingProfile = true
+        profileSaveErrorMessage = nil
+        defer { isSavingProfile = false }
+        do {
+            let updated = try await withAuthRetry { try await self.dataProvider.patchProfile(current) }
+            profile = updated
         } catch {
             profileSaveErrorMessage = AppCopy.friendlyError(error.localizedDescription)
         }
@@ -3021,8 +4025,10 @@ final class AppState: ObservableObject {
         case .authenticationRequired, .missingSession:
             return true
         case let .httpStatus(code, _):
-            return code == 401 || code == 403
-        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network:
+            // 403 is a permission/eligibility error — a refreshed token cannot fix it.
+            // Only 401 (genuine auth expiry) should trigger a session refresh.
+            return code == 401
+        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired:
             return false
         }
     }
@@ -3073,7 +4079,7 @@ final class AppState: ObservableObject {
             return true
         case let .httpStatus(code, _):
             return code == 400 || code == 401 || code == 403
-        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network:
+        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired:
             return false
         }
     }
@@ -3120,13 +4126,19 @@ final class AppState: ObservableObject {
     }
 
     private func persistCheckedInBookingIDs() {
-        let ids = checkedInBookingIDs.map(\.uuidString).sorted()
-        UserDefaults.standard.set(ids, forKey: StorageKeys.checkedInBookingIDs)
+        let attendedIDs = checkedInBookingIDs.map(\.uuidString).sorted()
+        UserDefaults.standard.set(attendedIDs, forKey: StorageKeys.checkedInBookingIDs)
+        let noShowIDs = noShowBookingIDs.map(\.uuidString).sorted()
+        UserDefaults.standard.set(noShowIDs, forKey: StorageKeys.noShowBookingIDs)
     }
 
     private func restoreCheckedInBookingIDs() {
-        guard let rawIDs = UserDefaults.standard.array(forKey: StorageKeys.checkedInBookingIDs) as? [String] else { return }
-        checkedInBookingIDs = Set(rawIDs.compactMap(UUID.init(uuidString:)))
+        if let rawIDs = UserDefaults.standard.array(forKey: StorageKeys.checkedInBookingIDs) as? [String] {
+            checkedInBookingIDs = Set(rawIDs.compactMap(UUID.init(uuidString:)))
+        }
+        if let rawIDs = UserDefaults.standard.array(forKey: StorageKeys.noShowBookingIDs) as? [String] {
+            noShowBookingIDs = Set(rawIDs.compactMap(UUID.init(uuidString:)))
+        }
     }
 
     private func persistDUPRIDStore() {
@@ -3156,36 +4168,37 @@ final class AppState: ObservableObject {
     }
 
     private func persistDUPRRatingsStore() {
-        // Store as [userIDString: [String: Double]] — "d" for doubles, "s" for singles
-        let rawMap: [String: [String: Double]] = duprRatingsByUserID.reduce(into: [:]) { result, entry in
-            var inner: [String: Double] = [:]
-            if let d = entry.value.doubles { inner["d"] = d }
-            if let s = entry.value.singles { inner["s"] = s }
-            result[entry.key.uuidString] = inner
-        }
+        // Store as [userIDString: Double]
+        let rawMap: [String: Double] = duprRatingsByUserID.compactMapValues { $0 }
+            .reduce(into: [:]) { result, entry in result[entry.key.uuidString] = entry.value }
         UserDefaults.standard.set(rawMap, forKey: StorageKeys.duprRatingsByUserID)
     }
 
     private func restoreDUPRRatingsStore() {
-        guard let rawMap = UserDefaults.standard.dictionary(forKey: StorageKeys.duprRatingsByUserID) as? [String: [String: Double]] else {
+        // Support both old format ([String: [String: Double]]) and new ([String: Double])
+        if let rawMap = UserDefaults.standard.dictionary(forKey: StorageKeys.duprRatingsByUserID) as? [String: Double] {
+            duprRatingsByUserID = rawMap.reduce(into: [:]) { partial, entry in
+                guard let userID = UUID(uuidString: entry.key) else { return }
+                partial[userID] = entry.value
+            }
+        } else if let oldMap = UserDefaults.standard.dictionary(forKey: StorageKeys.duprRatingsByUserID) as? [String: [String: Double]] {
+            // Migrate old doubles/singles format — keep doubles only
+            duprRatingsByUserID = oldMap.reduce(into: [:]) { partial, entry in
+                guard let userID = UUID(uuidString: entry.key) else { return }
+                partial[userID] = entry.value["d"]
+            }
+            persistDUPRRatingsStore() // rewrite in new format
+        } else {
             duprRatingsByUserID = [:]
-            return
-        }
-        duprRatingsByUserID = rawMap.reduce(into: [:]) { partial, entry in
-            guard let userID = UUID(uuidString: entry.key) else { return }
-            partial[userID] = (doubles: entry.value["d"], singles: entry.value["s"])
         }
     }
 
     private func syncCurrentUserDUPRRatingsFromStore() {
         guard let userID = authUserID else {
             duprDoublesRating = nil
-            duprSinglesRating = nil
             return
         }
-        let stored = duprRatingsByUserID[userID]
-        duprDoublesRating = stored?.doubles
-        duprSinglesRating = stored?.singles
+        duprDoublesRating = duprRatingsByUserID[userID] ?? nil
     }
 
     private func persistClubNewsNotificationPreference() {
@@ -3255,51 +4268,13 @@ final class AppState: ObservableObject {
     }
 
     private func handleClubNewsNotificationsIfNeeded(club: Club, previousPosts: [ClubNewsPost], newPosts: [ClubNewsPost]) async {
-        guard !mutedClubChatIDs.contains(club.id) else {
-            seenClubNewsPostIDsByClubID[club.id] = Set(newPosts.map(\.id))
-            seenClubNewsCommentIDsByClubID[club.id] = Set(newPosts.flatMap { $0.comments.map(\.id) })
-            clubNewsPrimedClubIDs.insert(club.id)
-            return
-        }
-        let oldPostIDs = seenClubNewsPostIDsByClubID[club.id] ?? Set(previousPosts.map(\.id))
-        let oldCommentIDs = seenClubNewsCommentIDsByClubID[club.id] ?? Set(previousPosts.flatMap { $0.comments.map(\.id) })
-
-        let newPostIDs = Set(newPosts.map(\.id))
-        let newCommentIDs = Set(newPosts.flatMap { $0.comments.map(\.id) })
-
-        defer {
-            seenClubNewsPostIDsByClubID[club.id] = newPostIDs
-            seenClubNewsCommentIDsByClubID[club.id] = newCommentIDs
-            clubNewsPrimedClubIDs.insert(club.id)
-        }
-
-        guard clubNewsPrimedClubIDs.contains(club.id) else { return }
-        guard let currentUserID = authUserID else { return }
-
-        let newPostsByOthers = newPosts.filter { !oldPostIDs.contains($0.id) && $0.userID != currentUserID }
-        for post in newPostsByOthers.prefix(2) {
-            await LocalNotificationManager.shared.scheduleClubNewsActivityNotification(
-                id: "post.\(post.id.uuidString)",
-                title: "\(club.name): New Post",
-                body: "\(post.authorName): \(post.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Shared a photo" : post.content)"
-            )
-        }
-
-        // Reply/comment notifications for posts authored by current user.
-        let myPostIDs = Set(newPosts.filter { $0.userID == currentUserID }.map(\.id))
-        if !myPostIDs.isEmpty {
-            let newCommentsOnMyPosts = newPosts
-                .flatMap(\.comments)
-                .filter { myPostIDs.contains($0.postID) && !oldCommentIDs.contains($0.id) && $0.userID != currentUserID }
-
-            for comment in newCommentsOnMyPosts.prefix(2) {
-                await LocalNotificationManager.shared.scheduleClubNewsActivityNotification(
-                    id: "reply.\(comment.id.uuidString)",
-                    title: "\(club.name): New Reply",
-                    body: "\(comment.authorName) replied: \(comment.content)"
-                )
-            }
-        }
+        // APNs push (club-chat-push Edge Function) is the single notification path for chat events —
+        // both background delivery and foreground presentation (via willPresent → .banner) are handled
+        // server-side. Local notifications are suppressed here to prevent duplicate banners when the
+        // app refreshes the feed after receiving a push.
+        seenClubNewsPostIDsByClubID[club.id] = Set(newPosts.map(\.id))
+        seenClubNewsCommentIDsByClubID[club.id] = Set(newPosts.flatMap { $0.comments.map(\.id) })
+        clubNewsPrimedClubIDs.insert(club.id)
     }
 
     // MARK: - Club Venues
@@ -3326,26 +4301,66 @@ final class AppState: ObservableObject {
         let tempID = UUID()
         savingClubVenueIDs.insert(tempID)
         defer { savingClubVenueIDs.remove(tempID) }
-        // Geocode the address before saving. On failure, coordinates stay nil
-        // and the venue is saved in an unresolved state — does not block the save.
-        let geocoded = await LocationService.geocode(draft: draft)
+        // Fast path: coordinates pre-resolved via place search — no geocoding needed.
+        // Manual entry path: geocode the address fields; block if it fails.
+        let saveLat: Double
+        let saveLng: Double
+        if let lat = draft.resolvedLatitude, let lng = draft.resolvedLongitude {
+            saveLat = lat
+            saveLng = lng
+        } else {
+            let geocodeResult = await LocationService.geocode(draft: draft)
+            guard case .success(let geocoded) = geocodeResult else {
+                switch geocodeResult {
+                case .emptyAddress:
+                    ownerToolsErrorMessage = "Please enter an address before saving."
+                case .noResult:
+                    ownerToolsErrorMessage = "Address could not be located. Check the address and try again."
+                case .failed:
+                    ownerToolsErrorMessage = "Location lookup failed. Check your connection and try again."
+                case .success:
+                    break
+                }
+                return false
+            }
+            saveLat = geocoded.coordinate.latitude
+            saveLng = geocoded.coordinate.longitude
+        }
         do {
             let venue = try await withAuthRetry {
                 try await self.dataProvider.createClubVenue(
                     clubID: club.id,
                     draft: draft,
-                    latitude: geocoded?.coordinate.latitude,
-                    longitude: geocoded?.coordinate.longitude
+                    latitude: saveLat,
+                    longitude: saveLng
                 )
             }
             var current = clubVenuesByClubID[club.id] ?? []
             current.append(venue)
+            // Enforce single-primary: demote all other venues in DB and local cache.
+            if draft.isPrimary {
+                try? await withAuthRetry {
+                    try await self.dataProvider.demoteOtherPrimaryVenues(clubID: club.id, exceptVenueID: venue.id)
+                }
+                for i in current.indices where current[i].id != venue.id {
+                    current[i].isPrimary = false
+                }
+            }
             current.sort { ($0.isPrimary && !$1.isPrimary) || ($0.venueName < $1.venueName && $0.isPrimary == $1.isPrimary) }
             clubVenuesByClubID[club.id] = current
-            // Propagate primary venue coordinates to the club row so it appears on the explore map.
-            if draft.isPrimary, let lat = venue.latitude, let lng = venue.longitude {
-                try? await withAuthRetry {
-                    try await self.dataProvider.updateClubCoordinates(clubID: club.id, latitude: lat, longitude: lng)
+            // Propagate primary venue name and coordinates to the club row.
+            // venue_name drives Club.addressLine1 in the clubs list; coordinates power the explore map.
+            if draft.isPrimary {
+                let name = draft.venueName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty {
+                    try? await withAuthRetry {
+                        try await self.dataProvider.updateClubVenueName(clubID: club.id, venueName: name)
+                    }
+                }
+                if let lat = venue.latitude, let lng = venue.longitude {
+                    try? await withAuthRetry {
+                        try await self.dataProvider.updateClubCoordinates(clubID: club.id, latitude: lat, longitude: lng)
+                    }
                 }
                 await refreshClubs()
             }
@@ -3360,14 +4375,54 @@ final class AppState: ObservableObject {
         ownerToolsErrorMessage = nil
         savingClubVenueIDs.insert(venue.id)
         defer { savingClubVenueIDs.remove(venue.id) }
-        // Re-geocode only when the address changed. On failure the coordinates
-        // are set to nil (stale coords cleared). Address unchanged → coords preserved.
+        // Geocode when the address changed, or when the existing venue has no coordinates.
+        // Both cases must succeed — a venue without valid coordinates cannot be saved.
+        // Address unchanged AND coordinates already valid → existing coordinates preserved.
         var geocodedLat: Double? = nil
         var geocodedLng: Double? = nil
-        if draft.locationChanged {
-            let geocoded = await LocationService.geocode(draft: draft)
-            geocodedLat = geocoded?.coordinate.latitude
-            geocodedLng = geocoded?.coordinate.longitude
+        var shouldWriteCoordinates = false
+        if let lat = draft.resolvedLatitude, let lng = draft.resolvedLongitude {
+            // Fast path: coordinates pre-resolved via place search.
+            geocodedLat = lat
+            geocodedLng = lng
+            shouldWriteCoordinates = true
+        } else if draft.locationChanged {
+            let geocodeResult = await LocationService.geocode(draft: draft)
+            guard case .success(let geocoded) = geocodeResult else {
+                switch geocodeResult {
+                case .emptyAddress:
+                    ownerToolsErrorMessage = "Please enter an address before saving."
+                case .noResult:
+                    ownerToolsErrorMessage = "Address could not be located. Check the address and try again."
+                case .failed:
+                    ownerToolsErrorMessage = "Location lookup failed. Check your connection and try again."
+                case .success:
+                    break
+                }
+                return false
+            }
+            geocodedLat = geocoded.coordinate.latitude
+            geocodedLng = geocoded.coordinate.longitude
+            shouldWriteCoordinates = true
+        } else if !venue.hasResolvedCoordinates {
+            // Address unchanged but venue has no valid coordinates — must resolve before saving.
+            let geocodeResult = await LocationService.geocode(draft: draft)
+            guard case .success(let geocoded) = geocodeResult else {
+                switch geocodeResult {
+                case .emptyAddress:
+                    ownerToolsErrorMessage = "This venue has no address. Add an address before saving."
+                case .noResult:
+                    ownerToolsErrorMessage = "Venue address could not be located. Update the address and try again."
+                case .failed:
+                    ownerToolsErrorMessage = "Location lookup failed. Check your connection and try again."
+                case .success:
+                    break
+                }
+                return false
+            }
+            geocodedLat = geocoded.coordinate.latitude
+            geocodedLng = geocoded.coordinate.longitude
+            shouldWriteCoordinates = true
         }
         do {
             let updated = try await withAuthRetry {
@@ -3376,15 +4431,39 @@ final class AppState: ObservableObject {
                     draft: draft,
                     latitude: geocodedLat,
                     longitude: geocodedLng,
-                    updateCoordinates: draft.locationChanged
+                    updateCoordinates: shouldWriteCoordinates
                 )
             }
             var current = clubVenuesByClubID[club.id] ?? []
             if let idx = current.firstIndex(where: { $0.id == venue.id }) {
                 current[idx] = updated
             }
+            // Enforce single-primary: demote all other venues in DB and local cache.
+            if updated.isPrimary {
+                try? await withAuthRetry {
+                    try await self.dataProvider.demoteOtherPrimaryVenues(clubID: club.id, exceptVenueID: updated.id)
+                }
+                for i in current.indices where current[i].id != updated.id {
+                    current[i].isPrimary = false
+                }
+            }
             current.sort { ($0.isPrimary && !$1.isPrimary) || ($0.venueName < $1.venueName && $0.isPrimary == $1.isPrimary) }
             clubVenuesByClubID[club.id] = current
+            // Propagate primary venue name and coordinates to the club row.
+            if updated.isPrimary {
+                let name = updated.venueName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty {
+                    try? await withAuthRetry {
+                        try await self.dataProvider.updateClubVenueName(clubID: club.id, venueName: name)
+                    }
+                }
+                if let lat = updated.latitude, let lng = updated.longitude {
+                    try? await withAuthRetry {
+                        try await self.dataProvider.updateClubCoordinates(clubID: club.id, latitude: lat, longitude: lng)
+                    }
+                }
+                await refreshClubs()
+            }
             return true
         } catch {
             ownerToolsErrorMessage = "Could not update venue: \(error.localizedDescription)"
