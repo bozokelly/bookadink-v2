@@ -22,9 +22,9 @@ struct ClubBookGameView: View {
     }()
 
     private var allGames: [Game] {
-        let today = Calendar.current.startOfDay(for: Date())
+        let now = Date()
         return appState.games(for: club)
-            .filter { Calendar.current.startOfDay(for: $0.dateTime) >= today }
+            .filter { $0.dateTime >= now }
             .sorted { $0.dateTime < $1.dateTime }
     }
 

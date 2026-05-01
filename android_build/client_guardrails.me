@@ -1,0 +1,182 @@
+# client_guardrails.me
+# Purpose: Strict rules for iOS and Android clients. Defines what clients can and
+#          cannot do. These constraints exist to maintain data integrity, prevent
+#          security bypass, and ensure consistent product behaviour.
+# Scope: iOS (SwiftUI), Android (Jetpack Compose or equivalent)
+
+---
+
+## 1. NETWORK AND DATA
+
+### DO
+- Include every required column in PostgREST `select=` strings (see data_contracts.me).
+- Lowercase all UUID values before passing to PostgREST filters.
+- Decode Supabase timestamps using the project-standard date parser (not raw Codable `Date?`).
+- Sanitise all text fields received from Supabase at decode time: apply length caps, validate URL schemes.
+- Use the anon key for Edge Function calls (`apikey` and `Authorization` headers). User JWT is for PostgREST DB calls only.
+- Handle HTTP 204 (No Content) responses without throwing — some RPCs return no body.
+- Handle HTTP 409 (Conflict) specifically for duplicate review submissions — show "already reviewed" message, not a generic error.
+
+### DO NOT
+- Do NOT pass unbounded Supabase text fields directly into UI models without length capping.
+- Do NOT use `bookadink-preset://` URL scheme for anything — deprecated and blocked.
+- Do NOT call Edge Functions with the user JWT as the Authorization header.
+- Do NOT rely on PostgREST schema cache for newly created RPCs (PGRST202). Use direct PATCH/INSERT instead for `use_credits` and `issue_cancellation_credit` flows.
+- Do NOT assume a query returned 0 rows means "not found" — always verify network errors separately.
+
+---
+
+## 2. BOOKING AND PAYMENT
+
+### DO
+- Insert a booking row only after Stripe PaymentSheet returns `.completed` (or game is free / full credit cover).
+- Pass `nil` (not `0`) for `creditsAppliedCents` when no credits are applied to `requestBooking`.
+- Always include `clubID` when calling `confirmPendingBooking` — both iOS call sites must pass this.
+- Refresh credit balance at the top of `preparePaymentSheet` before computing the net amount.
+- Display live hold countdown from `booking.holdExpiresAt`. Update every second.
+- Show "Spot hold expired" passive state when `holdExpiresAt <= now()`. Do NOT auto-retry promotion.
+
+### DO NOT
+- Do NOT compute platform fee on the client. Fee comes from Edge Function response.
+- Do NOT insert a booking on Stripe `.canceled` or `.failed`.
+- Do NOT decrement credits on Stripe `.canceled` or `.failed`.
+- Do NOT allow booking a game where `publishAt > now()` from the player booking flow.
+- Do NOT allow a player to hold more than one `confirmed` or `pending_payment` seat per game.
+- Do NOT call `confirmPendingBooking` without `clubID`.
+
+---
+
+## 3. CREDITS
+
+### DO
+- Use `creditBalanceByClubID: [UUID: Int]` (club-scoped dictionary) for all credit operations.
+- Optimistic update: decrement `creditBalanceByClubID[clubID]` immediately on main thread; confirm with DB value after background operation.
+- Show credit toggle only when: `game.fee > 0 AND creditBalance(for: clubID) > 0 AND canBook`.
+- Refresh credit balance after cancellation to compute the credited amount and trigger UI update.
+- Compute net price inline as: `max(0, totalFee - min(balance, totalFee))`.
+
+### DO NOT
+- Do NOT use a global (non-club-scoped) `creditBalanceCents: Int` — deprecated.
+- Do NOT call `use_credits` or `issue_cancellation_credit` RPCs via PostgREST — PGRST202 failure.
+- Do NOT allow credits to go below 0. The PATCH atomic guard handles this server-side; the client should also guard against displaying negative values.
+- Do NOT apply credits from Club A to a booking at Club B.
+
+---
+
+## 4. CLUB DATA
+
+### DO
+- Load club data on tab change only (not on view appear unconditionally).
+- Include `latitude` and `longitude` in all 5 club select strings.
+- Use `String.normalizedAddress()` to display club addresses (trim, collapse whitespace, title-case, max 40 chars).
+- Validate custom image URLs against allowed Supabase host before rendering.
+
+### DO NOT
+- Do NOT use `confirmationDialog("Club Actions", ...)` in ClubDetailView — caused production freeze.
+- Do NOT use `containerRelativeFrame` or forced clipping in club navigation containers.
+- Do NOT trigger network tasks automatically on ClubDetailView open — load on tab change only.
+- Do NOT pass unbounded Supabase text fields to UI models.
+
+---
+
+## 5. LAYOUT AND UI
+
+### DO
+- Apply `.frame(maxWidth: .infinity)` to every card/container before `.background(...)`.
+- Cap avatar preview rows with `prefix(N)` where N satisfies the row width constraint.
+- Show overflow as a `+N` badge — never as additional circles.
+- For screens with vertical scroll, always constrain root container to viewport width.
+
+### DO NOT
+- Do NOT use `.fixedSize(horizontal: true)` on any view — causes overflow on narrow devices.
+- Do NOT add `ScrollView(.horizontal)` inside full-page vertical scrolls without explicit width bounding.
+- Do NOT use `frame(minWidth: X)` on container views unless X < available content width.
+- Do NOT feed `GeometryReader` size values back into child frame widths (read-only use only).
+- Do NOT use `.blendMode(.screen)` on SVG assets with transparent backgrounds.
+
+---
+
+## 6. NAVIGATION AND NOTIFICATIONS
+
+### DO
+- Use a dedicated back stack for the Notifications screen. Club destinations push inline; game destinations open as bottom sheets.
+- Show chevron indicator on notification rows only when `hasDestination: true`.
+- Review notifications are always tappable. They do NOT require the game to be in memory.
+- Extract game title from review notification using the "How was {title}?" prefix strip.
+- **Refresh notifications on foreground return** — in the Android `Activity.onResume` or `Lifecycle.ON_RESUME` observer, call the notification refresh function. This keeps the in-app inbox, tab badge, and app icon badge all in sync without requiring a manual pull-to-refresh.
+- **Sync app icon badge** — after every notification refresh, mark-read, mark-all-read, and clear-all: update the Android app icon badge to the current unread count. Use `NotificationManagerCompat` badge APIs or `ShortcutBadger` to set/clear the badge. Badge must read 0 when there are no unread notifications.
+- **Single source of truth for unread count** — compute `unreadCount` from the in-memory notification list (filter `!is_read`). Tab badge and app icon badge both derive from this same value. Never maintain a separate counter.
+
+### DO NOT
+- Do NOT route notification taps by switching the main bottom-nav tab (e.g. switching to Clubs tab). Notifications handle their own navigation.
+- Do NOT skip foreground refresh — relying on push-only updates means the badge count drifts whenever a notification is read on another device or via the web.
+- Do NOT maintain separate unread counters for the tab badge and app icon badge — use one shared value.
+
+---
+
+## 7. GAME FORMAT AND PAYMENT METHOD
+
+### DO
+- Use only the canonical `game_format` values when writing to the DB: `"open_play"`, `"random"`, `"round_robin"`, `"king_of_court"`, `"dupr_king_of_court"`. Reject any other value client-side before the network call.
+- Map display labels in the UI layer only. The wire/DB value is always the canonical string — never derive it from a display label.
+- Use only the canonical `payment_method` values: `"stripe"`, `"admin"`, `"cash"`, `"credits"`, NULL. Free games use NULL — not `"free"`.
+
+### DO NOT
+- Do NOT write `"ladder"` as a `game_format` — it was a legacy alias for `"king_of_court"` and has been normalised out. The DB CHECK constraint will reject it.
+- Do NOT write `"free"` as a `payment_method` — it was normalised to NULL. The DB CHECK constraint will reject it.
+- Do NOT label `curr_credits_returned_cents` in analytics as "Refunded" or "Cash Refunded" — the correct label is **"Credits Returned"** (club credit exposure, not a Stripe cash refund).
+
+---
+
+## 8. AUTH AND PROFILE
+
+### DO
+- Auth bootstrap guard must check all three conditions: `authState != .signedOut && !isInitialBootstrapComplete && profile == nil`.
+- DUPR ratings are stored in two places: `profiles.dupr_rating` (Supabase) and local storage keyed by user ID. Keep both in sync via a profile-fetch sync step on bootstrap.
+- Always PATCH `profiles.dupr_id` to Supabase when the user saves their DUPR ID — not just local storage. The `book_game` server gate reads the DB value.
+- Send `dupr_rating` as exactly 3 decimal places (e.g. `"3.520"`, never `"3.52"`). Column type `NUMERIC(5,3)` enforces this at storage but sending fewer dp will be rounded silently — always send canonical format.
+
+### DO NOT
+- Do NOT remove the `WITH CHECK (auth.uid() = id)` requirement from `profiles` RLS UPDATE policy.
+- Do NOT silently rewrite invalid `dupr_rating` values — surface the error and let the user correct.
+- Do NOT enforce DUPR gate client-side only — handle `dupr_required` error from `book_game` server response.
+
+---
+
+## 9. ADMIN OPERATIONS
+
+### DO
+- Check both conditions for admin: `clubs.created_by == auth.uid()` (owner) OR row in `club_admins`.
+- Handle `isMemberOrAdmin` to cover `.approved`, `.unknown` (club owner case), and `isClubAdminUser`.
+- When generating synthetic `ClubOwnerMember` entry for club owners without a `club_members` row: use `isAdmin=true`, `isOwner=true`, `adminRole="owner"`, prepend to member list.
+
+### DO NOT
+- Do NOT allow attendance marking (`game_attendance` writes) from non-admin users. RLS enforces this server-side; client should also guard the UI.
+- Do NOT allow a player to mark their own attendance.
+
+---
+
+## 10. CLUB CHAT
+
+### DO
+- Keep `commentDraft` state inside `ClubNewsPostCard` as `@State private var commentDraft: String`. Lifting to parent causes full re-render on every keystroke.
+- Use optimistic UI for likes and comments — mutate local cache immediately, revert on failure.
+
+### DO NOT
+- Do NOT call `refreshClubNews` after every like or comment interaction.
+- Do NOT lift comment draft state to parent view.
+
+---
+
+## VIOLATION IMPACT
+- Inserting booking before payment → ghost seats; players locked out.
+- Computing fee client-side → fee manipulation; financial loss.
+- Using global credit balance → cross-club credit spending.
+- Omitting required columns from select strings → silent nil; broken features.
+- Lifting comment draft state → keyboard lag; degraded UX.
+- Not guarding against `.fixedSize(horizontal: true)` → horizontal scroll on all screens.
+- Writing `"ladder"` as game_format → DB CHECK rejects with 400; game save fails.
+- Writing `"free"` as payment_method → DB CHECK rejects with 400; booking save fails.
+- Skipping foreground notification refresh → badge count drifts; unread indicator shows stale data.
+- Storing DUPR ID locally only, not PATCHing to DB → `book_game` returns `dupr_required` even for users who have entered their ID.
+- Sending `dupr_rating` with fewer than 3 decimal places → NUMERIC(5,3) rounds silently; external DUPR API receives wrong precision.

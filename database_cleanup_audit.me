@@ -1,0 +1,451 @@
+# Database Cleanup Audit
+# BookaDink — Supabase schema, Edge Functions, iOS client, Android planning docs
+# Audit date: 2026-04-25
+# Status: READ-ONLY PASS — no schema changes made
+
+---
+
+## Scope
+
+Clients audited:
+- iOS app (`BookadinkV2/**/*.swift`)
+- Supabase Edge Functions (`supabase/functions/**/*.ts`)
+- Migrations (`supabase/migrations/**/*.sql`)
+- Android planning docs (`android_build/**/*.me`)
+- No live Android client exists yet — `.me` files only
+
+---
+
+## Classification Key
+
+A — Active authoritative: keep, server is source of truth
+B — Active legacy compatibility: still referenced, migrate away before removing
+C — Redundant but referenced: do not delete; update references first
+D — Unreferenced but risky: no client refs, but may be in trigger/policy/RPC bodies
+E — Safe removal candidate: no references anywhere
+
+---
+
+## 1. Authoritative Plan/Entitlement State
+
+### Finding: Two sources, one winner
+
+| Field | Table | Written by | Read by iOS | Read by Android |
+|---|---|---|---|---|
+| `subscription_tier` | `clubs` | stripe-webhook, cancel-club-subscription, expire-subscriptions, admin_force_expire_subscription | **Never** | **Never** (doc-only) |
+| `plan_tier` | `club_entitlements` | `derive_club_entitlements()` only | Yes — FeatureGateService, ClubDashboardView, plan badge | Yes (planned) |
+| `plan_type` | `club_subscriptions` | stripe-webhook, create-club-subscription, cancel-club-subscription | No (internal) | No |
+
+**Rule confirmed:** `club_entitlements.plan_tier` is the single authoritative source for feature gating in all clients.
+`clubs.subscription_tier` is a denormalised write-through field maintained by backend services only. iOS never reads it. Android planning docs say read-only, but `android_build/system_contracts.me:155` incorrectly calls it "the authoritative field" — this is a documentation error (see Section 8).
+
+---
+
+## 2. Full Object Inventory
+
+### 2.1 `clubs` table — columns
+
+| Column | Classification | iOS reads | iOS writes | Edge fn reads | Edge fn writes | Notes |
+|---|---|---|---|---|---|---|
+| `id` | A | Yes | No | Yes | No | PK |
+| `name` | A | Yes | Yes | No | No | |
+| `description` | A | Yes | Yes | No | No | |
+| `image_url` | A | Yes | Yes | No | No | |
+| `contact_email` | A | Yes | Yes | No | No | |
+| `contact_phone` | A | Yes | Yes | No | No | |
+| `website` | A | Yes | Yes | No | No | |
+| `manager_name` | A | Yes | Yes | No | No | |
+| `members_only` | A | Yes | Yes | No | No | |
+| `created_by` | A | Yes | No | Yes | No | |
+| `win_condition` | A | Yes | Yes | No | No | |
+| `default_court_count` | A | Yes | Yes | No | No | |
+| `venue_name` | A | Yes | Yes | No | No | |
+| `street_address` | A | Yes | Yes | No | No | |
+| `suburb` | A | Yes | Yes | No | No | |
+| `state` | A | Yes | Yes | No | No | |
+| `postcode` | A | Yes | Yes | No | No | |
+| `country` | A | Yes | Yes | No | No | |
+| `latitude` | A | Yes | No | No | No | MUST stay in all 5 select= strings |
+| `longitude` | A | Yes | No | No | No | MUST stay in all 5 select= strings |
+| `hero_image_key` | A | Yes | Yes | No | No | |
+| `custom_banner_url` | A | Yes | Yes | No | No | |
+| `code_of_conduct` | A | Yes | Yes | No | No | |
+| `cancellation_policy` | A | Yes | Yes | No | No | |
+| `stripe_connect_id` | A | Yes | Yes | Yes | Yes | |
+| `avatar_background_color` | A | Yes | Yes | No | No | |
+| `timezone` | A | Yes | Yes | No | No | |
+| `subscription_tier` | B | **No** | **No** | No | **Yes (3 fns)** | Denormalised write-through. Never read by any client. Written by stripe-webhook, cancel-club-subscription, expire-subscriptions. Read by `derive_club_entitlements()` as fallback when no `club_subscriptions` row exists. Protected by `trg_protect_subscription_tier`. See Section 4 for removal path. |
+
+iOS club SELECT strings (from SupabaseService.swift) — confirmed columns:
+```
+id,name,description,image_url,contact_email,contact_phone,website,manager_name,
+members_only,created_by,win_condition,default_court_count,venue_name,street_address,
+suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,
+code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone
+```
+`subscription_tier` is absent from all 5 select strings. Confirmed zero iOS reads.
+
+---
+
+### 2.2 `club_entitlements` table
+
+Classification: **A — Active authoritative**
+
+All columns actively read by iOS `FeatureGateService` and dashboard views.
+
+| Column | iOS reads | Feature gated |
+|---|---|---|
+| `club_id` | Yes | PK/FK |
+| `plan_tier` | Yes — display label only, never branched | Tier pill in dashboard |
+| `max_active_games` | Yes | Game creation limit |
+| `max_members` | Yes | Member join limit |
+| `can_accept_payments` | Yes | Payment setup checklist |
+| `analytics_access` | Yes | Pro analytics gate |
+| `can_use_recurring_games` | Yes | Recurring game creation |
+| `can_use_delayed_publishing` | Yes | Scheduled publish |
+| `updated_at` | Yes | Cache staleness |
+
+**Keep all columns. Keep table. Do not remove.**
+
+---
+
+### 2.3 `club_subscriptions` table
+
+Classification: **A — Active authoritative**
+
+Written by stripe-webhook, create-club-subscription, cancel-club-subscription, expire-subscriptions. Read by iOS (`fetchClubSubscription`), displayed in Plan & Billing UI. `isPastDue` and `isCanceling` computed properties actively used.
+
+| Column | Used by | Notes |
+|---|---|---|
+| `club_id` | All | PK |
+| `stripe_subscription_id` | All edge fns | Upsert key; NOT NULL (live constraint differs from migration) |
+| `plan_type` | All edge fns, `derive_club_entitlements` | Source for tier derivation |
+| `status` | All edge fns, iOS UI | isPastDue, isCanceling computed props |
+| `current_period_end` | cancel-club-subscription, iOS UI | Grace period display |
+| `subscription_source` | stripe-webhook | 'stripe'/'manual'/'promo' audit trail |
+| `updated_at` | All | Audit |
+
+**Keep all columns. Keep table.**
+
+---
+
+### 2.4 `club_stripe_accounts` table
+
+Classification: **A — Active authoritative**
+
+Read by iOS (`fetchClubStripeAccount`, `refreshStripeAccountStatus`), written by `stripe-account-status` Edge Function and `connect-onboarding`. Drives payment setup checklist in ClubDashboardView.
+
+**Keep.**
+
+---
+
+### 2.5 `player_credits` table
+
+Classification: **A — Active authoritative**
+
+Direct PATCH/INSERT by iOS (no RPC — PostgREST schema cache issue documented in CLAUDE.md). Deleted by `delete_club` RPC. INSERT and UPDATE RLS policies in place.
+
+**Keep.**
+
+---
+
+### 2.6 `bookings` table — selected columns
+
+| Column | Classification | Notes |
+|---|---|---|
+| `hold_expires_at` | A | Phase 3 payment hold window; set by `promote_waitlist_player` RPC; read by iOS |
+| `credits_applied_cents` | A | Credit deduction record; read and written by iOS booking flow |
+| `credit_refund_issued_at` | A | Idempotency guard for cancellation credits |
+| `payment_method` | A | 'stripe'/'admin'/nil; shown in owner attendee list |
+| `fee_paid` | A | Stripe completion flag |
+| `stripe_payment_intent_id` | A | Payment audit; extracted from client secret |
+
+**All columns active. Keep.**
+
+---
+
+### 2.7 `notifications` table
+
+Classification: **A — Active**
+
+Full CRUD from iOS. Written by Edge Functions (`notify`, `booking-confirmed`, `game-cancelled-notify`, `club-announcement-notify`, etc.).
+
+**Keep.**
+
+---
+
+### 2.8 `notification_preferences` table
+
+Classification: **A — Active**
+
+Read and written by iOS (`fetchNotificationPreferences`, `saveNotificationPreferences`). Checked by Edge Functions before sending push/email.
+
+| Column | Used |
+|---|---|
+| `booking_confirmed_push` | Yes |
+| `booking_confirmed_email` | Yes |
+| `new_game_push` | Yes |
+| `new_game_email` | Yes |
+| `waitlist_push` | Yes |
+| `waitlist_email` | Yes |
+| `chat_push` | Yes |
+
+**Keep.**
+
+---
+
+### 2.9 `reviews` table
+
+Classification: **A — Active**
+
+Written by iOS (`submitReview`). Read via `get_club_reviews` RPC (SECURITY DEFINER for profiles join). Deleted by `delete_club` RPC.
+
+**Keep.**
+
+---
+
+### 2.10 `club_venues` table
+
+Classification: **A — Active**
+
+Full CRUD from iOS (5 SupabaseService methods). Deleted by `delete_club` RPC.
+
+**Keep.**
+
+---
+
+### 2.11 `game_attendance` table
+
+Classification: **A — Active**
+
+Read/written by iOS check-in flow. Used by analytics supplemental RPC for no-show rate. Deleted by `delete_club` RPC.
+
+**Keep.**
+
+---
+
+## 3. RPCs / Functions
+
+### 3.1 Active RPCs — keep all
+
+| RPC | Called from | Classification |
+|---|---|---|
+| `derive_club_entitlements(UUID)` | stripe-webhook, create-club-subscription, cancel-club-subscription, expire-subscriptions | A — single source of truth for tier mapping |
+| `delete_club(UUID)` | iOS | A |
+| `get_club_dashboard_summary(UUID)` | iOS — every dashboard open | A |
+| `get_club_analytics_kpis(...)` | iOS — Pro tier | A |
+| `get_club_analytics_supplemental(...)` | iOS — Pro tier | A |
+| `get_club_revenue_trend(...)` | iOS — Pro tier | A |
+| `get_club_top_games(...)` | iOS — Pro tier | A |
+| `get_club_peak_times(...)` | iOS — Pro tier | A |
+| `get_club_reviews(UUID)` | iOS — club detail | A |
+| `promote_waitlist_player(...)` | iOS + promote-top-waitlisted-push Edge Fn | A |
+| `games_ending_between(window_start, window_end)` | send-review-prompts Edge Fn | A — **no migration file** (manually created via SQL Editor; see Section 6) |
+| `archive_finished_free_games(grace_minutes)` | archive-old-games Edge Fn | A — **no migration file** (manually created; see Section 6) |
+| `check_active_game_limit()` | DB trigger BEFORE INSERT on games | A |
+| `admin_force_expire_subscription(UUID)` | SQL Editor only — dev/admin | A — access-controlled; REVOKE from authenticated |
+
+---
+
+### 3.2 Dead RPCs — Phase 5A artifacts
+
+| RPC | Classification | Risk | Recommended action |
+|---|---|---|---|
+| `get_club_fill_rate_summary` | **E — Safe removal** | Low | Drop function. Remove from SupabaseService protocol + implementation, AppState, Models.swift |
+| `get_club_revenue_summary` | **E — Safe removal** | Low | Drop function. Remove from SupabaseService protocol + implementation, AppState, Models.swift |
+
+**Evidence:** These RPCs have full implementations in SupabaseService.swift and AppState.swift (including `@Published` caches) but are **never called from any View**. Analytics views were superseded entirely by Phase 5B RPCs (`get_club_analytics_kpis`, `get_club_analytics_supplemental`). Confirmed in `analytics_system.me`:
+> "Phase 5A Dead Code: get_club_revenue_summary and get_club_fill_rate_summary RPCs exist in the DB and are implemented in SupabaseService + AppState, but are NOT called from any view. These are Phase 5A artifacts fully superseded by Phase 5B RPCs."
+
+**iOS dead code to remove alongside DB drop:**
+
+```
+AppState.swift:
+  @Published var revenueSummaryByClubID: [UUID: ClubRevenueSummary] = [:]
+  @Published var loadingRevenueSummaryClubIDs: Set<UUID> = []
+  @Published var fillRateSummaryByClubID: [UUID: ClubFillRateSummary] = [:]
+  @Published var loadingFillRateSummaryClubIDs: Set<UUID> = []
+  func fetchClubRevenueSummary(for clubID: UUID, days: Int?) async { ... }    // lines ~3526-3540
+  func fetchClubFillRateSummary(for clubID: UUID, days: Int?) async { ... }   // lines ~3542-3556
+
+SupabaseService.swift (protocol):
+  func fetchClubRevenueSummary(clubID: UUID, days: Int?) async throws -> ClubRevenueSummary?   // line 96
+  func fetchClubFillRateSummary(clubID: UUID, days: Int?) async throws -> ClubFillRateSummary? // line 97
+
+SupabaseService.swift (implementation):
+  func fetchClubRevenueSummary(...) { ... }   // lines ~2559-2610
+  func fetchClubFillRateSummary(...) { ... }  // lines ~2611-2670
+
+Models.swift:
+  struct ClubRevenueSummary { ... }    // line ~934 — "Phase 5A-1" comment
+  struct ClubFillRateSummary { ... }   // line nearby
+```
+
+No views reference these symbols. Safe to remove the protocol requirements, implementations, caches, and DB functions in a single pass.
+
+---
+
+## 4. Triggers
+
+### 4.1 Active triggers — keep all
+
+| Trigger | Table | Event | Function | Classification |
+|---|---|---|---|---|
+| `trg_protect_subscription_tier` | `clubs` | BEFORE UPDATE OF subscription_tier | Rejects update if caller is not service_role/postgres/supabase_admin. Raises ERRCODE 42501. | A — critical security control |
+| `enforce_active_game_limit` | `games` | BEFORE INSERT | `check_active_game_limit()` — reads `club_entitlements.max_active_games`; deny-by-default if row missing | A — entitlement enforcement |
+| `promote_waitlist_after_hold_expiry` | `bookings` (or pg_cron) | pg_cron / cron job | Calls `promote_waitlist_player` after hold expiry | A |
+
+### 4.2 Triggers not found in migrations
+
+| Object | CLAUDE.md reference | Status |
+|---|---|---|
+| `send_notification_email` | "DB trigger on notifications table, uses net.http_post" | **Not found in any migration.** Likely created manually via SQL Editor. Gap in migration history (see Section 6). |
+
+---
+
+## 5. Edge Functions
+
+| Function | Classification | Notes |
+|---|---|---|
+| `stripe-webhook` | A | Writes club_subscriptions, clubs.subscription_tier, calls derive_club_entitlements |
+| `create-club-subscription` | A | Creates Stripe subscription, upserts club_subscriptions |
+| `cancel-club-subscription` | A | Cancels Stripe or manual subscription, updates status to 'canceling' |
+| `expire-subscriptions` | A | Cron safety net; marks canceling→canceled when period_end passed |
+| `stripe-account-status` | A | Returns payouts_enabled for Connect account; called by iOS ClubDashboardView |
+| `stripe-connect-redirect` | A | OAuth redirect handler for Stripe Connect onboarding |
+| `connect-onboarding` | A | Initiates Stripe Connect account link |
+| `create-payment-intent` | A | Creates Stripe PaymentIntent for game booking fees |
+| `booking-confirmed` | A | Post-booking push + email notification |
+| `game-cancelled-notify` | A | Push/email on game cancellation |
+| `game-published-notify` | A | Push on new game publish |
+| `game-reminder-24h` | A | 24h pre-game reminder push |
+| `game-updated-notify` | A | Push on game edit |
+| `club-announcement-notify` | A | Club news post push |
+| `club-chat-push` | A | Club chat message push |
+| `notify` | A | General-purpose notify dispatcher |
+| `send-notification-email` | A | Email via Resend; triggered by DB trigger or direct call |
+| `send-review-prompts` | A | Hourly cron; calls `games_ending_between` RPC; sends review request notifications |
+| `promote-top-waitlisted-push` | A | Calls `promote_waitlist_player`; sends push to promoted player |
+| `archive-old-games` | A | Hourly cron; calls `archive_finished_free_games` RPC |
+
+**No dead Edge Functions found.**
+
+---
+
+## 6. Migration History Gaps (schema objects with no migration file)
+
+These objects are confirmed to exist in the live database (called by active code) but have no corresponding migration file. They were created manually via SQL Editor and are at risk of being lost on schema reset or new environment setup.
+
+| Object | Type | Called by | Action required |
+|---|---|---|---|
+| `games_ending_between(window_start TIMESTAMPTZ, window_end TIMESTAMPTZ)` | RPC | `send-review-prompts/index.ts:36` | Write migration `20260425_games_ending_between.sql` |
+| `archive_finished_free_games(grace_minutes INT)` | RPC | `archive-old-games/index.ts` | Write migration `20260425_archive_finished_free_games.sql` |
+| `send_notification_email` | DB trigger on `notifications` | Referenced in CLAUDE.md; not in any migration | Write migration to document and re-create if lost |
+
+These are **not safe removal candidates** — they are missing migrations that should be backfilled.
+
+---
+
+## 7. Views (internal only)
+
+| View / Function | Created by migration | iOS access | Android access | Classification |
+|---|---|---|---|---|
+| `v_active_subscriptions` | `20260406_platform_analytics_views.sql` | None | None | D — internal Studio use; no client access |
+| `v_platform_revenue` | `20260406_platform_analytics_views.sql` | None | None | D — internal |
+| `v_subscription_events` | `20260406_platform_analytics_views.sql` | None | None | D — internal |
+| `v_club_growth` | `20260406_platform_analytics_views.sql` | None | None | D — internal |
+| `platform_plan_config` | `20260406_platform_analytics_views.sql` | None | None | D — internal config table |
+| `v_club_debug_summary` | `20260406_club_debug_views.sql` | None | None | D — support tool |
+| `get_club_recent_games(UUID)` | `20260406_club_debug_views.sql` | None | None | D — support tool |
+| `get_club_recent_bookings(UUID)` | `20260406_club_debug_views.sql` | None | None | D — support tool |
+
+SELECT access revoked from `anon` and `authenticated` on all views above. Postgres/service_role only. Safe to keep as-is.
+
+---
+
+## 8. Android Planning Docs — Stale References
+
+The `android_build/` directory contains planning/architecture documents only. No live Android client code exists. Two stale references found:
+
+| File | Line | Stale claim | Correct state |
+|---|---|---|---|
+| `android_build/system_contracts.me` | 155 | "`clubs.subscription_tier` is the authoritative field for entitlement checks" | **Wrong.** `club_entitlements.plan_tier` is authoritative. `clubs.subscription_tier` is a write-through denorm that iOS/Android must never read directly. |
+| `android_build/data_contracts.me` | ~207 | Lists `"enterprise"` as valid value for `subscription_tier` | No enterprise tier exists. Valid values are `free`, `starter`, `pro`. |
+
+These docs must be corrected before Android development starts. A developer reading `system_contracts.me` today would implement entitlement checks against the wrong field.
+
+---
+
+## 9. Summary Tables
+
+### Safe Removal Candidates (E)
+
+| Object | Type | Files to update | Migration needed |
+|---|---|---|---|
+| `get_club_fill_rate_summary` | DB function | SupabaseService.swift (protocol + impl ~lines 96,2611), AppState.swift (~lines 84,3542), Models.swift (~line 934) | `DROP FUNCTION get_club_fill_rate_summary(...)` |
+| `get_club_revenue_summary` | DB function | SupabaseService.swift (protocol + impl ~lines 97,2559), AppState.swift (~lines 82,3526), Models.swift (~line 936) | `DROP FUNCTION get_club_revenue_summary(...)` |
+| `ClubRevenueSummary` struct | iOS model | Models.swift | n/a (iOS-only) |
+| `ClubFillRateSummary` struct | iOS model | Models.swift | n/a (iOS-only) |
+| `revenueSummaryByClubID` cache | iOS @Published | AppState.swift | n/a |
+| `loadingRevenueSummaryClubIDs` cache | iOS @Published | AppState.swift | n/a |
+| `fillRateSummaryByClubID` cache | iOS @Published | AppState.swift | n/a |
+| `loadingFillRateSummaryClubIDs` cache | iOS @Published | AppState.swift | n/a |
+
+### Keep / Do Not Touch (A/B/D)
+
+All other tables, columns, RPCs, triggers, Edge Functions, and views.
+Notably: `clubs.subscription_tier` (B) — written by backend services, protected by trigger; removal path exists but requires coordinating 3 Edge Functions + `derive_club_entitlements` in a single atomic migration.
+
+### Documentation Fixes Required (not schema changes)
+
+| File | Fix |
+|---|---|
+| `android_build/system_contracts.me:155` | Replace: "clubs.subscription_tier is authoritative" → "club_entitlements is authoritative; clubs.subscription_tier is a backend-managed denorm, never read by clients" |
+| `android_build/data_contracts.me:207` | Remove 'enterprise' from valid values for subscription_tier |
+
+---
+
+## 10. Staged Migration Plan
+
+### Stage 1 — Backfill missing migrations (no schema change, documentation only)
+Write `supabase/migrations/20260425_games_ending_between.sql` and `20260425_archive_finished_free_games.sql` capturing the existing RPC bodies (retrieve via `\df+ games_ending_between` in SQL Editor). Write the `send_notification_email` trigger migration if the trigger body can be retrieved.
+
+### Stage 2 — Remove Phase 5A dead code (iOS only, no DB change)
+Remove `ClubRevenueSummary`, `ClubFillRateSummary`, their `@Published` AppState caches, AppState fetch methods, and SupabaseService protocol requirements + implementations. Build must stay clean. No DB migration required yet — functions still exist and can stay harmlessly.
+
+### Stage 3 — Drop Phase 5A DB functions
+After Stage 2 ships and is stable, run:
+```sql
+DROP FUNCTION IF EXISTS get_club_fill_rate_summary(UUID, INT);
+DROP FUNCTION IF EXISTS get_club_revenue_summary(UUID, INT);
+```
+No client will break (Stage 2 already removed all callers).
+
+### Stage 4 — Fix Android docs
+Correct `system_contracts.me` and `data_contracts.me` before Android development begins. Not a DB change.
+
+### Stage 5 — clubs.subscription_tier removal (future, high-effort)
+Only after all three Edge Functions (`stripe-webhook`, `cancel-club-subscription`, `expire-subscriptions`) are updated to not write `clubs.subscription_tier`, and `derive_club_entitlements` is updated to not read it as fallback. Requires:
+- Update all 3 Edge Functions to skip the `clubs.subscription_tier` write
+- Update `derive_club_entitlements` to rely solely on `club_subscriptions.plan_type`
+- Drop `trg_protect_subscription_tier`
+- `ALTER TABLE clubs DROP COLUMN subscription_tier`
+
+This is a medium-risk change. The trigger currently protects against privilege escalation — ensure `club_subscriptions` RLS is sufficient before dropping the trigger.
+
+**Do not combine Stages 3 and 5 into a single migration.**
+
+---
+
+## QA Checklist (run after each stage)
+
+- [ ] iOS build clean — no compile errors
+- [ ] `fetchClubEntitlements` returns correct tier for free/starter/pro test clubs
+- [ ] Paid booking creates booking with `fee_paid=true`, `payment_method='stripe'`
+- [ ] Cancellation within 6h issues credit; cancellation outside 6h issues no credit
+- [ ] Plan badge in ClubDashboardView shows correct tier (not "Free Plan" during load)
+- [ ] Analytics section locked for free/starter; unlocked for pro
+- [ ] Stripe webhook processes subscription.updated → entitlements refresh within 30s
+- [ ] `admin_force_expire_subscription` correctly reverts pro → free in test environment
+- [ ] No RLS policy violations in Supabase logs after migration
+- [ ] Edge Functions still deploy without `--no-verify-jwt` flag

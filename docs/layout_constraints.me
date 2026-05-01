@@ -1,0 +1,137 @@
+---
+title: Layout Constraints & Scroll Lock Rules
+scope: All screens in Book A Dink (SwiftUI iOS)
+applies_to: Claude Code sessions, code review, new feature work
+---
+
+## Core Principle
+
+The app must ALWAYS be locked to viewport width.
+No screen may allow horizontal scrolling or dragging under any circumstance.
+
+
+## Root Cause (Historical Bug — GameDetailView, April 2026)
+
+A child HStack (`largeAvatarRow`) contained up to 7 fixed-size circles at 44pt each
+with 8pt spacing = 356pt. Available card width on a standard iPhone was 318pt.
+
+The parent card VStack had no `.frame(maxWidth: .infinity)` modifier, so it reported
+its intrinsic content width (oversized) upward. The body VStack adopted that width.
+The outer `ScrollView(.vertical)` had no explicit width constraint on its content.
+
+Result: the entire screen became horizontally draggable.
+
+Fix: two changes.
+1. Added `.frame(maxWidth: .infinity)` to `playersCard` and `venueInfoCard`.
+2. Reduced `largeAvatarRow` from `prefix(6)` to `prefix(4)` so max row width = 252pt.
+
+
+## Non-Negotiable Rules
+
+**Rule 1 — Root container must constrain width.**
+Every screen body VStack (direct child of ScrollView) must carry:
+    .frame(maxWidth: .infinity)
+or:
+    .frame(maxWidth: .infinity, alignment: .leading)
+
+Do NOT remove or weaken this modifier.
+
+**Rule 2 — Every card/section component must constrain width.**
+Any view that is a card (has a background, overlay, or shadow) must have
+`.frame(maxWidth: .infinity)` as its outermost size modifier, before `.background(...)`.
+
+Pattern (correct):
+    VStack(...) { ... }
+        .frame(maxWidth: .infinity)          // ← MUST be first
+        .background(..., in: RoundedRectangle(...))
+        .overlay(...)
+        .shadow(...)
+
+Pattern (wrong — card adopts intrinsic content width):
+    VStack(...) { ... }
+        .background(..., in: RoundedRectangle(...))
+
+**Rule 3 — Never use `.fixedSize(horizontal: true)`.**
+This instructs SwiftUI to ignore the proposed width and use intrinsic width instead.
+It will cause overflow if the intrinsic width exceeds the viewport.
+
+Allowed: `.fixedSize(horizontal: false, vertical: true)` — this only expands height.
+Allowed: `.fixedSize()` on small contained elements (badges, labels) inside already-constrained parents.
+
+**Rule 4 — No unbounded fixed-width HStacks.**
+Any HStack whose children have explicit `.frame(width: X)` modifiers must satisfy:
+    sum(child widths) + sum(spacing) < (screen width − horizontal padding)
+
+Minimum screen width to target: 375pt (iPhone SE).
+Standard body padding: 20pt each side = 40pt total.
+Standard card inner padding: 16pt each side = 32pt total.
+Available card content width on SE: 375 − 40 − 32 = 303pt.
+
+If a row cannot satisfy this with N items, cap with `prefix(N)` and show a `+X` badge.
+
+**Rule 5 — No explicit `minWidth` or forced width on containers.**
+Do not use `frame(minWidth: X)` on any container view unless tightly bounded and
+the minWidth is smaller than the viewport content width.
+
+**Rule 6 — GeometryReader must NEVER feed oversized widths back into layout.**
+If GeometryReader is used, only read its value for positioning/offsets.
+Do NOT set a child's `.frame(width: geometry.size.width + constant)` or similar.
+
+**Rule 7 — Horizontal ScrollViews are banned inside vertical page screens.**
+Do not add `ScrollView(.horizontal)` inside any full-page vertical scroll unless it is
+a dedicated carousel component that is explicitly width-bounded and documented.
+
+
+## Avatar / Row Constraints
+
+- Avatar preview rows must always be capped with `prefix(N)`.
+- Remaining items must be shown as a `+N` badge, never as additional circles.
+- The cap `N` must satisfy: `(N+1) × 44 + N × 8 ≤ availableCardWidth`.
+- Current cap: `prefix(4)` → max 5 items = 252pt (fits in 303pt on SE with 51pt margin).
+- If avatar size or card padding changes, recalculate and update the cap.
+
+
+## Validation Checklist (Run Before Merging Any GameDetailView or Layout Change)
+
+Test states:
+- [ ] 0 registered players
+- [ ] 1 registered player
+- [ ] 11+ registered players (triggers avatar cap and +N badge)
+- [ ] Long game title (30+ characters)
+- [ ] Long venue name
+- [ ] Small device: iPhone SE (375pt) or simulator equivalent
+
+Confirm:
+- [ ] Screen cannot be dragged horizontally in ANY of the above states
+- [ ] `+N` badge appears correctly when attendees exceed prefix cap
+- [ ] Summary line still shows correct total count
+- [ ] No card is clipped unexpectedly
+- [ ] Expanded players list scrolls vertically, not horizontally
+
+
+## Current Card Inventory — Confirmed Constrained
+
+All cards below have `.frame(maxWidth: .infinity)` applied. Any new card added to
+GameDetailView must be added to this list after verification.
+
+| Card var/func         | Frame constraint line (approx) |
+|-----------------------|-------------------------------|
+| playersCard           | Confirmed (added April 2026)  |
+| venueInfoCard         | Confirmed (added April 2026)  |
+| attendanceSummaryCard | Confirmed (pre-existing)      |
+| aboutEventCard        | Confirmed (pre-existing)      |
+| cancellationCard      | Confirmed (pre-existing)      |
+| duprRequirementCard   | Confirmed (pre-existing)      |
+
+
+## Failure Modes to Watch
+
+| Failure Mode                          | Risk | Mitigation |
+|---------------------------------------|------|------------|
+| HStack with fixed-width children      | HIGH | Cap with prefix + +N badge; verify math |
+| Card VStack without maxWidth frame    | HIGH | Always add `.frame(maxWidth: .infinity)` first |
+| `.fixedSize(horizontal: true)`        | HIGH | Banned — remove immediately |
+| LazyHStack without bounded parent     | HIGH | Wrap in explicit width container |
+| Text with `.lineLimit(1)` and no truncation | MED | Add `.truncationMode(.tail)` |
+| GeometryReader returning proxy.size.width fed back to frame | MED | Read-only; never set frame from geometry width + offset |
+| New card added without `.frame(maxWidth: .infinity)` | MED | Add to card inventory above |

@@ -1,0 +1,143 @@
+# backend_authority.me
+# Purpose: Defines everything that MUST be enforced server-side. Clients have zero
+#          authority over these operations. If a client sends incorrect data, the
+#          server must reject it — not trust it.
+# Scope: Supabase PostgREST, Edge Functions, PostgreSQL RPCs, RLS policies
+
+---
+
+## 1. PRINCIPLE
+
+The backend is the single source of truth for all financial, security, and integrity decisions.
+Clients perform optimistic UI updates only. All writes that affect money, booking status,
+or entitlements must be validated and executed server-side.
+
+DO NOT trust any of the following from clients:
+- Price or fee amounts
+- Credit balance values
+- Booking status transitions
+- Platform fee calculations
+- Refund eligibility
+- Subscription tier
+- User roles or admin status
+
+
+---
+
+## 2. OPERATIONS THAT MUST BE SERVER-AUTHORITATIVE
+
+### Payments
+- PaymentIntent creation: `create-payment-intent` Edge Function.
+  - Calculates `application_fee_amount` server-side from `games.platform_fee_bps`.
+  - Clients MUST NOT compute the platform fee and pass it in.
+- Payment capture and settlement: Stripe (external); webhook `stripe-webhook` handles state sync.
+- Fee breakdown (`platform_fee_cents`, `club_payout_cents`): computed by Edge Function and returned to client. Client stores these values in the booking row but does not compute them independently.
+
+### Credits
+- Credit balance reads: direct SELECT on `player_credits` filtered by `auth.uid()` — enforced by RLS.
+- Credit deductions: PATCH on `player_credits` with atomic `amount_cents=gte.{amountCents}` filter. If filter fails (balance insufficient), PostgREST returns 0 rows — client must treat this as rejection.
+- Credit issuance: PATCH existing row or INSERT new row on `player_credits`. Idempotent via `credit_transactions` duplicate check.
+- NEVER allow negative `amount_cents`: enforced by RLS UPDATE policy `WITH CHECK (auth.uid() = user_id AND amount_cents >= 0)`.
+
+### Waitlist Promotion
+- `promote_waitlist_player(p_game_id, p_booking_id, p_hold_minutes)` RPC:
+  - Acquires FOR UPDATE lock on game row (prevents concurrent promotions).
+  - Verifies game is not full.
+  - Verifies booking is still `waitlisted`.
+  - Rejects if another active `pending_payment` hold exists for the game.
+  - Returns BOOL. Client must check the return value before updating UI.
+- Hold expiry: `expire_waitlist_holds()` runs server-side via pg_cron every 5 minutes. Clients do NOT revert holds themselves.
+
+### Subscription State
+- `stripe-webhook` Edge Function is the only writer of `clubs.subscription_tier` and `club_subscriptions.status`. Clients are read-only consumers of these fields.
+- Stripe HMAC signature verified manually in `stripe-webhook`. Unverified webhook calls rejected.
+
+### Booking Status Transitions
+- All status transitions go through PostgREST PATCH or the `promote_waitlist_player` RPC.
+- The client does NOT set `status='confirmed'` directly after payment — it calls `confirmPendingBooking` which performs a PATCH with the full fee breakdown.
+- RLS policies control which rows a user can update. Clients cannot escalate their own permissions.
+
+### User Roles and Admin Checks
+- Admin status (`isClubAdminUser`) is determined by:
+  - `clubs.created_by = auth.uid()` (owner), OR
+  - Row in `club_admins` table with `club_id` and `user_id = auth.uid()`
+- Both checks must be validated server-side via RLS when writing to admin-only tables.
+- `game_attendance` table: RLS enforces admin-only writes. Client cannot mark attendance for itself.
+
+### Review Submission
+- Duplicate prevention: `UNIQUE(game_id, user_id)` on `reviews` table. DB returns HTTP 409 on duplicate — clients detect this and show a specific message; they do NOT trust a local "already reviewed" flag.
+- `get_club_reviews` RPC runs as SECURITY DEFINER to bypass `profiles` RLS for reviewer name resolution. Clients must call this RPC, not query `reviews` directly with a join on `profiles`.
+
+### Notifications
+- Push notifications (APNs) sent by Edge Functions only. Clients do NOT send push notifications directly.
+- Email notifications triggered by DB trigger `send_notification_email` on `notifications` insert. Clients do NOT call the email function directly.
+
+### Club Image Storage
+- Storage paths enforced: avatars at `club-avatars/{clubID}/{uuid}.jpg`, banners at `club-banners/{clubID}/{uuid}.jpg`.
+- Bucket is public but path structure ensures clients cannot overwrite other clubs' images without knowing the clubID (which is validated by RLS on the `clubs` table).
+
+### Cancellation Window
+- 6-hour window is computed server-side (or by the `issue_cancellation_credit` RPC). Clients compute it for UX display only (to show/hide the "credit will be issued" message). The actual credit issuance uses the server time.
+
+---
+
+## 3. ROW LEVEL SECURITY — NON-NEGOTIABLE POLICIES
+
+Every table that stores user or financial data must have RLS enabled.
+
+### Required policies (must not be removed):
+| Table | Policy | Rule |
+|---|---|---|
+| `profiles` | UPDATE | `USING (auth.uid() = id) WITH CHECK (auth.uid() = id)` |
+| `player_credits` | SELECT | `auth.uid() = user_id` |
+| `player_credits` | UPDATE | `USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id AND amount_cents >= 0)` |
+| `player_credits` | INSERT | `WITH CHECK (auth.uid() = user_id AND amount_cents >= 0)` |
+| `notifications` | DELETE | `auth.uid() = user_id` |
+| `game_attendance` | INSERT/UPDATE | Admin-only (club owner or club_admins role) |
+| `club_subscriptions` | SELECT | Club owner only (`clubs.created_by = auth.uid()`) |
+| `club_stripe_accounts` | SELECT | Club owner or club admin |
+| `reviews` | INSERT | `WITH CHECK (auth.uid() = user_id)` |
+| `reviews` | SELECT | `auth.role() = 'authenticated'` |
+
+### profiles UPDATE policy note
+The `WITH CHECK (auth.uid() = id)` clause is REQUIRED. Without it, PostgREST upserts silently
+succeed for the wrong row (no error returned). This has caused production data corruption before.
+
+---
+
+## 4. EDGE FUNCTIONS — AUTHORITY BOUNDARIES
+
+| Function | Authoritative For |
+|---|---|
+| `create-payment-intent` | Fee calculation, Stripe PaymentIntent creation |
+| `stripe-webhook` | Subscription state sync to DB; HMAC verification |
+| `connect-onboarding` | Stripe Connect account creation and onboarding URL |
+| `booking-confirmed` | Post-booking push notification to attendees |
+| `game-cancelled-notify` | Push to all attendees when a game is cancelled |
+| `club-announcement-notify` | Push to club members on new announcement |
+| `club-chat-push` | Push for mentions and replies in club chat |
+| `send-notification-email` | Email delivery via Resend (triggered by DB trigger) |
+| `create-club-subscription` | Stripe Customer creation + Subscription creation |
+| `send-review-prompts` | Review request notifications 24h after game ends |
+| `archive-old-games` | Game archival (Edge Function, not client logic) |
+
+DO NOT replicate these functions' logic in client code. Client code calls the function and handles the response. The function is the authority.
+
+---
+
+## 5. SCHEMA CONSTRAINTS CLIENTS MUST NOT BYPASS
+
+- `player_credits.UNIQUE(user_id, club_id, currency)` — prevents duplicate balance rows.
+- `reviews.UNIQUE(game_id, user_id)` — prevents duplicate reviews.
+- `club_subscriptions.UNIQUE(club_id)` and `UNIQUE(stripe_subscription_id)` — prevents duplicate subscription rows.
+- `club_stripe_accounts.UNIQUE(club_id)` — one Connect account per club.
+- `bookings.status` check constraint — only valid enum values accepted.
+
+---
+
+## VIOLATION IMPACT
+- Removing `profiles` UPDATE WITH CHECK → PostgREST upserts silently overwrite wrong rows; user data corruption.
+- Computing platform fee on client → club or player could manipulate request to reduce fee; financial loss.
+- Removing `player_credits` amount_cents >= 0 check → credits go negative; players get free bookings.
+- Client-side waitlist promotion → race conditions; multiple players confirmed into one spot.
+- Calling email/push functions from client → spoofed notifications; abuse vector; API key exposure.

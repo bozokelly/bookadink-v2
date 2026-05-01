@@ -33,3 +33,4 @@ BookadinkV2/Services/SupabaseConfig.swift
 # Supabase local dev (keep migrations/functions, ignore local runtime)
 supabase/.branches/
 supabase/.temp/
+.claude/worktrees/

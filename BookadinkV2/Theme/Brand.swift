@@ -13,7 +13,21 @@ enum Brand {
     static let softOutline      = Color(hex: "D6D3D1")   // subtle neutral outline
 
     // Signature neon-lime accent — 5–10% usage only (dots, underlines, micro-accents)
-    static let accentGreen      = Color(hex: "C3FF45")
+    static let accentGreen      = Color(hex: "C8FF3D")
+
+    // Tonal card palette — base and deep ends of the diagonal gradient used on game/club cards
+    static let tonalTanBase      = Color(hex: "B79F86")
+    static let tonalTanDeep      = Color(hex: "7A6451")
+    static let tonalNavyBase     = Color(hex: "2A3A52")
+    static let tonalNavyDeep     = Color(hex: "16213A")
+    static let tonalCharcoalBase = Color(hex: "3A3D40")
+    static let tonalCharcoalDeep = Color(hex: "1F2123")
+    static let tonalForestBase   = Color(hex: "1F3D2C")
+    static let tonalForestDeep   = Color(hex: "0E2418")
+    static let tonalRoseBase     = Color(hex: "9A6E73")
+    static let tonalRoseDeep     = Color(hex: "5E3F44")
+    static let tonalSlateBase    = Color(hex: "4A5560")
+    static let tonalSlateDeep    = Color(hex: "2A323B")
 
     // ── Preserved legacy token names (updated to neutral values) ────────────
     // These keep all existing call sites compiling while shifting the palette.
@@ -62,6 +76,15 @@ enum Brand {
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
+
+    // ── Sport Blend palette — settings & account screens ─────────────────────
+    static let sportBg        = Color(hex: "FBFAF7")   // cream page background
+    static let sportBgAlt     = Color(hex: "F4F2EC")   // subtle elevation / input bg
+    static let sportBorder    = Color(hex: "EDEAE0")   // hairline dividers
+    static let sportPop       = Color(hex: "D4FF3A")   // electric lime — energy moments only
+    static let sportStatement = Color(hex: "1B1A17")   // dark statement surface (hero card)
+    static let sportWarn      = Color(hex: "C44545")   // destructive / paused state
+    static let sportCream     = Color(hex: "F4F1EA")   // text on dark sport surfaces
 }
 
 enum AppCopy {

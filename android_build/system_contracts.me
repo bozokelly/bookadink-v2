@@ -1,0 +1,172 @@
+# system_contracts.me
+# Purpose: Core product lifecycle rules for all booking, payment, credit, waitlist,
+#          cancellation, and entitlement flows. These rules define what the product
+#          does — not how it is implemented on any given platform.
+# Scope: iOS, Android, backend (Supabase Edge Functions, RPCs)
+
+---
+
+## 1. BOOKING LIFECYCLE
+
+### States
+A booking may only be in one of these states:
+- `confirmed`       — seat is held; payment settled (or free game)
+- `waitlisted`      — game is full; player is queued
+- `pending_payment` — promoted from waitlist; hold window active; payment not yet complete
+- `cancelled`       — booking voided by player or admin
+
+### State Transitions (Allowed)
+```
+(new)         → confirmed         [player books a free game or completes Stripe payment]
+(new)         → waitlisted        [player joins a full game]
+waitlisted    → pending_payment   [server promotes player; hold window opened]
+pending_payment → confirmed       [player completes Stripe payment within hold window]
+pending_payment → waitlisted      [hold expires without payment; player re-queued at position 1]
+confirmed     → cancelled         [player or admin cancels]
+waitlisted    → cancelled         [player removes themselves from waitlist]
+```
+
+### Rules
+- DO NOT insert a booking row until payment is complete (Stripe `.completed`) or the game is free.
+- DO NOT transition `pending_payment → confirmed` from the client. The client calls `confirmPendingBooking` which PATCHes the DB; the DB is authoritative.
+- DO NOT allow a player to hold more than one confirmed or pending_payment seat per game.
+- DO NOT allow booking a game with `publish_at > now()` from the public flow. Admins may still see and manage unpublished games.
+- Booking `status` enum values in the DB must exactly match the list above. No aliases or variants.
+
+
+---
+
+## 2. PAYMENT FLOW
+
+### Architecture
+- Player payments are destination charges via Stripe Connect.
+- Platform retains `application_fee_amount` (10% default, stored as `platform_fee_bps`).
+- Remainder flows to the club's Stripe Express account.
+- Currency: AUD only (v1). Multi-currency deferred.
+
+### Booking → Payment sequence (paid game)
+1. Client calls `create-payment-intent` Edge Function with `{ gameID, userID, creditsToApply, currency }`.
+2. Edge Function creates Stripe PaymentIntent with `application_fee_amount` and `transfer_data.destination`.
+3. PaymentSheet presented. Client does NOT insert a booking row at this point.
+4. On Stripe `.completed`:
+   - Client calls `requestBooking` (new booking) or `confirmPendingBooking` (waitlist hold).
+   - Booking row is inserted with: `fee_paid=true`, `payment_method="stripe"`, `stripe_payment_intent_id`, `platform_fee_cents`, `club_payout_cents`, `credits_applied_cents`.
+5. On Stripe `.canceled` or `.failed`: do NOT insert a booking row; do NOT decrement credits.
+
+### Free game booking
+- No PaymentSheet. Client calls `requestBooking` directly. `fee_paid` is NOT set to true. `payment_method` is NULL.
+
+### Admin-added booking
+- Club owner or admin adds player via "Add Player" sheet.
+- `payment_method = "admin"`. Shown as "Comp" badge in UI.
+- No Stripe interaction.
+
+### Partial credit booking
+- If `creditBalance >= totalFee`: skip Stripe. Client calls `applyCredits` then `requestBooking` with `fee_paid=false`, `payment_method=NULL`, `credits_applied_cents=totalFee`.
+- If `creditBalance < totalFee`: PaymentIntent created for `(totalFee - creditBalance)`. On `.completed`, booking inserted and credits deducted.
+- NEVER pass `creditsAppliedCents = 0` to `requestBooking`. Pass `nil` when no credits are applied.
+
+
+---
+
+## 3. CREDIT SYSTEM
+
+### Scoping
+- Credits are **club-scoped**. A credit balance at Club A cannot be applied at Club B.
+- `player_credits` table: `UNIQUE(user_id, club_id, currency)` — one row per player per club.
+- NEVER use a global (non-club-scoped) credit balance. The old `creditBalanceCents: Int` global design is deprecated.
+
+### Credit Issuance (cancellation refund)
+- Eligible conditions:
+  - Game starts more than 6 hours from cancellation time.
+  - Booking was paid via Stripe (`fee_paid = true`) OR credits were applied (`credits_applied_cents > 0`).
+  - Refund amount > 0.
+- Refund amount:
+  - Card-paid: `platform_fee_cents + club_payout_cents + credits_applied_cents`
+  - Credit-only: `credits_applied_cents`
+  - Free or admin-added: 0 (no credit issued)
+- Credit issuance is idempotent — check for existing `credit_transactions` row with `reason='cancellation_refund'` and same `booking_id` before inserting.
+- Credits are issued as PATCH/INSERT on `player_credits` — NOT via the `issue_cancellation_credit` RPC through PostgREST (PGRST202 schema-cache failure; RPC exists in DB but is unreachable via PostgREST).
+
+### Credit Deduction (at checkout)
+- Credits deducted via direct PATCH on `player_credits`.
+- NOT via the `use_credits` RPC through PostgREST (same PGRST202 failure).
+- Atomic safety: PATCH includes filter `amount_cents=gte.{amountCents}` — rejects if balance insufficient.
+- Optimistic update: decrement `creditBalanceByClubID[clubID]` immediately on main thread; confirm with DB value after background task.
+- NEVER allow `player_credits.amount_cents` to go below 0.
+- Credits never expire (v1).
+
+### Credit Display
+- Show credit toggle only when: `game.fee > 0 AND creditBalance(for: clubID) > 0 AND canBook`.
+- Display net price inline: `max(0, totalFee - min(balance, totalFee))`.
+
+
+---
+
+## 4. WAITLIST
+
+### Promotion
+- Promotion is **server-authoritative**. Use `promote_waitlist_player` RPC.
+- RPC acquires a row-level lock on the game and the booking row to prevent race conditions.
+- RPC rejects if: game already full, booking no longer waitlisted, or another active `pending_payment` hold exists for the same game.
+- Only **one player** may hold `pending_payment` status per game at any time.
+- Free games: multi-promote all waitlisted players in a single pass. No hold needed.
+- Paid games: promote one player. Wait for payment confirmation or hold expiry before promoting the next.
+
+### Hold Window
+- Default: 30 minutes (`hold_expires_at = now() + '30 minutes'`).
+- `expire_waitlist_holds()` DB function reverts expired holds to `waitlisted` at `waitlist_position = 1`.
+- pg_cron runs `expire_waitlist_holds()` every 5 minutes.
+- On expiry: client shows "Spot hold expired" passive state + Refresh button. No automatic retry from client.
+
+### Promotion Notification
+- Server sends push notification to promoted player: "A spot opened — complete your booking".
+- Deep link opens game detail in "complete payment" state.
+
+
+---
+
+## 5. CANCELLATION
+
+### Rules
+- Cancellation within 6 hours of game start: no credit issued. Booking marked `cancelled`.
+- Cancellation more than 6 hours before start: credit issued (see Credit Issuance above).
+- `bookings.cancellation_reason`: `'player_cancelled'`, `'admin_cancelled'`, `'game_cancelled'`.
+- After cancellation: trigger `autoPromoteWaitlistIfPossible` to fill the vacated spot.
+- Game cancellation (admin cancels the whole game): all confirmed bookings cancelled with `cancellation_reason='game_cancelled'`. Push notification sent to all attendees.
+
+### Hard Constraints
+- NEVER cancel a booking without computing whether a credit is owed first.
+- NEVER issue a credit for a free game or admin-added booking (refund amount = 0).
+- NEVER issue a credit if the 6-hour window has passed.
+
+
+---
+
+## 6. SUBSCRIPTION ENTITLEMENTS
+
+### Tiers
+- `free` — default. No paid games. No Stripe Connect requirement. Limited game/member capacity.
+- `starter` — basic paid features. Stripe Connect required for paid games.
+- `pro` — full feature set including analytics, custom branding.
+- `enterprise` — custom limits (reserved).
+
+### Entitlement Checks
+- `clubs.subscription_tier` is the authoritative field for entitlement checks (denormalised from `club_subscriptions`).
+- Feature gates are enforced on the client AND backend Edge Functions.
+- Stripe subscription state is synced to `clubs.subscription_tier` via the `stripe-webhook` Edge Function.
+- Downgrade: existing data preserved; new paid game creation blocked until tier restored.
+
+### Subscription Payment
+- Club owner is billed via Stripe Subscription (not destination charges — separate flow).
+- One Stripe Customer per owner (`profiles.stripe_customer_id`), reused across multiple clubs.
+- `payment_behavior=default_incomplete`: subscription only activates after first payment succeeds.
+
+---
+
+## VIOLATION IMPACT
+- Inserting a booking before Stripe `.completed` → unconfirmed seats; real players locked out; potential double-booking.
+- Using a global credit balance → credits from Club A spendable at Club B; incorrect deductions.
+- Skipping the 6-hour window check → credits issued for same-day cancellations; financial loss.
+- Client-only promotion of waitlist → race conditions; multiple players believe they have the same spot.
+- Missing `payment_method` in booking SELECT queries → all attendees shown as "Unpaid" to admins.

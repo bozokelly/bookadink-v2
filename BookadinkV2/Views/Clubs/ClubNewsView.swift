@@ -22,6 +22,7 @@ struct ClubNewsView: View {
     @State private var showModerationQueue = false
     @State private var hiddenPostIDs: Set<UUID> = []
     @State private var localInfoMessage: String?
+    @State private var mentionCandidates: [ClubDirectoryMember] = []
 
     private var canPost: Bool {
         guard appState.authUserID != nil else { return false }
@@ -41,7 +42,6 @@ struct ClubNewsView: View {
     var body: some View {
         ScrollView {
           VStack(alignment: .leading, spacing: 12) {
-            headerCard
 
             if let error = appState.clubNewsError(for: club), !error.isEmpty {
                 HStack(spacing: 8) {
@@ -81,9 +81,7 @@ struct ClubNewsView: View {
                 )
             }
 
-            if let pushError = appState.remotePushRegistrationErrorMessage,
-               !appState.isClubChatMuted(for: club.id),
-               !pushError.isEmpty {
+            if let pushError = appState.remotePushRegistrationErrorMessage, !pushError.isEmpty {
                 HStack(spacing: 8) {
                     Image(systemName: "bell.slash")
                     Text(AppCopy.friendlyError(pushError))
@@ -257,9 +255,7 @@ struct ClubNewsView: View {
                 .environmentObject(appState)
         }
         .task(id: club.id) {
-            if !appState.isClubChatMuted(for: club.id) {
-                await appState.prepareClubChatPushNotificationsIfNeeded()
-            }
+            await appState.prepareClubChatPushNotificationsIfNeeded()
             appState.startClubChatRealtime(for: club, includeModeration: isClubModerator)
             if appState.clubNewsPosts(for: club).isEmpty {
                 await appState.refreshClubNews(for: club)
@@ -279,56 +275,16 @@ struct ClubNewsView: View {
             appState.stopClubChatRealtime(for: club)
             appState.startClubChatRealtime(for: club, includeModeration: newValue)
         }
-    }
-
-    private var headerCard: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(Brand.emeraldAction)
-                        .frame(width: 7, height: 7)
-                    Text("Club Chat")
-                        .font(.headline.weight(.semibold))
-                        .foregroundStyle(Brand.primaryText)
+        .toolbar {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                if !hiddenPostIDs.isEmpty {
+                    Button("Show Hidden") {
+                        hiddenPostIDs.removeAll()
+                        localInfoMessage = "Hidden posts restored."
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.primaryText)
                 }
-                Text("Live posts, photos, and replies synced with the website.")
-                    .font(.caption)
-                    .foregroundStyle(Brand.secondaryText)
-                    .lineLimit(2)
-            }
-            Spacer(minLength: 6)
-
-            if !hiddenPostIDs.isEmpty {
-                Button("Show Hidden") {
-                    hiddenPostIDs.removeAll()
-                    localInfoMessage = "Hidden posts restored."
-                }
-                .font(.caption.weight(.semibold))
-                .buttonStyle(.plain)
-                .foregroundStyle(Brand.primaryText)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(Brand.secondarySurface, in: Capsule())
-                .overlay(
-                    Capsule()
-                        .stroke(Brand.softOutline, lineWidth: 1)
-                )
-            }
-
-            HStack(spacing: 6) {
-                Button {
-                    appState.setClubChatMuted(!appState.isClubChatMuted(for: club.id), for: club.id)
-                } label: {
-                    Image(systemName: appState.isClubChatMuted(for: club.id) ? "bell.slash" : "bell.badge.fill")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(appState.isClubChatMuted(for: club.id) ? Brand.secondaryText : Brand.softOrangeAccent)
-                        .frame(width: 34, height: 34)
-                        .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                }
-                .buttonStyle(.plain)
-                .actionBorder(cornerRadius: 10, color: Brand.softOutline, lineWidth: 1)
-                .accessibilityLabel(appState.isClubChatMuted(for: club.id) ? "Enable club chat alerts" : "Disable club chat alerts")
 
                 if isClubModerator {
                     Button {
@@ -337,11 +293,7 @@ struct ClubNewsView: View {
                         Image(systemName: "shield.lefthalf.filled")
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(Brand.primaryText)
-                            .frame(width: 34, height: 34)
-                            .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     }
-                    .buttonStyle(.plain)
-                    .actionBorder(cornerRadius: 10, color: Brand.softOutline, lineWidth: 1)
                     .accessibilityLabel("Open moderation reports")
                 }
 
@@ -351,24 +303,19 @@ struct ClubNewsView: View {
                     Image(systemName: "arrow.clockwise")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Brand.primaryText)
-                        .frame(width: 34, height: 34)
-                        .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
-                .buttonStyle(.plain)
-                .actionBorder(cornerRadius: 10, color: Brand.softOutline, lineWidth: 1)
                 .accessibilityLabel("Refresh club chat")
             }
         }
-        .padding(12)
-        .background(Color.clear)
     }
+
 
     private var composerCard: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 12) {
                 let name = appState.profile?.fullName ?? ""
                 Circle()
-                    .fill(chatAvatarColor(for: name))
+                    .fill(AvatarGradients.resolveGradient(forKey: appState.profile?.avatarColorKey))
                     .overlay(
                         Text(chatInitials(name))
                             .font(.caption.weight(.bold))
@@ -384,11 +331,14 @@ struct ClubNewsView: View {
                             .font(.footnote)
                             .foregroundStyle(Color.secondary)
                     }
-                    TextField("Share an update with the club…", text: $postText, axis: .vertical)
+                    TextField("Share an update… use @ to mention a member", text: $postText, axis: .vertical)
                         .lineLimit(1...5)
                         .textInputAutocapitalization(.sentences)
                         .disabled(!canPost || appState.isPostingClubNews(for: club))
                         .font(.body)
+                        .onChange(of: postText) { _, newText in
+                            refreshMentionCandidates(for: newText)
+                        }
                 }
             }
             .padding(.horizontal, 14)
@@ -423,6 +373,15 @@ struct ClubNewsView: View {
                 .padding(.bottom, 6)
             }
 
+            if !mentionCandidates.isEmpty {
+                Divider()
+                mentionCandidateList(mentionCandidates) { member in
+                    guard let (_, atIdx) = activeMentionQuery(in: postText) else { return }
+                    postText = String(postText[..<atIdx]) + "@\(member.name) "
+                    mentionCandidates = []
+                }
+            }
+
             Divider()
 
             HStack(spacing: 10) {
@@ -447,8 +406,11 @@ struct ClubNewsView: View {
                     } label: {
                         HStack(spacing: 5) {
                             Image(systemName: "megaphone.fill")
-                            Text("Announce")
-                                .font(.caption.weight(.bold))
+                            if !isAnnouncementPost {
+                                Text("Announce")
+                                    .font(.caption.weight(.bold))
+                                    .lineLimit(1)
+                            }
                         }
                         .foregroundStyle(isAnnouncementPost ? .white : Brand.spicyOrange)
                         .padding(.horizontal, 10)
@@ -471,12 +433,13 @@ struct ClubNewsView: View {
                 Button {
                     Task { await submitPost() }
                 } label: {
-                    HStack(spacing: 6) {
+                    Group {
                         if appState.isPostingClubNews(for: club) {
                             ProgressView().tint(.white).controlSize(.small)
+                        } else {
+                            Text(isAnnouncementPost ? "Announce" : "Post")
+                                .font(.subheadline.weight(.semibold))
                         }
-                        Text(appState.isPostingClubNews(for: club) ? "Posting…" : "Post")
-                            .font(.subheadline.weight(.semibold))
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, 14)
@@ -580,20 +543,105 @@ extension ClubNewsView {
             await appState.refreshClubNewsModerationReports(for: club)
         }
     }
+
+    private func refreshMentionCandidates(for text: String) {
+        guard let (query, _) = activeMentionQuery(in: text) else {
+            mentionCandidates = []
+            return
+        }
+        if appState.clubDirectoryMembers(for: club).isEmpty && !appState.isLoadingClubDirectory(for: club) {
+            Task { await appState.refreshClubDirectoryMembers(for: club) }
+        }
+        let currentUserID = appState.authUserID
+        let allMembers = appState.clubDirectoryMembers(for: club).filter { $0.id != currentUserID }
+        mentionCandidates = filterMentionCandidates(allMembers, query: query)
+    }
 }
 
 // MARK: - Chat Helpers
-
-private func chatAvatarColor(for name: String) -> Color {
-    let palette: [Color] = [Brand.pineTeal, Brand.slateBlue, Brand.spicyOrange, Brand.emeraldAction, Brand.brandPrimary]
-    let hash = name.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
-    return palette[abs(hash) % palette.count]
-}
 
 private func chatInitials(_ name: String) -> String {
     let parts = name.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ")
     let chars = parts.prefix(2).compactMap(\.first)
     return chars.isEmpty ? "?" : String(chars).uppercased()
+}
+
+// MARK: - Mention Helpers
+
+/// Returns the active mention query and the index of the `@` character if the text
+/// ends with an open `@mention` (i.e. `@` at start or after whitespace, followed only
+/// by name-valid characters — letters, spaces, hyphens, apostrophes).
+private func activeMentionQuery(in text: String) -> (query: String, atIndex: String.Index)? {
+    guard !text.isEmpty else { return nil }
+    var i = text.endIndex
+    while i > text.startIndex {
+        i = text.index(before: i)
+        guard text[i] == "@" else { continue }
+        let precededByStartOrSpace = i == text.startIndex || text[text.index(before: i)].isWhitespace
+        guard precededByStartOrSpace else { return nil }
+        let afterAt = text.index(after: i)
+        let query = String(text[afterAt...])
+        let validScalars = CharacterSet.letters
+            .union(.whitespaces)
+            .union(CharacterSet(charactersIn: "-'\u{2019}"))
+        guard query.unicodeScalars.allSatisfy({ validScalars.contains($0) }) else { return nil }
+        return (query, i)
+    }
+    return nil
+}
+
+/// Filters members whose name starts with `query` (case-insensitive) or whose last
+/// name starts with `query`. Returns at most 5 results; returns the first 5 when
+/// `query` is empty (just typed `@`).
+private func filterMentionCandidates(_ members: [ClubDirectoryMember], query: String) -> [ClubDirectoryMember] {
+    let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+    if q.isEmpty { return Array(members.prefix(5)) }
+    return members
+        .filter { m in
+            let name = m.name.lowercased()
+            return name.hasPrefix(q) || name.contains(" \(q)")
+        }
+        .prefix(5)
+        .map { $0 }
+}
+
+/// Inline autocomplete list shown inside composer cards when `@mention` is active.
+@ViewBuilder
+private func mentionCandidateList(
+    _ candidates: [ClubDirectoryMember],
+    onSelect: @escaping (ClubDirectoryMember) -> Void
+) -> some View {
+    VStack(spacing: 0) {
+        ForEach(candidates) { member in
+            Button { onSelect(member) } label: {
+                HStack(spacing: 10) {
+                    Circle()
+                        .fill(AvatarGradients.resolveGradient(forKey: member.avatarColorKey))
+                        .overlay(
+                            Text(chatInitials(member.name))
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white)
+                        )
+                        .frame(width: 30, height: 30)
+                    Text(member.name)
+                        .font(.subheadline)
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    Image(systemName: "at")
+                        .font(.caption)
+                        .foregroundStyle(Brand.pineTeal)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if member.id != candidates.last?.id {
+                Divider().padding(.leading, 54)
+            }
+        }
+    }
+    .background(Color(.systemBackground))
 }
 
 // MARK: - Post Card
@@ -605,6 +653,7 @@ private struct ClubNewsPostCard: View {
     let isClubModerator: Bool
     // Draft is owned by the card — typing here no longer re-renders sibling cards
     @State private var commentDraft: String = ""
+    @State private var commentMentionCandidates: [ClubDirectoryMember] = []
     let onLike: () -> Void
     let onComment: (_ text: String, _ parentCommentID: UUID?) -> Void
     let onDelete: () -> Void
@@ -642,7 +691,7 @@ private struct ClubNewsPostCard: View {
             // Author row
             HStack(alignment: .top, spacing: 10) {
                 Circle()
-                    .fill(chatAvatarColor(for: post.authorName))
+                    .fill(AvatarGradients.resolveGradient(forKey: post.avatarColorKey))
                     .overlay(
                         Text(initials(post.authorName))
                             .font(.caption.weight(.bold))
@@ -672,7 +721,13 @@ private struct ClubNewsPostCard: View {
             }
 
             // Post body
-            if !post.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if post.content.hasPrefix(sessionResultSentinel) {
+                let jsonStr = String(post.content.dropFirst(sessionResultSentinel.count))
+                if let data = jsonStr.data(using: .utf8),
+                   let payload = try? JSONDecoder().decode(SessionResultPayload.self, from: data) {
+                    SessionResultChatCardView(payload: payload)
+                }
+            } else if !post.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text(post.content)
                     .font(.body)
                     .foregroundStyle(.primary)
@@ -743,14 +798,26 @@ private struct ClubNewsPostCard: View {
                 }
             }
 
+            // Mention autocomplete for reply composer
+            if !commentMentionCandidates.isEmpty {
+                mentionCandidateList(commentMentionCandidates) { member in
+                    guard let (_, atIdx) = activeMentionQuery(in: commentDraft) else { return }
+                    commentDraft = String(commentDraft[..<atIdx]) + "@\(member.name) "
+                    commentMentionCandidates = []
+                }
+            }
+
             // Reply composer
             HStack(spacing: 8) {
-                TextField("Write a reply…", text: $commentDraft)
+                TextField("Write a reply… use @ to mention", text: $commentDraft)
                     .textInputAutocapitalization(.sentences)
                     .font(.subheadline)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
                     .background(Color(.systemGray6), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .onChange(of: commentDraft) { _, newText in
+                        refreshCommentMentionCandidates(for: newText)
+                    }
 
                 Button {
                     let text = commentDraft
@@ -814,6 +881,19 @@ private struct ClubNewsPostCard: View {
         return chars.isEmpty ? "M" : String(chars)
     }
 
+    private func refreshCommentMentionCandidates(for text: String) {
+        guard let (query, _) = activeMentionQuery(in: text) else {
+            commentMentionCandidates = []
+            return
+        }
+        if appState.clubDirectoryMembers(for: club).isEmpty && !appState.isLoadingClubDirectory(for: club) {
+            Task { await appState.refreshClubDirectoryMembers(for: club) }
+        }
+        let currentUserID = appState.authUserID
+        let allMembers = appState.clubDirectoryMembers(for: club).filter { $0.id != currentUserID }
+        commentMentionCandidates = filterMentionCandidates(allMembers, query: query)
+    }
+
     private var threadedComments: (topLevel: [ClubNewsComment], repliesByParent: [UUID: [ClubNewsComment]]) {
         let all = post.comments.sorted { lhs, rhs in
             (lhs.createdAt ?? .distantPast) < (rhs.createdAt ?? .distantPast)
@@ -838,7 +918,7 @@ private struct ClubNewsPostCard: View {
     private func commentRow(_ comment: ClubNewsComment, isReply: Bool) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Circle()
-                .fill(chatAvatarColor(for: comment.authorName))
+                .fill(AvatarGradients.resolveGradient(forKey: comment.avatarColorKey))
                 .overlay(
                     Text(initials(comment.authorName))
                         .font(.caption2.weight(.bold))
@@ -1362,6 +1442,153 @@ private struct CameraCaptureView: UIViewControllerRepresentable {
             let image = info[.originalImage] as? UIImage
             onCapture(image)
             dismiss()
+        }
+    }
+}
+
+// MARK: - Session Result Chat Card
+
+private struct SessionResultChatCardView: View {
+    let payload: SessionResultPayload
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            headerSection
+            Divider()
+                .padding(.vertical, 12)
+            roundsSection
+            if let champ = payload.champion, let label = payload.championLabel {
+                Divider()
+                    .padding(.vertical, 12)
+                championSection(name: champ, label: label)
+            }
+        }
+        .padding(14)
+        .background(
+            Color(.secondarySystemBackground),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color(.separator).opacity(0.4), lineWidth: 0.5)
+        )
+    }
+
+    // MARK: Header
+
+    private var headerSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text("🏓")
+                    .font(.caption)
+                Text("Session Results")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(payload.gameTitle)
+                .font(.headline)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(payload.subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Rounds
+
+    private var roundsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            ForEach(payload.rounds, id: \.number) { round in
+                roundView(round)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func roundView(_ round: SessionResultPayload.SRRound) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Round \(round.number)")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .tracking(0.4)
+
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(round.courts, id: \.courtNumber) { court in
+                    courtView(court)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func courtView(_ court: SessionResultPayload.SRCourt) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if court.showLabel {
+                Text("COURT \(court.courtNumber)")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .tracking(0.8)
+                    .padding(.bottom, 1)
+            }
+            if let match = court.result {
+                matchRow(names: match.topNames, score: match.topScore, isWinner: match.topIsWinner)
+                matchRow(names: match.bottomNames, score: match.bottomScore, isWinner: match.bottomIsWinner)
+            } else {
+                Text("No result recorded")
+                    .font(.subheadline)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func matchRow(names: String, score: Int, isWinner: Bool) -> some View {
+        HStack(spacing: 0) {
+            Text(names)
+                .font(.subheadline.weight(isWinner ? .semibold : .regular))
+                .foregroundStyle(isWinner ? Color.primary : Color.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 0) {
+                Text("\(score)")
+                    .font(.subheadline.weight(isWinner ? .bold : .regular))
+                    .foregroundStyle(isWinner ? Color.primary : Color.secondary)
+                    .monospacedDigit()
+                    .frame(width: 26, alignment: .trailing)
+
+                if isWinner {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Brand.emeraldAction)
+                        .frame(width: 22)
+                } else {
+                    Spacer()
+                        .frame(width: 22)
+                }
+            }
+        }
+    }
+
+    // MARK: Champion
+
+    @ViewBuilder
+    private func championSection(name: String, label: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("🏆")
+                .font(.body)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label.uppercased())
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .tracking(0.4)
+                Text(name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }

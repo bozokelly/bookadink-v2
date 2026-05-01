@@ -1,0 +1,313 @@
+# Analytics System — BookaDink
+
+Last hardened: 2026-04-24 (revenue breakdown pass + hardening pass)
+
+## Metric Dictionary
+
+### Dashboard Summary (all tiers, no Pro gate)
+
+| Metric | Source Table | Formula | Scope | RPC |
+|--------|-------------|---------|-------|-----|
+| Total Members | club_members | COUNT(*) WHERE status='approved' | club_id | get_club_dashboard_summary |
+| Member Growth 30d | club_members | COUNT(*) WHERE status='approved' AND requested_at >= 30d ago | club_id | ^ |
+| Monthly Active Players | bookings + games | COUNT(DISTINCT user_id) on confirmed bookings, past games, last 30d | club_id | ^ |
+| Prev Active Players | bookings + games | Same, 30–60 days ago | club_id | ^ |
+| Fill Rate 30d | bookings + games | SUM(confirmed) / SUM(max_spots) for past games with max_spots > 0, last 30d; NULL if none | club_id | ^ |
+| Prev Fill Rate 30d | bookings + games | Same, 30–60 days ago | club_id | ^ |
+| Upcoming Bookings | bookings + games | COUNT(*) confirmed on future non-cancelled games | club_id | ^ |
+
+### KPIs (Pro plan — analytics_access = true)
+
+| Metric | Source Table | Formula | Where Computed | RPC |
+|--------|-------------|---------|---------------|-----|
+| Revenue (Club Net) | bookings | SUM(club_payout_cents) WHERE payment_method='stripe', confirmed, curr period | DB | get_club_analytics_kpis |
+| Gross Revenue | bookings | SUM(platform_fee_cents + club_payout_cents) WHERE payment_method='stripe', confirmed | DB | ^ |
+| Platform Fee | bookings | SUM(platform_fee_cents) WHERE payment_method='stripe', confirmed | DB | ^ |
+| Credits Used | bookings | SUM(credits_applied_cents) on all confirmed bookings | DB | ^ |
+| Refunded (Cancelled) | bookings | SUM(platform_fee_cents + club_payout_cents) WHERE status='cancelled' AND fee_paid=true AND payment_method='stripe' | DB | ^ |
+| Bookings | bookings | COUNT(DISTINCT id) WHERE status='confirmed', curr period | DB | ^ |
+| Fill Rate | bookings + games | SUM(confirmed) / SUM(max_spots) across games with max_spots > 0 | DB | ^ |
+| Active Players | bookings | COUNT(DISTINCT user_id) WHERE status='confirmed' | DB | ^ |
+| Cancellation Rate | bookings | COUNT(cancelled) / COUNT(all) on curr period games | DB | ^ |
+| Repeat Player Rate | bookings | COUNT(players with 2+ games) / COUNT(distinct users) in curr period | DB | ^ |
+| Avg per Player | bookings | SUM(club_payout_cents) / COUNT(DISTINCT paying users), Stripe only | DB | get_club_analytics_supplemental |
+| Paid Bookings | bookings | COUNT(*) WHERE payment_method='stripe', confirmed | DB | ^ |
+| Free/Comp Bookings | bookings | COUNT(*) WHERE payment_method IS NOT 'stripe', confirmed | DB | ^ |
+| No-show Rate | game_attendance | no_show_count / checked_count — NULL when no attendance rows | **DB** | ^ |
+| Waitlist | bookings | COUNT(*) WHERE status='waitlisted' on curr period games (future + past) | DB | ^ |
+| Games Hosted | games | COUNT(*) non-cancelled past games in curr period | DB | ^ |
+| New Players | bookings | COUNT DISTINCT users whose first-ever confirmed booking at this club falls in curr period | DB | ^ |
+
+### Revenue Trend (Pro)
+
+| Bucket | Source | Revenue Formula | Booking Count | Fill Rate | Game Filter |
+|--------|--------|----------------|---------------|-----------|------------|
+| Daily (≤30d) | bookings + games | SUM(club_payout_cents) WHERE payment_method='stripe', confirmed | SUM(confirmed) | SUM(conf)/SUM(spots) | past games only (date_time <= now()) |
+| Weekly (>30d) | bookings + games | Same, DATE_TRUNC('week') | Same | Same | past games only |
+
+Trend chart sums reconcile exactly with KPI totals for the same period — both filter `date_time <= now()`.
+
+### Top Games (Pro)
+
+Filters: past games (date_time < now()), non-cancelled, within p_days.
+Ordered by: confirmed_count DESC, fill_rate DESC. Top 5.
+Revenue = club_payout_cents (net), Stripe only.
+
+### Peak Times (Pro)
+
+Groups past games by DOW + hour. AVG(confirmed_count) per slot. Top 5 by avg_confirmed DESC.
+
+---
+
+## Source of Truth
+
+| Data | Authoritative Source | Notes |
+|------|---------------------|-------|
+| Revenue (net) | bookings.club_payout_cents | Set at payment-intent creation |
+| Platform fee | bookings.platform_fee_cents | Set at payment-intent creation |
+| Gross player payment | platform_fee_cents + club_payout_cents | Computed in DB |
+| Credits | bookings.credits_applied_cents | Set at booking creation |
+| Cancelled revenue | bookings WHERE status='cancelled' AND fee_paid=true AND payment_method='stripe' | Gross that was refunded as credits |
+| Membership | club_members.requested_at | Join proxy; removals NOT tracked |
+| Attendance / no-show | game_attendance | Opt-in only — not populated for all games |
+| Active players | bookings.user_id (confirmed only) | |
+
+---
+
+## Revenue Formulas
+
+```
+Gross Revenue     = SUM(platform_fee_cents + club_payout_cents)  [Stripe confirmed]
+Platform Fee      = SUM(platform_fee_cents)                       [Stripe confirmed]
+Club Net Payout   = SUM(club_payout_cents)                        [Stripe confirmed]
+Credits Used      = SUM(credits_applied_cents)                    [all confirmed — Stripe + credit-only]
+Refunded          = SUM(platform_fee_cents + club_payout_cents)   [cancelled + fee_paid=true + Stripe]
+Free Booking Rev  = $0 (counts as booking, never as revenue)
+```
+
+Invariant: `Gross Revenue - Platform Fee = Club Net Payout` (for Stripe bookings).
+Invariant: `Credits Used` and `Gross Revenue` are mutually independent — credits on Stripe bookings are already counted in Credits Used via credits_applied_cents; the Stripe portion is in Gross.
+
+---
+
+## Booking State Transitions — Analytics Impact
+
+| Transition | Revenue Impact | Booking Count | Credits |
+|-----------|---------------|---------------|---------|
+| waitlisted → confirmed (free) | None | +1 confirmed | None |
+| waitlisted → confirmed (Stripe) | +gross at payment time | +1 confirmed | None |
+| waitlisted → confirmed (credits only) | None | +1 confirmed, +1 free | +credits_applied |
+| confirmed (Stripe) → cancelled | -gross moves to Refunded | -1 confirmed | Refunded to player_credits |
+| confirmed (Stripe, < 6h window) → cancelled | -gross moves to Refunded | -1 confirmed | No credit issued |
+| confirmed (credit-only) → cancelled (> 6h) | None | -1 confirmed | Credits restored to player_credits |
+| cancelled game | All bookings excluded (games.status='cancelled' filter) | 0 | N/A |
+
+Idempotency: The `Refunded` metric counts cancelled bookings (status='cancelled') — not credits issued. A booking cancelled twice is impossible (status can only move to cancelled once). Double-counting cannot occur.
+
+---
+
+## Refresh Rules
+
+| Trigger | Signal | Refresh Path |
+|---------|--------|-------------|
+| View appears | — | `.task` in ClubAnalyticsDashboardView |
+| Period changed | — | `.onChange(of: period)` |
+| Cancellation confirmed | `appState.lastCancellationCredit` | `.onChange` → reload |
+| Confirmed booking created | `appState.lastConfirmedBookingClubID` | `.onChange` → reload (club-scoped) |
+| Attendance upsert/delete | `appState.lastAttendanceUpdateClubID` | `.onChange` → reload (club-scoped) |
+| App returns to foreground | `scenePhase == .active` | `.onChange(of: scenePhase)` → reload |
+| Pull-to-refresh | — | Not wired — analytics has no `.refreshable` |
+
+All refresh paths call `fetchClubAdvancedAnalytics(for:days:)` which is guard-gated to skip re-entrant calls (`loadingAnalyticsClubIDs`).
+
+---
+
+## Known Exclusions / Limitations
+
+- **Member removals not tracked**: member_growth_30d counts additions only via requested_at. Net-negative growth is not surfaced.
+- **No-show rate requires opt-in check-in**: game_attendance is not populated for games where the admin didn't use check-in. Rate shows "—" when no attendance rows exist for the period.
+- **Waitlist count includes future games**: it signals live demand, not purely historical activity.
+- **Refunded = gross lost as credits, not Stripe refunds**: BookaDink cancellations return money as club credits, not Stripe refunds. The metric shows what left retained revenue — not what returned to a card.
+- **Credit issuance not transaction-logged**: player_credits stores current balance only. Total credits issued per period cannot be summed accurately. "Credits Used" = sum of credits_applied_cents on confirmed bookings (not credits returned).
+- **Trend revenue = net club payout**: the chart shows club_payout_cents, not gross. No gross revenue trend is available.
+- **Custom date range**: the view computes `activeStartDate = startOfDay(customStartDate)` and `activeEndDate = startOfDay(customEndDate) + 1 day` (exclusive upper bound), then passes them as `p_start_date`/`p_end_date` TIMESTAMPTZ to all 5 RPCs. The DB resolves `v_range_start = p_start_date`, `v_range_end = p_end_date`, and caps retrospective metrics at `LEAST(v_range_end, now())`. For preset ranges (7d, 30d, 90d), both params are nil and the DB anchors from `now() - p_days`. Custom range accuracy is exact when both dates are in the past; future end dates are clamped to now().
+- **No all-time option**: analytics always requires a finite window for prior-period comparison.
+- **Currency defaults to AUD**: falls back when no Stripe paid booking exists in club history.
+- **Timezone — filtering vs grouping**: range predicates (`g.date_time >= v_range_start`) always operate on raw UTC TIMESTAMPTZ — mathematically exact regardless of timezone. Bucket *assignment* for the trend chart (day/week) and peak-times (DOW + hour) uses `g.date_time AT TIME ZONE v_tz` where `v_tz` is the club's IANA timezone identifier (`clubs.timezone`, set from `TimeZone.current.identifier` at creation; fallback `'Australia/Perth'`). An invalid or empty `clubs.timezone` is caught by a `pg_timezone_names` guard and falls back silently. KPI totals are unaffected by timezone (no date grouping); SUM reconciliation between trend and KPIs is preserved.
+
+---
+
+## Phase 5A Dead Code
+
+`get_club_revenue_summary` and `get_club_fill_rate_summary` RPCs (migrations 20260406_*) exist in the DB and are implemented in SupabaseService + AppState (`revenueSummaryByClubID`, `fillRateSummaryByClubID`), but are NOT called from any view. These are Phase 5A artifacts fully superseded by Phase 5B RPCs. Safe to ignore; do not wire them up — they lack the credits and refunded metrics added in Phase 5B.
+
+---
+
+## Access Control (defense-in-depth)
+
+1. **iOS FeatureGateService** — blocks non-Pro users at the view layer; shows demo data
+2. **AppState.fetchClubAdvancedAnalytics** — skips fetch when `analyticsLocked`
+3. **SQL SECURITY DEFINER functions** — enforce owner/admin check + analytics_access entitlement before touching any row
+4. **RLS** — bookings, games, club_members have RLS; SECURITY DEFINER bypasses RLS but applies its own explicit auth checks
+
+### Entitlement source chain (authoritative order)
+
+1. `club_subscriptions.plan_type + status` — Stripe-managed, set by stripe-webhook Edge Function
+2. `clubs.subscription_tier` — denormalized fallback; written only by service_role Edge Functions; used by `derive_club_entitlements` when no active Stripe subscription row exists
+3. `club_entitlements` table — output of `derive_club_entitlements`; the only table iOS reads
+4. `AppState.entitlementsByClubID` — in-memory cache; populated by `fetchClubEntitlements` on dashboard open + subscription actions + foreground return
+
+---
+
+## Required DB Migrations (in order)
+
+| File | Purpose |
+|------|---------|
+| 20260417_analytics_rpcs.sql | Core KPI, trend, top games, peak times RPCs |
+| 20260419_club_dashboard_summary.sql | Lightweight dashboard summary RPC (all tiers) |
+| 20260419_analytics_supplemental.sql | Operational metrics (initial version) |
+| 20260419_analytics_kpis_always_1_row.sql | Fix: KPI always returns 1 row (FROM (SELECT 1) guard) |
+| 20260424_analytics_revenue_breakdown.sql | Adds gross revenue, platform fee, credits, cancelled gross + fixes prev_revenue Stripe filter |
+| 20260424_analytics_hardening.sql | Fixes trend upper bound (past games only) + moves no-show rate into DB |
+| 20260424_analytics_custom_range.sql | All 5 RPCs accept optional p_start_date/p_end_date TIMESTAMPTZ; preset ranges (nil params) unchanged |
+| 20260424_analytics_tz_grouping.sql | trend + peak-times use clubs.timezone for bucket assignment; filtering stays UTC; KPI totals unchanged |
+
+---
+
+## Audit SQL Queries
+
+Use these in the Supabase SQL Editor to verify UI numbers against direct table totals.
+
+### Verify Revenue KPIs (replace clubid and days)
+```sql
+-- Gross, net, platform fee, credits for a club in last 30 days
+WITH games AS (
+  SELECT id FROM games
+  WHERE club_id = '<club_id>'
+    AND status != 'cancelled'
+    AND date_time >= now() - INTERVAL '30 days'
+    AND date_time <= now()
+),
+conf AS (
+  SELECT * FROM bookings
+  WHERE status = 'confirmed' AND game_id IN (SELECT id FROM games)
+)
+SELECT
+  SUM(COALESCE(platform_fee_cents,0) + COALESCE(club_payout_cents,0))
+    FILTER (WHERE payment_method='stripe')                         AS gross_revenue_cents,
+  SUM(COALESCE(club_payout_cents,0))
+    FILTER (WHERE payment_method='stripe')                         AS net_revenue_cents,
+  SUM(COALESCE(platform_fee_cents,0))
+    FILTER (WHERE payment_method='stripe')                         AS platform_fee_cents,
+  SUM(COALESCE(credits_applied_cents,0))                          AS credits_used_cents,
+  COUNT(*) FILTER (WHERE payment_method='stripe')                  AS paid_bookings,
+  COUNT(*) FILTER (WHERE payment_method IS DISTINCT FROM 'stripe') AS free_bookings,
+  COUNT(DISTINCT user_id)                                          AS active_players
+FROM conf;
+```
+
+### Verify Refunded (Cancelled Paid Bookings)
+```sql
+WITH games AS (
+  SELECT id FROM games
+  WHERE club_id = '<club_id>'
+    AND status != 'cancelled'
+    AND date_time >= now() - INTERVAL '30 days'
+    AND date_time <= now()
+)
+SELECT
+  COUNT(*)                                                         AS cancelled_paid_count,
+  SUM(COALESCE(platform_fee_cents,0) + COALESCE(club_payout_cents,0)) AS cancelled_gross_cents
+FROM bookings
+WHERE status = 'cancelled'
+  AND fee_paid = true
+  AND payment_method = 'stripe'
+  AND game_id IN (SELECT id FROM games);
+```
+
+### Verify No-show Rate
+```sql
+SELECT
+  COUNT(*) FILTER (WHERE attendance_status = 'no_show') AS no_show_count,
+  COUNT(*)                                               AS checked_count,
+  ROUND(
+    COUNT(*) FILTER (WHERE attendance_status = 'no_show')::NUMERIC
+    / NULLIF(COUNT(*), 0), 4
+  )                                                      AS no_show_rate
+FROM game_attendance
+WHERE game_id IN (
+  SELECT id FROM games
+  WHERE club_id = '<club_id>'
+    AND status != 'cancelled'
+    AND date_time >= now() - INTERVAL '30 days'
+    AND date_time < now()
+);
+```
+
+### Verify Trend Reconciles with KPI (sum of daily buckets = KPI total)
+```sql
+-- Should match net_revenue_cents from KPI query above
+WITH games AS (
+  SELECT id, date_time::DATE AS d FROM games
+  WHERE club_id = '<club_id>'
+    AND status != 'cancelled'
+    AND date_time >= now() - INTERVAL '30 days'
+    AND date_time <= now()
+)
+SELECT SUM(COALESCE(b.club_payout_cents,0)) AS trend_total_net_cents
+FROM bookings b
+JOIN games g ON g.id = b.game_id
+WHERE b.status = 'confirmed' AND b.payment_method = 'stripe';
+```
+
+### Verify Fill Rate
+```sql
+WITH games AS (
+  SELECT id, max_spots FROM games
+  WHERE club_id = '<club_id>'
+    AND status != 'cancelled'
+    AND date_time >= now() - INTERVAL '30 days'
+    AND date_time <= now()
+    AND max_spots IS NOT NULL AND max_spots > 0
+),
+fills AS (
+  SELECT g.max_spots, COUNT(b.id) AS conf
+  FROM games g
+  LEFT JOIN bookings b ON b.game_id = g.id AND b.status = 'confirmed'
+  GROUP BY g.id, g.max_spots
+)
+SELECT
+  SUM(conf) AS total_confirmed,
+  SUM(max_spots) AS total_capacity,
+  ROUND(SUM(conf)::NUMERIC / NULLIF(SUM(max_spots), 0), 4) AS fill_rate
+FROM fills;
+```
+
+### Verify Club Isolation (no cross-club leakage)
+```sql
+-- Should return 0 for any club other than the one queried
+SELECT COUNT(*) FROM bookings b
+JOIN games g ON g.id = b.game_id
+WHERE g.club_id != '<club_id>'
+  AND b.game_id IN (
+    SELECT id FROM games WHERE club_id = '<club_id>'
+  );
+```
+
+---
+
+## Test Cases
+
+| Scenario | Gross Revenue | Net Revenue | Platform Fee | Credits Used | Refunded | Bookings |
+|----------|--------------|-------------|-------------|-------------|---------|---------|
+| No bookings | $0 | $0 | $0 | $0 | $0 | 0 |
+| Free booking only | $0 | $0 | $0 | $0 | $0 | 1 (free) |
+| Paid booking ($10 fee, $1 platform, $9 payout) | $10 | $9 | $1 | $0 | $0 | 1 (paid) |
+| Paid booking cancelled (> 6h) | $0 | $0 | $0 | $0 | $10 | 0 confirmed |
+| Paid booking cancelled (< 6h) | $0 | $0 | $0 | $0 | $10 | 0 confirmed |
+| Credit-only booking ($5 credit) | $0 | $0 | $0 | $5 | $0 | 1 (free) |
+| Partial credits + Stripe ($3 credit, $7 Stripe, $0.70 fee, $6.30 payout) | $7 | $6.30 | $0.70 | $3 | $0 | 1 (paid) |
+| Waitlisted booking | $0 | $0 | $0 | $0 | $0 | 0 confirmed |
+| Cancelled game | All excluded by games.status filter | | | | | |
+| No-show (attended=1, no_show=2) | n/a | n/a | n/a | n/a | n/a | no_show_rate=0.6667 |
+| Multi-club admin (clubs A + B) | Each club returns only its own data | | | | | |

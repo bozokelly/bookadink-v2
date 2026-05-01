@@ -1,0 +1,202 @@
+# android_test_matrix.me
+# Purpose: Defines the parity test cases required to validate Android v1. Covers
+#          happy path, failure path, stale state, race condition, and recovery
+#          scenarios. All test cases are mapped to system_contracts.me,
+#          edge_cases.me, and ux_parity.me.
+# Scope: Android v1. Manual QA and automated test targets.
+
+---
+
+## TEST PHILOSOPHY
+
+Android v1 must produce identical outcomes to iOS for every in-scope flow.
+A test passes when:
+1. The correct data is written to Supabase.
+2. The user sees the correct state defined in `ux_parity.me`.
+3. The correct error message appears on failure (exact copy from `ux_parity.me §13`).
+
+Tests are grouped by: Happy Path | Failure Path | Stale State | Race Condition | Recovery.
+
+---
+
+## 1. AUTHENTICATION
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| A1 | Sign up with new email | Account created; profile row inserted; user lands on Home | — |
+| A2 | Sign in with existing email + password | Session restored; auth bootstrap completes; MainTabView shown | `client_guardrails.me §7` |
+| A3 | Sign in with wrong password | "Invalid email or password" shown; no navigation | — |
+| A4 | App relaunch with valid session | User auto-authenticated; no sign-in screen shown | — |
+| A5 | App relaunch with expired session | Sign-in screen shown; no crash | — |
+| A6 | Sign out | Session cleared; sign-in screen shown; all cached state cleared | — |
+
+---
+
+## 2. BOOKING — FREE GAMES
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| B1 | Book a free game with spots available | Booking row inserted (`status=confirmed`, `fee_paid=false`, `payment_method=null`); CTA changes to "Booked" | `system_contracts.me §2` |
+| B2 | Book a free game that is full | User placed on waitlist (`status=waitlisted`); waitlist position shown | `system_contracts.me §1` |
+| B3 | Cancel a confirmed free booking | Booking `status=cancelled`; CTA resets to "Book Now"; no credit issued | `system_contracts.me §5` |
+| B4 | Two users book the last spot simultaneously | One succeeds; one receives "game is full" and is placed on waitlist | `edge_cases.me §1` |
+| B5 | Double-tap on "Book Now" button | Only one booking row inserted; second tap is ignored; UI shows "Booked" | `edge_cases.me §1` |
+| B6 | Waitlist player auto-promoted (free game) | Player's status changes to `confirmed`; spot fills; next in waitlist re-queued if further spots open | `system_contracts.me §4` |
+
+---
+
+## 3. BOOKING — PAID GAMES
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| P1 | Book a paid game; complete Stripe payment | PaymentSheet shown; on `.completed`, booking inserted with `fee_paid=true`, `payment_method="stripe"`, `stripe_payment_intent_id`, `platform_fee_cents`, `club_payout_cents` | `system_contracts.me §2` |
+| P2 | Book a paid game; cancel Stripe PaymentSheet | No booking row inserted; no credits decremented; CTA resets to "Book · $X.XX" | `system_contracts.me §2`, `edge_cases.me §1` |
+| P3 | Book a paid game; Stripe payment fails | No booking row inserted; "Payment failed. Please try again." shown | `ux_parity.me §13` |
+| P4 | Book a paid game fully covered by credits | PaymentSheet NOT shown; booking inserted with `credits_applied_cents=totalFee`; credit balance decremented | `system_contracts.me §3` |
+| P5 | Book a paid game partially covered by credits | PaymentSheet shown for net amount; on `.completed`, booking inserted with both `credits_applied_cents` and `platform_fee_cents` set | `system_contracts.me §2` |
+| P6 | Credit deduction fails (balance drops between read and write) | "Could not apply credits. Please try again." shown; booking not inserted | `edge_cases.me §3` |
+| P7 | Network lost after Stripe `.completed`, before booking insert | Retry UI shown; booking can be retried with same PaymentIntent ID | `edge_cases.me §1` |
+
+---
+
+## 4. WAITLIST — PAID GAMES
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| W1 | Player joins waitlist on full paid game | `status=waitlisted`, `waitlist_position` set; no payment taken | `system_contracts.me §4` |
+| W2 | Server promotes player to `pending_payment` | FCM push received; game detail shows "Complete Booking · $X.XX"; hold countdown starts | `system_contracts.me §4`, `ux_parity.me §6` |
+| W3 | Player completes payment within hold window | Booking transitions to `confirmed`; credits deducted if applied | `system_contracts.me §4` |
+| W4 | Hold expires before player pays | `pending_payment` reverted to `waitlisted` at position 1; UI shows "Spot hold expired" + Refresh | `system_contracts.me §4`, `ux_parity.me §3` |
+| W5 | Two admins trigger promotion simultaneously | Only one promotion succeeds (RPC row lock); second returns FALSE; only one FCM push sent | `edge_cases.me §2`, `backend_authority.me §2` |
+| W6 | Player cancels during hold window | Booking `status=cancelled`; no credit issued (never paid); next waitlisted player promoted | `edge_cases.me §2` |
+| W7 | Player in `pending_payment` opens app after hold expires | UI shows "Spot hold expired" (not countdown); Refresh button visible | `ux_parity.me §3` |
+
+---
+
+## 5. CANCELLATION AND CREDITS
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| C1 | Cancel a paid booking > 6h before game | Credit issued for `platform_fee_cents + club_payout_cents + credits_applied_cents`; credit sheet shown with amount and new balance | `system_contracts.me §5`, `ux_parity.me §5` |
+| C2 | Cancel a paid booking ≤ 6h before game | Booking cancelled; NO credit issued; pre-cancel warning was shown; no credit sheet shown | `system_contracts.me §5`, `ux_parity.me §5` |
+| C3 | Cancel a free booking | Booking cancelled; no credit; no credit sheet | `system_contracts.me §5` |
+| C4 | Cancel a credit-only booking > 6h before game | Credit issued for `credits_applied_cents` only | `system_contracts.me §5` |
+| C5 | Cancellation credit issued twice (network retry) | Only one credit transaction inserted (`credit_transactions` unique constraint prevents duplicate) | `edge_cases.me §3` |
+| C6 | Credit balance display after cancellation | `creditBalanceByClubId[clubId]` updated; club detail and checkout reflect new balance immediately | `system_contracts.me §3` |
+| C7 | Pre-cancel warning shown when within 6h | Modal shows "No credit will be issued within 6 hours of game start." | `ux_parity.me §5` |
+| C8 | Pre-cancel confirmation shown when outside 6h | Modal shows "You will receive a $X.XX credit for this booking." | `ux_parity.me §5` |
+
+---
+
+## 6. CREDIT DISPLAY AND BALANCE
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| CR1 | View game detail with positive credit balance for that club | Credit toggle row shown; balance shown; net price in CTA | `ux_parity.me §3` |
+| CR2 | View game detail with zero credit balance | No credit toggle row shown | `client_guardrails.me §3` |
+| CR3 | View game detail for a free game with credit balance | No credit toggle (fee = 0) | `client_guardrails.me §3` |
+| CR4 | View game detail for a different club than where credits are held | No credit toggle (club-scoped) | `system_contracts.me §3` |
+| CR5 | View bookings list with credits at multiple clubs | One pill per club with positive balance | `ux_parity.me §7` |
+| CR6 | Credit balance goes to zero after booking | Pill disappears from bookings list; toggle not shown on next booking | `system_contracts.me §3` |
+| CR7 | Optimistic credit decrement | UI balance drops immediately on "Book"; confirmed by DB value after async completes | `client_guardrails.me §3` |
+
+---
+
+## 7. NOTIFICATIONS
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| N1 | FCM token registered on first launch | Token stored server-side; push delivery enabled | `platform_adaptation.me §3` |
+| N2 | FCM token refreshed (`onNewToken` fires) | New token stored; old token replaced | `platform_adaptation.me §3` |
+| N3 | Push received: `booking_confirmed` | In-app notification appears; tap navigates to game detail modal | `ux_parity.me §8` |
+| N4 | Push received: `game_cancelled` | In-app notification appears; tap navigates to game detail modal | `ux_parity.me §8` |
+| N5 | Push received: `waitlist_promoted` | In-app notification appears; tap navigates to game detail showing "Complete Booking" CTA | `ux_parity.me §6` |
+| N6 | Push received: `game_review_request` | In-app notification appears; tap opens ReviewSheet modal | `ux_parity.me §10` |
+| N7 | Push received: `club_announcement` | In-app notification appears; tap navigates to club detail inline | `ux_parity.me §8` |
+| N8 | Push received: `club_chat_mention` | In-app notification appears; tap navigates to club chat | `ux_parity.me §8` |
+| N9 | Tap "Clear All" | All notification rows deleted server-side and from list; empty state shown | `ux_parity.me §8` |
+| N10 | Notification received while app is in foreground | In-app notification badge/list updates; no OS-level push banner required | — |
+
+---
+
+## 8. REVIEWS
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| R1 | Submit a review (1–5 stars, comment) | Row inserted in `reviews`; success state shown; "View [Club Name]" button available | `system_contracts.me §1 (reviews)` |
+| R2 | Submit review without comment | Row inserted with `comment=null`; accepted | — |
+| R3 | Submit review with 0 stars | Rejected client-side (validation); not sent to DB | `data_contracts.me §2 reviews` |
+| R4 | Submit review twice (duplicate) | HTTP 409 returned; "You have already left a review for this session." shown | `edge_cases.me §8`, `ux_parity.me §13` |
+| R5 | Tap review notification; game not in memory | ReviewSheet opens; club resolved via DB fallback (`games?select=club_id`) | `edge_cases.me §8` |
+| R6 | View reviews section on club detail | Star average + count shown; individual reviews with initials, game title, comment | `ux_parity.me §10` |
+| R7 | Club with zero reviews | Reviews section hidden entirely | `ux_parity.me §10` |
+
+---
+
+## 9. CLUB CHAT
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| CH1 | View club chat feed | Posts, comments, likes rendered; images displayed | `android_v1_scope.me §1` |
+| CH2 | Post a text message | Post appears in feed; optimistic insert before server confirms | `client_guardrails.me §9` |
+| CH3 | Comment on a post | Comment count increments optimistically; comment appears | `client_guardrails.me §9` |
+| CH4 | Like a post | Like count increments optimistically; reverts on failure | `client_guardrails.me §9` |
+| CH5 | Type comment on card A; view card B | Card A's draft text is preserved; card B has empty draft | `client_guardrails.me §9` |
+| CH6 | Comment draft causes full-list re-render | Must NOT happen — comment state is local to card composable | `client_guardrails.me §9` |
+
+---
+
+## 10. DEEP LINKS
+
+| ID | Scenario | Expected Outcome | Ref |
+|---|---|---|---|
+| DL1 | Open `bookadink://club/{valid-id}` | App opens; navigates to ClubDetailScreen for that club | `platform_adaptation.me §4` |
+| DL2 | Open `bookadink://game/{valid-id}` | App opens; navigates to GameDetailScreen for that game | `platform_adaptation.me §4` |
+| DL3 | Open `bookadink://review/{gameID}` | App opens; no navigation (no-op) | `platform_adaptation.me §4` |
+| DL4 | Open deep link while unauthenticated | App shows sign-in screen; after auth, navigates to deep link destination | — |
+| DL5 | Open deep link for deleted club | Error state shown; not a crash | `edge_cases.me §6` |
+
+---
+
+## 11. DATA INTEGRITY PARITY TESTS
+
+These tests verify that Android writes match iOS expectations at the DB level.
+
+| ID | Scenario | DB Assertion |
+|---|---|---|
+| DI1 | Book a free game | `bookings.status='confirmed'`, `fee_paid=false`, `payment_method IS NULL` |
+| DI2 | Book a paid game (card) | `bookings.status='confirmed'`, `fee_paid=true`, `payment_method='stripe'`, `stripe_payment_intent_id NOT NULL` |
+| DI3 | Book with full credit cover | `bookings.status='confirmed'`, `fee_paid=false`, `payment_method IS NULL`, `credits_applied_cents = totalFee` |
+| DI4 | Cancel inside 6h window | `bookings.status='cancelled'`, `cancellation_reason='player_cancelled'`; no new `credit_transactions` row |
+| DI5 | Cancel outside 6h window | `bookings.status='cancelled'`; new `credit_transactions` row with `reason='cancellation_refund'`; `player_credits.amount_cents` incremented |
+| DI6 | UUID in all PostgREST filters | All `user_id`, `club_id`, `game_id` values in queries are lowercase | `data_contracts.me §5` |
+| DI7 | Timestamp decode | All `created_at`, `date_time`, `hold_expires_at` decode to correct `Instant` without null | `data_contracts.me §4` |
+| DI8 | Credit balance never negative | `player_credits.amount_cents >= 0` after any deduction | `backend_authority.me §2` |
+
+---
+
+## 12. LAYOUT AND UX PARITY TESTS
+
+Run on minimum supported device (360dp width):
+
+| ID | Scenario | Expected Outcome |
+|---|---|---|
+| L1 | Open GameDetailScreen with 11+ attendees | Avatar row capped at N; `+X` badge shown; no horizontal scroll | `client_guardrails.me §5` |
+| L2 | Open GameDetailScreen on 360dp device | No horizontal scroll; all cards fill width | `client_guardrails.me §5` |
+| L3 | Long game title (30+ chars) in game card | Title truncates with ellipsis; card does not overflow | `client_guardrails.me §5` |
+| L4 | Booking CTA labels match per state | "Book Now", "Book · $X.XX", "Complete Booking · $X.XX", "Booked", "On Waitlist · #X", "Spot hold expired" | `ux_parity.me §3` |
+| L5 | Payment badge visible to admin only | "Card", "Comp", "Unpaid" badges shown in attendee list for admin; hidden for regular players | `ux_parity.me §4` |
+| L6 | Club owner tools menu order | View/Edit Games → Create Game → divider → Club Settings → divider → Join Requests → Manage Members | `ux_parity.me §9` |
+
+---
+
+## 13. REGRESSION TARGETS
+
+After any change to booking, payment, credit, or cancellation flows, re-run:
+
+- B1, B5, P1, P2, P3 (core booking paths)
+- C1, C2, C5 (cancellation and credit idempotency)
+- CR7 (optimistic credit update)
+- W4, W5 (hold expiry and promotion race)
+- DI6, DI7, DI8 (data integrity)
+- L1, L2 (layout constraints)

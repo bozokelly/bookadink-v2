@@ -78,6 +78,7 @@ interface ClubRow {
   suburb: string | null;
   state: string | null;
   postcode: string | null;
+  timezone: string | null;
 }
 
 serve(async (req: Request) => {
@@ -115,6 +116,32 @@ serve(async (req: Request) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
 
+  // Check user's email notification preferences (missing row = all defaults on)
+  const { data: notifPrefs } = await supabase
+    .from("notification_preferences")
+    .select("booking_confirmed_email,new_game_email,waitlist_email")
+    .eq("user_id", notification.user_id)
+    .single();
+
+  if (notifPrefs) {
+    const type = notification.type;
+    if (
+      (type === "booking_confirmed" || type === "booking_cancelled") &&
+      notifPrefs.booking_confirmed_email === false
+    ) {
+      return new Response(JSON.stringify({ skipped: true, reason: "user_pref_off" }), { status: 200 });
+    }
+    if (type === "new_game" && notifPrefs.new_game_email === false) {
+      return new Response(JSON.stringify({ skipped: true, reason: "user_pref_off" }), { status: 200 });
+    }
+    if (
+      (type === "booking_waitlisted" || type === "waitlist_promoted") &&
+      notifPrefs.waitlist_email === false
+    ) {
+      return new Response(JSON.stringify({ skipped: true, reason: "user_pref_off" }), { status: 200 });
+    }
+  }
+
   // Fetch user profile
   const { data: profile } = await supabase
     .from("profiles")
@@ -146,19 +173,31 @@ serve(async (req: Request) => {
     if (game?.club_id) {
       const { data: clubData } = await supabase
         .from("clubs")
-        .select("name,venue_name,street_address,suburb,state,postcode")
+        .select("name,venue_name,street_address,suburb,state,postcode,timezone")
         .eq("id", game.club_id)
         .single<ClubRow>();
       club = clubData;
     }
 
-    htmlBody = buildGameEmail({
-      firstName,
-      title: notification.title,
-      notifType,
-      game: game ?? null,
-      club,
-    });
+    // For game_cancelled, the game row may have been deleted before this email fires.
+    // The notification body already contains full details ("Title · Date · Venue has been cancelled.")
+    // Fall back to a plain email rather than an empty game card.
+    if (!game && notifType === "game_cancelled") {
+      htmlBody = buildGenericEmail({
+        firstName,
+        title: notification.title,
+        body: notification.body,
+      });
+    } else {
+      htmlBody = buildGameEmail({
+        firstName,
+        title: notification.title,
+        notifType,
+        game: game ?? null,
+        club,
+        clubTZ: club?.timezone || FALLBACK_TZ,
+      });
+    }
   } else if (CLUB_TYPES.has(notifType) && refID) {
     const { data: club } = await supabase
       .from("clubs")
@@ -217,14 +256,22 @@ serve(async (req: Request) => {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function formatDate(iso: string): string {
+const FALLBACK_TZ = "Australia/Perth";
+
+function formatDate(iso: string, tz: string): string {
   const d = new Date(iso);
-  return d.toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  return d.toLocaleDateString("en-AU", {
+    weekday: "long", day: "numeric", month: "long", year: "numeric",
+    timeZone: tz,
+  });
 }
 
-function formatTime(iso: string): string {
+function formatTime(iso: string, tz: string): string {
   const d = new Date(iso);
-  return d.toLocaleTimeString("en-AU", { hour: "numeric", minute: "2-digit", hour12: true });
+  return d.toLocaleTimeString("en-AU", {
+    hour: "numeric", minute: "2-digit", hour12: true,
+    timeZone: tz,
+  });
 }
 
 function formatDuration(minutes: number): string {
@@ -289,15 +336,16 @@ function buildGameEmail(opts: {
   notifType: string;
   game: GameRow | null;
   club: ClubRow | null;
+  clubTZ: string;
 }): string {
-  const { firstName, title, notifType, game, club } = opts;
+  const { firstName, title, notifType, game, club, clubTZ } = opts;
   const tagline = gameTagline(notifType);
   const supportText = gameSupportingText(notifType);
 
   const gameName = game?.title ?? title;
   const clubName = club?.name ?? "";
-  const dateStr  = game ? formatDate(game.date_time)    : "";
-  const timeStr  = game ? formatTime(game.date_time)    : "";
+  const dateStr  = game ? formatDate(game.date_time, clubTZ) : "";
+  const timeStr  = game ? formatTime(game.date_time, clubTZ) : "";
   const durStr   = game ? formatDuration(game.duration_minutes) : "";
   const venueName   = game?.venue_name ?? club?.venue_name ?? "";
   const venueAddr   = [club?.street_address, club?.suburb, club?.state, club?.postcode].filter(Boolean).join(", ");

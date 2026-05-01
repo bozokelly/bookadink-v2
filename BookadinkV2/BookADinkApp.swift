@@ -1,4 +1,5 @@
 
+import AVFoundation
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -50,22 +51,25 @@ final class BookADinkAppDelegate: NSObject, UIApplicationDelegate, UNUserNotific
         defer { completionHandler() }
         let userInfo = response.notification.request.content.userInfo
 
-        // booking-confirmed edge function — sends game_id directly
-        if let gameIDString = userInfo["game_id"] as? String,
-           let gameID = UUID(uuidString: gameIDString) {
-            NotificationCenter.default.post(
-                name: .bookADinkNotificationGameTapped,
-                object: DeepLink.gameURL(id: gameID)
-            )
-            return
-        }
-
-        // notify edge function — sends type + reference_id
+        // Check type first — it's the authoritative routing key sent by all edge functions.
         if let type = userInfo["type"] as? String {
+            let gameIDFromPayload = (userInfo["game_id"] as? String).flatMap(UUID.init)
+            let clubIDFromPayload = (userInfo["club_id"] as? String).flatMap(UUID.init)
             let referenceID = (userInfo["reference_id"] as? String).flatMap(UUID.init)
+
             switch type {
-            case "waitlist_promoted", "booking_waitlisted", "booking_confirmed":
-                if let id = referenceID {
+            case "booking_confirmed":
+                // Open the booked game sheet.
+                if let id = gameIDFromPayload ?? referenceID {
+                    NotificationCenter.default.post(
+                        name: .bookADinkNotificationGameTapped,
+                        object: DeepLink.gameURL(id: id)
+                    )
+                }
+                return
+
+            case "waitlist_promoted", "booking_waitlisted":
+                if let id = gameIDFromPayload ?? referenceID {
                     if type == "waitlist_promoted" {
                         NotificationCenter.default.post(name: .bookADinkWaitlistPromoted, object: id.uuidString)
                     }
@@ -75,22 +79,95 @@ final class BookADinkAppDelegate: NSObject, UIApplicationDelegate, UNUserNotific
                     )
                 }
                 return
+
+            case "game_updated", "game_reminder_2h":
+                // Game still exists — open game sheet, fall back to club.
+                if let id = gameIDFromPayload {
+                    NotificationCenter.default.post(
+                        name: .bookADinkNotificationGameTapped,
+                        object: DeepLink.gameURL(id: id)
+                    )
+                } else if let clubID = clubIDFromPayload {
+                    NotificationCenter.default.post(
+                        name: .bookADinkNotificationGameTapped,
+                        object: DeepLink.clubURL(id: clubID)
+                    )
+                } else {
+                    NotificationCenter.default.post(name: .bookADinkOpenNotificationsTab, object: nil)
+                }
+                return
+
+            case "new_game":
+                // Navigate to club (game may not be bookable yet).
+                if let clubID = clubIDFromPayload {
+                    NotificationCenter.default.post(
+                        name: .bookADinkNotificationGameTapped,
+                        object: DeepLink.clubURL(id: clubID)
+                    )
+                } else if let id = gameIDFromPayload {
+                    NotificationCenter.default.post(
+                        name: .bookADinkNotificationGameTapped,
+                        object: DeepLink.gameURL(id: id)
+                    )
+                } else {
+                    NotificationCenter.default.post(name: .bookADinkOpenNotificationsTab, object: nil)
+                }
+                return
+
+            case "game_cancelled":
+                // Game row is deleted when cancelled — navigate to club instead.
+                if let clubID = clubIDFromPayload {
+                    NotificationCenter.default.post(
+                        name: .bookADinkNotificationGameTapped,
+                        object: DeepLink.clubURL(id: clubID)
+                    )
+                } else {
+                    NotificationCenter.default.post(name: .bookADinkOpenNotificationsTab, object: nil)
+                }
+                return
+
+            case "new_post", "new_comment", "new_announcement", "comment_on_post", "mention":
+                // Club chat — navigate to the club feed.
+                if let clubID = clubIDFromPayload {
+                    NotificationCenter.default.post(
+                        name: .bookADinkNotificationGameTapped,
+                        object: DeepLink.clubURL(id: clubID)
+                    )
+                } else {
+                    NotificationCenter.default.post(name: .bookADinkOpenNotificationsTab, object: nil)
+                }
+                return
+
             case "membership_approved", "admin_promoted", "membership_request_received":
                 NotificationCenter.default.post(name: .bookADinkMembershipStatusChanged, object: nil)
-                if let id = referenceID {
+                if let id = referenceID ?? clubIDFromPayload {
                     NotificationCenter.default.post(
                         name: .bookADinkNotificationGameTapped,
                         object: DeepLink.clubURL(id: id)
                     )
                 }
                 return
+
             case "membership_rejected", "membership_removed":
                 NotificationCenter.default.post(name: .bookADinkMembershipStatusChanged, object: nil)
                 NotificationCenter.default.post(name: .bookADinkOpenNotificationsTab, object: nil)
                 return
+
             default:
-                break
+                // Unknown type — open notifications tab so the user sees what arrived.
+                NotificationCenter.default.post(name: .bookADinkOpenNotificationsTab, object: nil)
+                return
             }
+        }
+
+        // Fallback for legacy payloads without a type field — use game_id if present.
+        if let gameIDString = userInfo["game_id"] as? String,
+           let gameID = UUID(uuidString: gameIDString) {
+            NotificationCenter.default.post(
+                name: .bookADinkNotificationGameTapped,
+                object: DeepLink.gameURL(id: gameID)
+            )
+            return
         }
 
         // Fallback: extract game_id from local reminder identifier
@@ -132,9 +209,12 @@ struct BookADinkApp: App {
     @UIApplicationDelegateAdaptor(BookADinkAppDelegate.self) private var appDelegate
     @StateObject private var appState = AppState()
     @StateObject private var locationManager = LocationManager()
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         StripeAPI.defaultPublishableKey = SupabaseConfig.stripePublishableKey
+        // Mix with background audio (e.g. music) instead of interrupting it.
+        try? AVAudioSession.sharedInstance().setCategory(.ambient, mode: .default, options: [])
     }
 
     var body: some Scene {
@@ -154,6 +234,24 @@ struct BookADinkApp: App {
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .bookADinkMembershipStatusChanged)) { _ in
                     Task { await appState.refreshMemberships() }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .bookADinkWaitlistPromoted)) { _ in
+                    // Push arrived (foreground or background→foreground tap):
+                    // refresh bookings so the pending_payment CTA surfaces immediately
+                    // regardless of which screen the user is on.
+                    Task { await appState.refreshBookings(silent: true) }
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active {
+                        Task {
+                            // Refresh notifications on foreground so badge counts and indicators
+                            // stay in sync without requiring manual pull-to-refresh.
+                            await appState.refreshNotifications()
+                            for clubID in appState.entitlementsByClubID.keys {
+                                await appState.fetchClubEntitlements(for: clubID)
+                            }
+                        }
+                    }
                 }
         }
     }

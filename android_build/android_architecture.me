@@ -1,0 +1,287 @@
+# android_architecture.me
+# Purpose: Defines the recommended Kotlin/Compose app structure for Book A Dink
+#          Android. Specifies layers, module boundaries, state ownership, and
+#          backend interaction rules. All rules align strictly with
+#          backend_authority.me, data_contracts.me, and client_guardrails.me.
+# Scope: Android v1 only
+
+---
+
+## 1. STACK
+
+| Concern | Technology |
+|---|---|
+| Language | Kotlin |
+| UI | Jetpack Compose |
+| Navigation | Navigation Compose (`androidx.navigation:navigation-compose`) |
+| Async | Coroutines + Flow |
+| DI | Hilt (`com.google.dagger:hilt-android`) |
+| Network | Ktor Client (Kotlin-native) OR Supabase Kotlin SDK (`io.github.jan-tennert.supabase`) |
+| Payments | Stripe Android SDK (`com.stripe:stripe-android`) |
+| Push | Firebase Cloud Messaging (`com.google.firebase:firebase-messaging`) |
+| Image loading | Coil (`io.coil-kt:coil-compose`) |
+| In-app browser | Chrome Custom Tabs (`androidx.browser:browser`) |
+| Location | FusedLocationProviderClient (Google Play Services) |
+| Local storage | DataStore Preferences (`androidx.datastore:datastore-preferences`) |
+| Date/time | `java.time` (API 26+; use `desugaring` for API < 26 if targeted) |
+
+---
+
+## 2. LAYER STRUCTURE
+
+```
+┌─────────────────────────────────────┐
+│  UI Layer                           │
+│  Composables, Screens, ViewModels   │
+├─────────────────────────────────────┤
+│  Domain Layer                       │
+│  Use Cases, State mappers           │
+├─────────────────────────────────────┤
+│  Data Layer                         │
+│  Repositories, Data Sources         │
+├─────────────────────────────────────┤
+│  Remote Layer                       │
+│  SupabaseService, StripeService,    │
+│  FcmService                         │
+└─────────────────────────────────────┘
+```
+
+Rules:
+- UI layer depends on Domain only. Never calls Repository or SupabaseService directly.
+- Domain layer depends on Data only. No Compose imports.
+- Data layer depends on Remote only. No ViewModel imports.
+- Remote layer has zero business logic. Only serialisation, HTTP calls, and error mapping.
+
+---
+
+## 3. MODULE BOUNDARIES
+
+```
+app/
+├── ui/
+│   ├── auth/           AuthScreen, AuthViewModel
+│   ├── profile/        ProfileScreen, ProfileViewModel
+│   ├── clubs/          ClubsListScreen, ClubDetailScreen, ClubViewModel
+│   ├── games/          GamesListScreen, GameDetailScreen, GameViewModel
+│   ├── bookings/       BookingsListScreen, BookingViewModel
+│   ├── notifications/  NotificationsScreen, NotificationsViewModel
+│   ├── chat/           ClubChatScreen, ClubChatViewModel
+│   ├── reviews/        ReviewSheet, ReviewViewModel
+│   ├── home/           HomeScreen, HomeViewModel
+│   └── shared/         Reusable composables (cards, badges, avatars, etc.)
+├── domain/
+│   ├── model/          Domain models (separate from data models)
+│   ├── usecase/        One class per use case (BookGameUseCase, CancelBookingUseCase, etc.)
+│   └── mapper/         Data ↔ Domain model mappers
+├── data/
+│   ├── repository/     ClubRepository, GameRepository, BookingRepository,
+│   │                   CreditRepository, ProfileRepository, NotificationRepository,
+│   │                   ReviewRepository, ChatRepository
+│   └── local/          DataStore access (DUPR cache, session state)
+└── remote/
+    ├── supabase/       SupabaseClient, all table queries and RPCs
+    ├── stripe/         StripeService (PaymentSheet setup, PaymentIntent creation)
+    └── fcm/            FcmTokenService (token registration, token refresh)
+```
+
+---
+
+## 4. SCREEN AND NAVIGATION BOUNDARIES
+
+Top-level navigation is tab-based (5 tabs matching iOS):
+
+| Tab | Root Screen | Notes |
+|---|---|---|
+| Home | HomeScreen | Nearby games + news feed stub |
+| Clubs | ClubsListScreen | Browse and search clubs |
+| Bookings | BookingsListScreen | My upcoming + past bookings |
+| Notifications | NotificationsScreen | **Own NavHost** — see rule below |
+| Profile | ProfileScreen | My profile |
+
+Navigation rules:
+- `NotificationsScreen` has its own nested `NavHost`. Club destinations push to `ClubDetailScreen` inline; game destinations open as `ModalBottomSheet`. Back on club detail returns to Notifications.
+- `ClubDetailScreen` uses a tab row internally: Info / Games / Members / Chat. These are NOT separate nav destinations — they are tab-switched content within a single screen.
+- `GameDetailScreen` is a full-screen destination pushed from any game list.
+- `ReviewSheet` is a `ModalBottomSheet`, not a full screen. It can be triggered from a notification or from a notification destination.
+- Deep link entry points must be handled at the root `NavHost` level, not inside individual screens.
+
+---
+
+## 5. VIEWMODEL RESPONSIBILITIES
+
+Each ViewModel:
+- Owns the `UiState` for its screen as a `StateFlow<UiState>`
+- Calls Use Cases only — never calls Repositories or SupabaseService directly
+- Applies optimistic updates before async completion (see §8)
+- Handles error mapping to user-facing strings (see `ux_parity.me §13`)
+- Does NOT own shared state that multiple screens need (see §7)
+
+ViewModel does NOT:
+- Contain Supabase query strings
+- Contain Stripe SDK logic
+- Compute platform fees
+- Mutate another ViewModel's state
+
+---
+
+## 6. REPOSITORY RESPONSIBILITIES
+
+Each Repository:
+- Exposes suspend functions and Flows to the Domain layer
+- Owns in-memory cache for its domain (e.g. `BookingRepository` caches bookings by game)
+- Calls exactly one Remote data source (no cross-repository calls inside a repository)
+- Maps remote DTOs to domain models
+- Throws typed domain errors (not raw HTTP exceptions)
+
+Repositories must NOT:
+- Contain UI logic or formatting
+- Share cache state directly with other repositories (use shared state holder — see §7)
+
+---
+
+## 7. SHARED STATE — APP STATE EQUIVALENT
+
+iOS uses `AppState` as a shared observable object. Android equivalent:
+
+Use a **`AppStateHolder`** singleton injected via Hilt (`@Singleton`):
+- Exposes `StateFlow` properties for shared state:
+  - `currentUser: StateFlow<UserProfile?>`
+  - `creditBalanceByClubId: StateFlow<Map<UUID, Int>>`
+  - `pendingDeepLink: StateFlow<DeepLink?>`
+- Updated by repositories after successful writes
+- Observed by ViewModels that need cross-screen coordination
+
+Rules:
+- `creditBalanceByClubId` is the ONLY credit balance container. Never a single global `Int`.
+  See `system_contracts.me §3` and `client_guardrails.me §3`.
+- `creditBalanceByClubId` key is a lowercased UUID string (consistent with all PostgREST filters).
+  See `data_contracts.me §5`.
+- Optimistic update: decrement `creditBalanceByClubId[clubId]` on main thread before the
+  background coroutine fires. Confirm with DB value after coroutine completes.
+
+---
+
+## 8. BACKEND INTERACTION RULES
+
+All of these rules are derived from `backend_authority.me` and `client_guardrails.me`.
+Repeating them here as implementation anchor points:
+
+### Supabase queries
+- All UUID values in PostgREST filters must be lowercase: `.eq("user_id", uuid.lowercase())`
+- All select strings must include every required column (see `data_contracts.me §1`)
+- Use anon key for Edge Function calls; user JWT for PostgREST DB calls
+- Decode all timestamps via `Instant.parse()` with `ISO_OFFSET_DATE_TIME` formatter
+
+### Payments (Stripe)
+- PaymentIntent is created by `create-payment-intent` Edge Function — never locally
+- Booking row inserted ONLY in `PaymentSheetResult.Completed` handler — never in `Canceled` or `Failed`
+- Credits not decremented on `Canceled` or `Failed`
+- `confirmPendingBooking` called for waitlist-hold completions; `requestBooking` for new bookings
+
+### Credits
+- Credit deduction: PATCH `player_credits` with `amount_cents=gte.{amount}` filter
+- Credit issuance: PATCH existing row or INSERT new row on `player_credits`
+- Do NOT call `use_credits` or `issue_cancellation_credit` RPCs via PostgREST (PGRST202)
+- See `system_contracts.me §3` and `edge_cases.me §3`
+
+### Notifications
+- Register FCM token on app launch and on `onNewToken` callback
+- Store token server-side (PATCH `profiles.fcm_token` or equivalent)
+- Handle notification payload in `FirebaseMessagingService.onMessageReceived`
+- Tap routing logic matches `ux_parity.me §8`
+
+---
+
+## 9. STATE OWNERSHIP MAP
+
+| State | Owner | Scope |
+|---|---|---|
+| Auth session | `AppStateHolder` | App-wide |
+| Current user profile | `AppStateHolder` | App-wide |
+| Credit balances (by club) | `AppStateHolder` | App-wide |
+| Clubs list cache | `ClubRepository` | Repository-scoped |
+| Games list cache | `GameRepository` | Repository-scoped |
+| Bookings cache | `BookingRepository` | Repository-scoped |
+| Notifications list | `NotificationRepository` | Repository-scoped |
+| Chat posts cache | `ChatRepository` | Repository-scoped |
+| Current screen UI state | ViewModel | Screen-scoped |
+| Comment draft text | Composable `remember` | Card-scoped (NOT lifted) — see `client_guardrails.me §9` |
+| Hold countdown timer | `GameDetailViewModel` | Screen-scoped |
+| Stripe PaymentSheet state | `BookingViewModel` | Screen-scoped |
+
+Comment draft MUST be `remember { mutableStateOf("") }` inside the card composable.
+Lifting it to the feed ViewModel causes full re-composition of all cards on every keystroke.
+This is a known iOS production issue — do not repeat on Android.
+
+---
+
+## 10. ERROR HANDLING STRATEGY
+
+Each layer handles a distinct class of errors:
+
+| Layer | Error Class | Action |
+|---|---|---|
+| Remote | HTTP errors, network failures | Map to typed `RemoteError` sealed class |
+| Repository | `RemoteError` | Map to `DomainError` sealed class; never expose HTTP codes to UI |
+| ViewModel | `DomainError` | Map to user-facing string using error catalogue from `ux_parity.me §13` |
+| UI | `UiState.Error(message: String)` | Show error banner or retry prompt |
+
+Specific cases:
+- HTTP 409 on review insert → `DomainError.ReviewAlreadySubmitted` → "You have already left a review for this session."
+- PostgREST 0 rows returned on credit PATCH → `DomainError.InsufficientCredits` → "Insufficient credits. Please try again."
+- Stripe `.Failed` → `DomainError.PaymentFailed` → "Payment failed. Please try again."
+- HTTP 404 on game fetch → `DomainError.NotFound` → fall back to DB lookup (review flow)
+
+---
+
+## 11. LAYOUT RULES
+
+Android equivalents to iOS layout constraints (see `client_guardrails.me §5`):
+
+- Root screen containers: `Modifier.fillMaxWidth()` on outermost layout composable.
+- Every card composable: `Modifier.fillMaxWidth()` before `.background(...)` or `.clip(...)`.
+- Avatar preview rows: `LazyRow` with `prefix(N)` equivalent; show `+N` badge for overflow.
+  Cap: N satisfying `(N+1) × 44.dp + N × 8.dp ≤ (screenWidth − horizontal padding)`.
+- DO NOT use `wrapContentWidth()` on card containers — equivalent to iOS `fixedSize(horizontal: true)`.
+- DO NOT set a fixed `width` on a container that holds dynamic text.
+- Minimum target width: 360dp (equivalent to iPhone SE 375pt).
+
+---
+
+## 12. DEPENDENCY INJECTION SETUP
+
+```
+@Module @InstallIn(SingletonComponent::class)
+object AppModule {
+    @Provides @Singleton fun provideSupabaseClient(): SupabaseClient
+    @Provides @Singleton fun provideStripeService(): StripeService
+    @Provides @Singleton fun provideAppStateHolder(): AppStateHolder
+}
+
+@Module @InstallIn(SingletonComponent::class)
+object RepositoryModule {
+    @Binds ClubRepository → ClubRepositoryImpl
+    @Binds GameRepository → GameRepositoryImpl
+    @Binds BookingRepository → BookingRepositoryImpl
+    @Binds CreditRepository → CreditRepositoryImpl
+    @Binds ProfileRepository → ProfileRepositoryImpl
+    @Binds NotificationRepository → NotificationRepositoryImpl
+    @Binds ReviewRepository → ReviewRepositoryImpl
+    @Binds ChatRepository → ChatRepositoryImpl
+}
+```
+
+---
+
+## 13. STRIPE ANDROID SETUP
+
+```kotlin
+// In Application.onCreate():
+PaymentConfiguration.init(context, BuildConfig.STRIPE_PUBLISHABLE_KEY)
+```
+
+- `STRIPE_PUBLISHABLE_KEY` comes from `SupabaseConfig` / build config — same value as iOS.
+- Google Pay enabled via `GooglePayConfig` with `countryCode = "AU"`, `currencyCode = "aud"`.
+- `PaymentSheet.FlowController` used when credits need to be applied before presenting (net price path).
+- `PaymentSheet` used for standard full-price booking.
+- All PaymentSheet result handling in `BookingViewModel` — no business logic in the Composable.

@@ -76,11 +76,7 @@ struct NotificationsView: View {
                 await appState.refreshNotifications()
             }
         }
-        .confirmationDialog(
-            "Clear all notifications?",
-            isPresented: $showClearConfirm,
-            titleVisibility: .visible
-        ) {
+        .alert("Clear all notifications?", isPresented: $showClearConfirm) {
             Button("Clear All", role: .destructive) {
                 Task { await appState.clearAllNotifications() }
             }
@@ -154,9 +150,8 @@ struct NotificationsView: View {
         guard let link = notification.deepLink else { return nil }
         switch link {
         case .game(let id):
-            let game = appState.gamesByClubID.values
-                .flatMap { $0 }
-                .first { $0.id == id }
+            let game = appState.gamesByClubID.values.flatMap { $0 }.first { $0.id == id }
+                ?? appState.bookings.first { $0.booking.gameID == id }?.game
             return game.map { .game($0) }
         case .club(let id):
             let club = appState.clubs.first { $0.id == id }
@@ -165,6 +160,9 @@ struct NotificationsView: View {
             // Always tappable — game title is extracted from the notification itself.
             // Club lookup happens inside ReviewGameSheet via appState.clubForGame().
             return .review(gameID: gameID, title: extractGameTitle(from: notification.title))
+        case .connectReturn:
+            // Not a notification destination — connect return is only triggered by URL scheme.
+            return nil
         }
     }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Full "See All" screen for Games Near You.
 ///
@@ -17,7 +18,6 @@ struct NearbyGamesView: View {
     @Binding var selectedTab: AppTab
 
     @State private var selectedGame: Game? = nil
-    @State private var selectedClub: Club? = nil
 
     // MARK: - Derived data
 
@@ -83,11 +83,6 @@ struct NearbyGamesView: View {
                     GameDetailView(game: game)
                 }
             }
-            .sheet(item: $selectedClub) { club in
-                NavigationStack {
-                    ClubDetailView(club: club)
-                }
-            }
         }
     }
 
@@ -95,18 +90,34 @@ struct NearbyGamesView: View {
 
     private var gameList: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                if locationUnavailable {
-                    locationHint
+            if UIDevice.current.userInterfaceIdiom == .pad {
+                LazyVGrid(
+                    columns: [GridItem(.flexible()), GridItem(.flexible())],
+                    spacing: 12
+                ) {
+                    if locationUnavailable {
+                        locationHint.gridCellColumns(2)
+                    }
+                    ForEach(sortedGames) { game in
+                        gameRow(for: game)
+                    }
                 }
-
-                ForEach(sortedGames) { game in
-                    gameRow(for: game)
+                .padding(.horizontal, 20)
+                .padding(.top, 12)
+                .padding(.bottom, 32)
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    if locationUnavailable {
+                        locationHint
+                    }
+                    ForEach(sortedGames) { game in
+                        gameRow(for: game)
+                    }
                 }
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 32)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-            .padding(.bottom, 32)
         }
         .scrollIndicators(.hidden)
         .refreshable { await appState.refreshUpcomingGames() }
@@ -138,8 +149,7 @@ struct NearbyGamesView: View {
                     clubName: club?.name ?? "",
                     isBooked: isBooked,
                     isWaitlisted: isWaitlisted,
-                    resolvedVenue: resolvedVenue,
-                    onClubTap: club.map { c in { selectedClub = c } }
+                    resolvedVenue: resolvedVenue
                 )
             }
             .buttonStyle(.plain)

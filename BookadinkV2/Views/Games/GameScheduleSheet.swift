@@ -657,21 +657,29 @@ struct SessionResultsFormatter {
         let displayRounds = Array(rounds.prefix(maxRoundsToShow))
 
         for round in displayRounds {
-            let roundResults = round.courts.compactMap { results[$0.id] }
-            let allConfirmed = roundResults.count == round.courts.count && roundResults.allSatisfy(\.isConfirmed)
+            let roundResults  = round.courts.compactMap { results[$0.id] }
+            let allConfirmed  = roundResults.count == round.courts.count && roundResults.allSatisfy(\.isConfirmed)
+            let multiCourt    = round.courts.count > 1
 
             lines.append("Round \(round.number)\(allConfirmed ? "" : " (incomplete)")")
             for court in round.courts.sorted(by: { $0.number < $1.number }) {
+                let courtPrefix = multiCourt ? "  Court \(court.number):  " : "  "
                 if let result = results[court.id], result.isConfirmed {
-                    let teamANames = result.teamA.map { shortName($0.userName) }.joined(separator: " & ")
-                    let teamBNames = result.teamB.map { shortName($0.userName) }.joined(separator: " & ")
-                    let scoreStr = "\(result.teamAScore) – \(result.teamBScore)"
-                    let winMark = result.winner == .teamA ? "✅" : result.winner == .teamB ? "✅" : ""
-                    lines.append("  Court \(court.number):  \(teamANames)  \(scoreStr)  \(teamBNames)  \(winMark)")
+                    // Winner row first; fall back to higher-score-first when no winner
+                    let teamAWon = result.winner == .teamA
+                    let teamBWon = result.winner == .teamB
+                    let topIsA   = teamAWon || (!teamBWon && result.teamAScore >= result.teamBScore)
+                    let winNames  = (topIsA ? result.teamA : result.teamB).map { shortName($0.userName) }.joined(separator: " & ")
+                    let losNames  = (topIsA ? result.teamB : result.teamA).map { shortName($0.userName) }.joined(separator: " & ")
+                    let winScore  = topIsA ? result.teamAScore : result.teamBScore
+                    let losScore  = topIsA ? result.teamBScore : result.teamAScore
+                    let hasWinner = teamAWon || teamBWon
+                    let mark      = hasWinner ? " ✅" : ""
+                    lines.append("\(courtPrefix)\(winNames)\(mark)  \(winScore) – \(losScore)  \(losNames)")
                 } else {
                     let teamANames = court.teamA.map { shortName($0.userName) }.joined(separator: " & ")
                     let teamBNames = court.teamB.map { shortName($0.userName) }.joined(separator: " & ")
-                    lines.append("  Court \(court.number):  \(teamANames)  vs  \(teamBNames)")
+                    lines.append("\(courtPrefix)\(teamANames)  vs  \(teamBNames)")
                 }
             }
             lines.append("")
@@ -727,6 +735,99 @@ struct SessionResultsFormatter {
             return fullName
         }
         return "\(first) \(lastInitial)."
+    }
+}
+
+// MARK: - Session Result Normalizer
+
+/// Converts raw session data into a `SessionResultPayload` for JSON encoding
+/// and storage as a structured club chat post.
+private struct SessionResultNormalizer {
+
+    static func normalize(
+        game: Game,
+        rounds: [ScheduledRound],
+        results: [UUID: CourtResult],
+        method: ScheduleAllocationMethod
+    ) -> SessionResultPayload {
+        let date    = game.dateTime.formatted(.dateTime.month(.abbreviated).day())
+        let time    = game.dateTime.formatted(.dateTime.hour().minute())
+        let fmt     = game.gameFormat.replacingOccurrences(of: "_", with: " ").capitalized
+        let courts  = rounds.first?.courts.count ?? game.courtCount
+        let subtitle = "\(date) · \(time) · \(fmt) · \(courts) court\(courts == 1 ? "" : "s")"
+
+        let srRounds: [SessionResultPayload.SRRound] = rounds.map { round in
+            let showLabel = round.courts.count > 1
+            let srCourts: [SessionResultPayload.SRCourt] = round.courts
+                .sorted(by: { $0.number < $1.number })
+                .map { court in
+                    guard let r = results[court.id], r.isConfirmed else {
+                        return SessionResultPayload.SRCourt(courtNumber: court.number, showLabel: showLabel, result: nil)
+                    }
+                    let teamAWon = r.winner == .teamA
+                    let teamBWon = r.winner == .teamB
+                    let topIsA   = teamAWon || (!teamBWon && r.teamAScore >= r.teamBScore)
+                    let match = SessionResultPayload.SRMatch(
+                        topNames:       teamLabel(topIsA ? r.teamA : r.teamB),
+                        topScore:       topIsA ? r.teamAScore : r.teamBScore,
+                        topIsWinner:    topIsA ? teamAWon : teamBWon,
+                        bottomNames:    teamLabel(topIsA ? r.teamB : r.teamA),
+                        bottomScore:    topIsA ? r.teamBScore : r.teamAScore,
+                        bottomIsWinner: topIsA ? teamBWon : teamAWon
+                    )
+                    return SessionResultPayload.SRCourt(courtNumber: court.number, showLabel: showLabel, result: match)
+                }
+            return SessionResultPayload.SRRound(number: round.number, courts: srCourts)
+        }
+
+        let (champion, championLabel) = resolveChampion(method: method, rounds: rounds, results: results)
+
+        return SessionResultPayload(
+            gameTitle: game.title,
+            subtitle: subtitle,
+            rounds: srRounds,
+            champion: champion,
+            championLabel: championLabel
+        )
+    }
+
+    private static func teamLabel(_ attendees: [GameAttendee]) -> String {
+        attendees.map { shortName($0.userName) }.joined(separator: " & ")
+    }
+
+    private static func shortName(_ full: String) -> String {
+        let parts = full.components(separatedBy: " ")
+        guard parts.count >= 2, let first = parts.first, let lastInitial = parts.last?.first else { return full }
+        return "\(first) \(lastInitial)."
+    }
+
+    private static func resolveChampion(
+        method: ScheduleAllocationMethod,
+        rounds: [ScheduledRound],
+        results: [UUID: CourtResult]
+    ) -> (String?, String?) {
+        if method == .kingOfCourt {
+            let lastFull = rounds.last { $0.courts.allSatisfy { results[$0.id]?.isConfirmed == true } }
+            guard let finalRound = lastFull,
+                  let court1 = finalRound.courts.first(where: { $0.number == 1 }),
+                  let r = results[court1.id],
+                  let winner = r.winner else { return (nil, nil) }
+            let name = (winner == .teamA ? r.teamA : r.teamB).map { shortName($0.userName) }.joined(separator: " & ")
+            return (name, "King of the Court")
+        }
+        if method == .duprKingOfCourt, rounds.count >= 3 {
+            let completeCycles = rounds.count / 3
+            guard completeCycles > 0 else { return (nil, nil) }
+            let cycleStart = (completeCycles - 1) * 3
+            let cycleRounds = Array(rounds[cycleStart ..< cycleStart + 3])
+            guard cycleRounds.allSatisfy({ r in r.courts.allSatisfy { results[$0.id]?.isConfirmed == true } }) else { return (nil, nil) }
+            let pts = DUPRKotCEngine.pointTotals(courtNumber: 1, cycleRounds: cycleRounds, results: results)
+            let court1Players = cycleRounds.first?.courts.first(where: { $0.number == 1 }).map { $0.teamA + $0.teamB } ?? []
+            guard let champ = court1Players.max(by: { pts[$0.booking.userID] ?? 0 < pts[$1.booking.userID] ?? 0 }) else { return (nil, nil) }
+            let ptsVal = pts[champ.booking.userID] ?? 0
+            return ("\(shortName(champ.userName)) (\(ptsVal) pts)", "DUPR King of the Court")
+        }
+        return (nil, nil)
     }
 }
 
@@ -891,6 +992,8 @@ private struct ResultsCardView: View {
 
     @ViewBuilder
     private func roundSection(_ round: ScheduledRound) -> some View {
+        // Court label is useful only when multiple courts run concurrently.
+        let showCourtLabel = round.courts.count > 1
         VStack(alignment: .leading, spacing: 10) {
             // Round header — slightly more presence than court labels
             Text("Round \(round.number)")
@@ -901,7 +1004,7 @@ private struct ResultsCardView: View {
             // Courts — tighter grouping within each court, more gap between courts
             VStack(alignment: .leading, spacing: 12) {
                 ForEach(round.courts.sorted(by: { $0.number < $1.number })) { court in
-                    courtBlock(court: court)
+                    courtBlock(court: court, showCourtLabel: showCourtLabel)
                 }
             }
         }
@@ -910,37 +1013,62 @@ private struct ResultsCardView: View {
     // ── Court block ───────────────────────────────────────────────────
 
     @ViewBuilder
-    private func courtBlock(court: ScheduledCourt) -> some View {
+    private func courtBlock(court: ScheduledCourt, showCourtLabel: Bool) -> some View {
         let result    = results[court.id]
         let confirmed = result?.isConfirmed == true
 
         VStack(alignment: .leading, spacing: 0) {
-            // Court label sits close to its rows — only 4 pt gap
-            Text("COURT \(court.number)")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(Self.mutedColor)
-                .tracking(0.8)
-                .padding(.bottom, 4)
+            // Court label — only when multiple courts run concurrently
+            if showCourtLabel {
+                Text("COURT \(court.number)")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(Self.mutedColor)
+                    .tracking(0.8)
+                    .padding(.bottom, 4)
+            }
 
             if let r = result, confirmed {
-                matchRow(names: teamLabel(r.teamA), score: r.teamAScore, isWinner: r.winner == .teamA)
-                    .padding(.bottom, 2)
-                matchRow(names: teamLabel(r.teamB), score: r.teamBScore, isWinner: r.winner == .teamB)
+                confirmedMatchRows(r)
             } else {
-                // Teams assigned but score not yet entered
-                Text(teamLabel(court.teamA))
-                    .font(.system(size: 13))
-                    .foregroundColor(Self.mutedColor)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.bottom, 2)
-                Text(teamLabel(court.teamB))
-                    .font(.system(size: 13))
-                    .foregroundColor(Self.mutedColor)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
+                pendingMatchRows(court: court)
             }
         }
+    }
+
+    // Winner row always on top. When there is no winner (tie/incomplete),
+    // the higher-score team sits on top; both rows render in neutral style.
+    @ViewBuilder
+    private func confirmedMatchRows(_ r: CourtResult) -> some View {
+        let teamAWon = r.winner == .teamA
+        let teamBWon = r.winner == .teamB
+        let topIsA   = teamAWon || (!teamBWon && r.teamAScore >= r.teamBScore)
+        matchRow(
+            names:    teamLabel(topIsA ? r.teamA : r.teamB),
+            score:    topIsA ? r.teamAScore : r.teamBScore,
+            isWinner: topIsA ? teamAWon : teamBWon
+        )
+        .padding(.bottom, 2)
+        matchRow(
+            names:    teamLabel(topIsA ? r.teamB : r.teamA),
+            score:    topIsA ? r.teamBScore : r.teamAScore,
+            isWinner: topIsA ? teamBWon : teamAWon
+        )
+    }
+
+    @ViewBuilder
+    private func pendingMatchRows(court: ScheduledCourt) -> some View {
+        // Teams assigned but score not yet entered — both neutral
+        Text(teamLabel(court.teamA))
+            .font(.system(size: 13))
+            .foregroundColor(Self.mutedColor)
+            .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.bottom, 2)
+        Text(teamLabel(court.teamB))
+            .font(.system(size: 13))
+            .foregroundColor(Self.mutedColor)
+            .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     // ── Match row ─────────────────────────────────────────────────────
@@ -1115,10 +1243,10 @@ struct GameScheduleSheet: View {
     @State private var isShowingPostConfirm = false
     @State private var postAsAnnouncement = false
     @State private var isPosting = false
+    @State private var postSucceeded = false
+    @State private var resultShareImage: UIImage? = nil
     @State private var settingsExpanded = true
     @State private var scrollTarget: UUID? = nil
-    @State private var showRoundTimer = false
-    @State private var timerDurationMinutes: Int = 15
     @State private var pendingResumeSession: LiveGameSession? = nil
     @State private var showResumePrompt = false
 
@@ -1137,6 +1265,10 @@ struct GameScheduleSheet: View {
         return .compact
     }
 
+    private func makeShareTaskID() -> String {
+        "\(game.id):\(activeRounds.count):\(courtResults.values.filter(\.isConfirmed).count)"
+    }
+
     private var winCondition: WinCondition {
         appState.clubs.first(where: { $0.id == game.clubID })?.winCondition ?? .firstTo11By2
     }
@@ -1151,7 +1283,10 @@ struct GameScheduleSheet: View {
     private var duprRatings: [UUID: Double] {
         var map: [UUID: Double] = [:]
         for player in confirmedPlayers {
-            if let rating = appState.duprDoublesRating(for: player.booking.userID) {
+            // Prefer the rating embedded in the attendee record (fetched from DB),
+            // fall back to the AppState in-memory cache (covers the current user
+            // and any admin-updated ratings not yet re-fetched as attendees).
+            if let rating = player.duprRating ?? appState.duprDoublesRating(for: player.booking.userID) {
                 map[player.booking.userID] = rating
             }
         }
@@ -1423,70 +1558,72 @@ struct GameScheduleSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        saveSession()
-                        dismiss()
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(Brand.primaryText)
+                    if settingsExpanded {
+                        // Settings page: X dismisses the whole sheet
+                        Button {
+                            saveSession()
+                            dismiss()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(Brand.secondaryText)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        // Schedule page: go back to settings to adjust format / courts / rounds
+                        Button {
+                            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                                settingsExpanded = true
+                            }
+                        } label: {
+                            Label("Settings", systemImage: "chevron.left")
+                                .labelStyle(.titleAndIcon)
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        .tint(Brand.primaryText)
                     }
-                    .buttonStyle(.plain)
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 10) {
-                        if !settingsExpanded {
-                            // Return to settings to reconfigure / regenerate
-                            Button {
-                                withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                                    settingsExpanded = true
-                                }
-                            } label: {
-                                Image(systemName: "slider.horizontal.3")
-                                    .font(.system(size: 16, weight: .medium))
-                                    .foregroundStyle(Brand.primaryText)
-                            }
-                            .buttonStyle(.plain)
-
-                            Button {
-                                showRoundTimer = true
-                            } label: {
-                                Image(systemName: "timer")
-                                    .font(.system(size: 17, weight: .medium))
-                                    .foregroundStyle(Brand.primaryText)
-                            }
-                            .buttonStyle(.plain)
+                if !settingsExpanded {
+                    // Schedule page: dedicated exit button to leave the generator entirely
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            saveSession()
+                            dismiss()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(Brand.secondaryText)
                         }
-
-                        if showPrimaryAction {
-                            Button { handlePrimaryAction() } label: {
-                                Text(primaryActionLabel)
-                                    .font(.subheadline.weight(.bold))
-                                    .foregroundStyle(.black)
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 7)
-                                    .background(Color(hex: "80FF00"), in: Capsule())
-                                    .opacity(primaryActionEnabled ? 1.0 : 0.45)
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(!primaryActionEnabled)
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if showPrimaryAction {
+                    HStack {
+                        Spacer()
+                        Button { handlePrimaryAction() } label: {
+                            Text(primaryActionLabel)
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(.black)
+                                .lineLimit(1)
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 8)
+                                .background(Color(hex: "80FF00"), in: Capsule())
+                                .opacity(primaryActionEnabled ? 1.0 : 0.45)
                         }
+                        .buttonStyle(.plain)
+                        .disabled(!primaryActionEnabled)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Brand.appBackground)
+                    .overlay(alignment: .bottom) {
+                        Divider()
                     }
                 }
             }
         }
-        .overlay {
-            if showRoundTimer {
-                RoundTimerView(durationMinutes: timerDurationMinutes) {
-                    showRoundTimer = false
-                }
-                .transition(.opacity)
-                .ignoresSafeArea()
-                .zIndex(100)
-            }
-        }
-        .animation(.easeInOut(duration: 0.2), value: showRoundTimer)
-        .interactiveDismissDisabled(showRoundTimer)
         .sheet(item: Binding(
             get: { scoringCourt.map { ScoringTarget(round: $0.round, court: $0.court) } },
             set: { if $0 == nil { scoringCourt = nil } }
@@ -1516,6 +1653,12 @@ struct GameScheduleSheet: View {
                 showResumePrompt = true
             }
         }
+        .task(id: makeShareTaskID()) {
+            guard hasActiveSession else { resultShareImage = nil; return }
+            resultShareImage = SessionResultsImageRenderer.render(
+                game: game, rounds: activeRounds, results: courtResults, method: method
+            )
+        }
         .alert("Resume Session?", isPresented: $showResumePrompt, presenting: pendingResumeSession) { session in
             Button("Resume") { applyRestoredSession(session); pendingResumeSession = nil }
             Button("Start Fresh", role: .destructive) {
@@ -1525,6 +1668,15 @@ struct GameScheduleSheet: View {
         } message: { session in
             Text("A live session was saved on \(session.savedAt.formatted(date: .abbreviated, time: .shortened)). Resume where you left off?")
         }
+        .overlay {
+            if postSucceeded {
+                PostSuccessOverlay {
+                    postSucceeded = false
+                }
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: postSucceeded)
     }
 
     // MARK: Schedule Content (shared between iPhone single-column and iPad right panel)
@@ -1536,25 +1688,32 @@ struct GameScheduleSheet: View {
             HStack(spacing: 10) {
                 HStack(spacing: 6) {
                     Circle()
-                        .fill(Color(hex: "80FF00"))
-                        .frame(width: 8, height: 8)
+                        .fill(Color(hex: "FF3B30"))
+                        .frame(width: 7, height: 7)
                     Text("Live Session")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color(hex: "80FF00"))
+                        .foregroundStyle(Color(hex: "FF3B30"))
                 }
                 Spacer()
-                let shareText = SessionResultsFormatter.format(
-                    game: game, rounds: activeRounds, results: courtResults,
-                    method: method, winCondition: winCondition
-                )
-                ShareLink(item: shareText) {
-                    Label("Share", systemImage: "square.and.arrow.up")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Brand.primaryText)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Brand.secondarySurface, in: Capsule())
-                        .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 1))
+                let shareLabel = Label("Share", systemImage: "square.and.arrow.up")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.primaryText)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Brand.secondarySurface, in: Capsule())
+                    .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 1))
+                if let img = resultShareImage {
+                    let shareImage = Image(uiImage: img)
+                    ShareLink(
+                        item: shareImage,
+                        preview: SharePreview(game.title, image: shareImage)
+                    ) { shareLabel }
+                } else {
+                    let shareText = SessionResultsFormatter.format(
+                        game: game, rounds: activeRounds, results: courtResults,
+                        method: method, winCondition: winCondition
+                    )
+                    ShareLink(item: shareText) { shareLabel }
                 }
             }
             .padding(.horizontal, 4)
@@ -1854,10 +2013,10 @@ struct GameScheduleSheet: View {
                     }
                     Spacer()
                     VStack(alignment: .trailing, spacing: 2) {
-                        if confirmedCount > 0 || allConfirmed {
-                            Text(allConfirmed ? "All complete" : "\(confirmedCount) of \(totalCount) complete")
+                        if !isExpanded && confirmedCount > 0 {
+                            Text(allConfirmed ? "Round complete" : "\(confirmedCount) of \(totalCount) complete")
                                 .font(.caption.weight(.semibold))
-                                .foregroundStyle(allConfirmed ? Color(hex: "80FF00") : Brand.mutedText)
+                                .foregroundStyle(Brand.mutedText)
                         }
                         if !round.sitOuts.isEmpty {
                             Text("\(round.sitOuts.count) sitting out")
@@ -1878,8 +2037,11 @@ struct GameScheduleSheet: View {
             if isExpanded {
                 Divider().padding(.horizontal, 14)
 
-                VStack(alignment: .leading, spacing: sizeClass == .large ? 16 : 12) {
-                    ForEach(round.courts) { court in
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(round.courts.enumerated()), id: \.element.id) { index, court in
+                        if index > 0 {
+                            Divider().padding(.horizontal, 4).padding(.vertical, sizeClass == .large ? 4 : 2)
+                        }
                         courtCard(court, round: round, showScoreEntry: showScoreEntry)
                     }
 
@@ -1900,7 +2062,7 @@ struct GameScheduleSheet: View {
                         }
                     }
                 }
-                .padding(14)
+                .padding(10)
             }
         }
         .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -1925,15 +2087,9 @@ struct GameScheduleSheet: View {
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.secondaryText)
                     if court.number == 1 && method.isKingOfCourt {
-                        HStack(spacing: 3) {
-                            Image(systemName: "crown.fill")
-                                .font(.system(size: 9, weight: .bold))
-                            Text("Featured")
-                                .font(.caption2.weight(.bold))
-                        }
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 7).padding(.vertical, 3)
-                        .background(Color(hex: "80FF00"), in: Capsule())
+                        Image(systemName: "crown.fill")
+                            .font(.system(size: 13, weight: .regular))
+                            .foregroundStyle(Color(hex: "D4AF37"))
                     }
                 }
                 Spacer()
@@ -1948,9 +2104,9 @@ struct GameScheduleSheet: View {
                     }
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 14)
-            .padding(.bottom, 10)
+            .padding(.horizontal, 2)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
 
             // Player matchup row
             HStack(spacing: 0) {
@@ -1972,20 +2128,19 @@ struct GameScheduleSheet: View {
                             scoringCourt = (round: round, court: court)
                         } label: {
                             Text(confirmed ? "Edit Score" : "Enter Score")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(confirmed ? Brand.primaryText : .black)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Brand.primaryText)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 7)
-                                .background(
-                                    confirmed ? Brand.secondarySurface : Color(hex: "80FF00"),
-                                    in: Capsule()
-                                )
-                                .overlay(Capsule().stroke(confirmed ? Brand.softOutline : Color.clear, lineWidth: 1))
+                                .background(Brand.secondarySurface, in: Capsule())
+                                .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 1))
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                .frame(width: 90)
+                .frame(width: 96)
 
                 // Team B players
                 HStack(spacing: 8) {
@@ -1995,15 +2150,13 @@ struct GameScheduleSheet: View {
                 }
                 .frame(maxWidth: .infinity)
             }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 16)
+            .padding(.bottom, 12)
         }
-        .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(confirmed ? Brand.emeraldAction.opacity(0.35) : Brand.softOutline, lineWidth: 1)
+        .padding(.horizontal, 4)
+        .background(
+            confirmed ? Brand.emeraldAction.opacity(0.04) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
         )
-        .shadow(color: .black.opacity(0.05), radius: 6, x: 0, y: 2)
     }
 
     private func playerAvatarCell(_ player: GameAttendee, isWinner: Bool) -> some View {
@@ -2020,7 +2173,7 @@ struct GameScheduleSheet: View {
                     .fill(Brand.secondarySurface)
                     .frame(width: 50, height: 50)
                     .overlay(
-                        Circle().stroke(isWinner ? Color(hex: "80FF00") : Brand.softOutline, lineWidth: isWinner ? 2.5 : 1)
+                        Circle().stroke(isWinner ? Color(hex: "80FF00") : Brand.softOutline.opacity(0.6), lineWidth: isWinner ? 2 : 0.5)
                     )
                 Text(initials.isEmpty ? "?" : initials)
                     .font(.system(size: 16, weight: .bold))
@@ -2031,7 +2184,7 @@ struct GameScheduleSheet: View {
                 .foregroundStyle(Brand.primaryText)
                 .lineLimit(1)
             if let dupr {
-                Text(String(format: "%.2f", dupr))
+                Text(String(format: "%.3f", dupr))
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Brand.mutedText)
                     .padding(.horizontal, 7)
@@ -2070,46 +2223,33 @@ struct GameScheduleSheet: View {
         isPosting = true
         defer { isPosting = false }
 
-        // Short caption used as the post text (shown in push notifications and
-        // as a fallback if the image fails to load).
-        let caption = "🏓 Session Results — \(game.title)"
-
-        // Attempt to generate the results image card.
-        let image = SessionResultsImageRenderer.render(
+        // Build a structured result payload — the primary in-app artifact.
+        let payload = SessionResultNormalizer.normalize(
             game: game,
             rounds: activeRounds,
             results: courtResults,
             method: method
         )
 
-        if let img = image, let pngData = img.pngData() {
-            let payload = FeedImageUploadPayload(
-                data: pngData,
-                contentType: "image/png",
-                fileExtension: "png"
-            )
-            let _ = await appState.createClubNewsPost(
-                for: club,
-                content: caption,
-                images: [payload],
-                isAnnouncement: postAsAnnouncement
-            )
+        let content: String
+        if let jsonData = try? JSONEncoder().encode(payload),
+           let jsonString = String(data: jsonData, encoding: .utf8) {
+            content = sessionResultSentinel + jsonString
         } else {
-            // Fallback: plain-text post if image rendering fails.
-            let text = SessionResultsFormatter.format(
-                game: game,
-                rounds: activeRounds,
-                results: courtResults,
-                method: method,
-                winCondition: winCondition
-            )
-            let _ = await appState.createClubNewsPost(
-                for: club,
-                content: text,
-                images: [],
-                isAnnouncement: postAsAnnouncement
+            // Encoding should never fail; fall back to plain text if it does.
+            content = SessionResultsFormatter.format(
+                game: game, rounds: activeRounds, results: courtResults,
+                method: method, winCondition: winCondition
             )
         }
+
+        let success = await appState.createClubNewsPost(
+            for: club,
+            content: content,
+            images: [],
+            isAnnouncement: postAsAnnouncement
+        )
+        if success { postSucceeded = true }
     }
 
     private func firstNameOrFull(_ name: String) -> String {
@@ -2412,109 +2552,67 @@ struct CourtScoreEntryView: View {
     }
 }
 
-// MARK: - Round Timer View
+// MARK: - Post Success Overlay
 
-private struct RoundTimerView: View {
-    let durationMinutes: Int
+private struct PostSuccessOverlay: View {
     let onDismiss: () -> Void
-
-    @State private var secondsRemaining: Int
-    @State private var isRunning = true
-
-    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
-    init(durationMinutes: Int, onDismiss: @escaping () -> Void) {
-        self.durationMinutes = durationMinutes
-        self.onDismiss = onDismiss
-        _secondsRemaining = State(initialValue: durationMinutes * 60)
-    }
-
-    private var timeString: String {
-        let m = max(0, secondsRemaining) / 60
-        let s = max(0, secondsRemaining) % 60
-        return String(format: "%d:%02d", m, s)
-    }
-
-    private var isExpired: Bool { secondsRemaining <= 0 }
+    @State private var appeared = false
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            Color.black.opacity(0.88)
+                .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 Spacer()
 
-                Text("ROUND TIMER")
-                    .font(.system(size: 13, weight: .semibold, design: .default))
-                    .foregroundStyle(.white.opacity(0.4))
-                    .tracking(3)
-                    .padding(.bottom, 20)
-
-                Text(timeString)
-                    .font(.system(size: 130, weight: .bold, design: .monospaced))
-                    .foregroundStyle(isExpired ? Color(hex: "80FF00") : .white)
-                    .monospacedDigit()
-                    .minimumScaleFactor(0.5)
-                    .lineLimit(1)
-                    .onReceive(ticker) { _ in
-                        guard isRunning && !isExpired else { return }
-                        secondsRemaining -= 1
-                    }
-
-                if isExpired {
-                    Text("Time's up!")
-                        .font(.system(size: 28, weight: .bold))
-                        .foregroundStyle(Color(hex: "80FF00"))
-                        .padding(.top, 16)
+                // Animated checkmark
+                ZStack {
+                    Circle()
+                        .fill(Color.green.opacity(0.15))
+                        .frame(width: 148, height: 148)
+                    Circle()
+                        .stroke(Color.green.opacity(0.35), lineWidth: 2)
+                        .frame(width: 148, height: 148)
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 88))
+                        .foregroundStyle(Color.green)
                 }
+                .scaleEffect(appeared ? 1.0 : 0.4)
+                .opacity(appeared ? 1.0 : 0)
+
+                VStack(spacing: 10) {
+                    Text("Results Posted!")
+                        .font(.title.weight(.bold))
+                        .foregroundStyle(.white)
+                    Text("Shared to club chat")
+                        .font(.body)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.top, 32)
+                .opacity(appeared ? 1.0 : 0)
+                .offset(y: appeared ? 0 : 8)
 
                 Spacer()
 
-                HStack(spacing: 48) {
-                    Button {
-                        isRunning.toggle()
-                    } label: {
-                        Image(systemName: isRunning ? "pause.circle" : "play.circle")
-                            .font(.system(size: 52, weight: .thin))
-                            .foregroundStyle(.white.opacity(0.8))
-                    }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        secondsRemaining = durationMinutes * 60
-                        isRunning = true
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise.circle")
-                            .font(.system(size: 52, weight: .thin))
-                            .foregroundStyle(.white.opacity(0.8))
-                    }
-                    .buttonStyle(.plain)
+                Button(action: onDismiss) {
+                    Text("Done")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.black)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 52)
+                        .background(.white, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
-                .padding(.bottom, 56)
+                .padding(.horizontal, 32)
+                .padding(.bottom, 40)
+                .opacity(appeared ? 1.0 : 0)
             }
-            .padding(.horizontal, 24)
-
-            // Dismiss button — top right
-            VStack {
-                HStack {
-                    Spacer()
-                    Button {
-                        onDismiss()
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(.white.opacity(0.12))
-                                .frame(width: 40, height: 40)
-                            Image(systemName: "xmark")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.7))
-                        }
-                        .padding(20)
-                    }
-                    .buttonStyle(.plain)
-                }
-                Spacer()
+        }
+        .onAppear {
+            withAnimation(.spring(response: 0.52, dampingFraction: 0.62)) {
+                appeared = true
             }
         }
     }
 }
+

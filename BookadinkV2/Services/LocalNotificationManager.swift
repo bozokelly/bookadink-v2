@@ -28,13 +28,13 @@ final class LocalNotificationManager {
 
     private init() {}
 
-    func scheduleGameReminder(for game: Game, clubName: String = "") async throws -> Date {
+    func scheduleGameReminder(for game: Game, offsetMinutes: Int, clubName: String = "") async throws -> Date {
         let now = Date()
         guard game.dateTime > now else { throw LocalNotificationError.gameAlreadyStarted }
 
         try await ensurePermission()
 
-        let fireDate = try reminderDate(for: game, now: now)
+        let fireDate = try reminderDate(for: game, offsetMinutes: offsetMinutes, now: now)
 
         let locationSuffix = Self.locationSuffix(venueName: game.venueName, clubName: clubName)
 
@@ -85,23 +85,12 @@ final class LocalNotificationManager {
         "bookadink.game.reminder.\(gameID.uuidString)"
     }
 
-    private func reminderDate(for game: Game, now: Date) throws -> Date {
-        let oneHourBefore = game.dateTime.addingTimeInterval(-3600)
-        if oneHourBefore.timeIntervalSince(now) >= 60 {
-            return oneHourBefore
+    private func reminderDate(for game: Game, offsetMinutes: Int, now: Date) throws -> Date {
+        let fireDate = game.dateTime.addingTimeInterval(-TimeInterval(offsetMinutes * 60))
+        guard fireDate.timeIntervalSince(now) >= 60 else {
+            throw LocalNotificationError.gameStartingTooSoon
         }
-
-        let tenMinutesBefore = game.dateTime.addingTimeInterval(-600)
-        if tenMinutesBefore.timeIntervalSince(now) >= 60 {
-            return tenMinutesBefore
-        }
-
-        let oneMinuteFromNow = now.addingTimeInterval(60)
-        if game.dateTime.timeIntervalSince(oneMinuteFromNow) >= 0 {
-            return oneMinuteFromNow
-        }
-
-        throw LocalNotificationError.gameStartingTooSoon
+        return fireDate
     }
 
     private func ensurePermission() async throws {
@@ -137,6 +126,38 @@ final class LocalNotificationManager {
                 continuation.resume(returning: settings)
             }
         }
+    }
+
+    // MARK: - Club Setup Reminder
+
+    private func setupReminderIdentifier(for clubID: UUID) -> String {
+        "bookadink.setup.reminder.\(clubID.uuidString)"
+    }
+
+    /// Schedules a 24-hour delayed push if no pending reminder already exists for this club.
+    /// Safe to call on every dashboard open — idempotent because the identifier is stable.
+    func scheduleSetupReminderIfNeeded(clubID: UUID, clubName: String) async {
+        let id = setupReminderIdentifier(for: clubID)
+        // Skip if one is already pending (don't reset the countdown on repeated opens).
+        let pending = await center.pendingNotificationRequests()
+        guard !pending.contains(where: { $0.identifier == id }) else { return }
+        do {
+            try await ensurePermission()
+            let content = UNMutableNotificationContent()
+            content.title = "Complete your club setup"
+            content.body = "\(clubName) can't collect booking fees until payment setup is finished. Tap to complete it."
+            content.sound = .default
+            content.userInfo = ["club_id": clubID.uuidString]
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 86_400, repeats: false)
+            let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+            try await addRequest(request)
+        } catch {
+            // Non-fatal — notification permission may be denied; setup flow still works.
+        }
+    }
+
+    func cancelSetupReminder(for clubID: UUID) {
+        center.removePendingNotificationRequests(withIdentifiers: [setupReminderIdentifier(for: clubID)])
     }
 
     /// Canonical location suffix for game notification bodies.

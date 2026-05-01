@@ -1,0 +1,129 @@
+# README.me
+# Purpose: Entry point for all Android implementation work on Book A Dink.
+#          Defines what each file in this directory governs, which file is
+#          authoritative for each topic, how to resolve conflicts, and the
+#          recommended read order before writing any Android code.
+# Scope: android_build/ directory
+
+---
+
+## WHAT IS THIS DIRECTORY
+
+`android_build/` is the source of truth for building the Book A Dink Android app.
+It defines behaviour, constraints, architecture, and test requirements derived from
+the live iOS product and Supabase backend.
+
+These files are enforceable contracts, not suggestions. If a rule conflicts with
+an assumption made during implementation, the rule wins.
+
+These files do NOT contain platform-specific code. They define what must be built,
+not how to write Kotlin or Compose syntax.
+
+---
+
+## FILE DIRECTORY
+
+### Guardrail Files (behaviour and rules)
+
+| File | Governs | Authoritative For |
+|---|---|---|
+| `system_contracts.me` | Core product lifecycle rules | Booking state machine, payment flow, credit rules, waitlist protocol, cancellation logic, subscription entitlements |
+| `backend_authority.me` | Server-enforced constraints | What is never trusted from clients, RLS policies, Edge Function responsibilities, schema constraints |
+| `data_contracts.me` | Entity structures and enums | Table schemas, required query columns, enum values, UUID/date/currency handling rules |
+| `client_guardrails.me` | Client DO/DO NOT rules | What iOS and Android can and cannot do; layout, network, auth, admin, chat constraints |
+| `ux_parity.me` | Cross-platform UX consistency | CTA labels, booking state display, payment badges, error messages, menu order, review and chat UX |
+| `platform_adaptation.me` | iOS vs Android equivalents | Stripe SDK mapping, APNs→FCM, deep links, location, in-app browser, storage, image loading |
+| `edge_cases.me` | Failure handling | Race conditions, partial states, retry logic, connectivity failures, all known production failure modes |
+
+### Planning Files (Android-specific)
+
+| File | Governs | Authoritative For |
+|---|---|---|
+| `README.me` *(this file)* | Directory orientation | Read order, conflict resolution, file responsibilities |
+| `android_v1_scope.me` | What to build | Included features, excluded features, priorities, dependencies, blockers |
+| `android_architecture.me` | How to structure the app | Layers, repositories, state management, module boundaries, backend interaction rules |
+| `android_test_matrix.me` | How to validate it | Parity test cases, edge case coverage, failure path tests, regression targets |
+
+---
+
+## AUTHORITATIVE FILE BY TOPIC
+
+| Topic | Primary File | Secondary Reference |
+|---|---|---|
+| Booking status transitions | `system_contracts.me §1` | `data_contracts.me §2 bookings` |
+| Payment sequence (Stripe) | `system_contracts.me §2` | `platform_adaptation.me §2` |
+| Credit rules | `system_contracts.me §3` | `backend_authority.me §2` |
+| Waitlist promotion | `system_contracts.me §4` | `edge_cases.me §2` |
+| Cancellation logic | `system_contracts.me §5` | `edge_cases.me §4` |
+| Subscription tiers | `system_contracts.me §6` | `data_contracts.me §2 club_subscriptions` |
+| RLS policies | `backend_authority.me §3` | `data_contracts.me` |
+| Edge Function ownership | `backend_authority.me §4` | `system_contracts.me` |
+| Table schemas | `data_contracts.me §2` | — |
+| Enum values | `data_contracts.me §3` | `system_contracts.me` |
+| UUID / date rules | `data_contracts.me §4, §5` | `client_guardrails.me §1` |
+| Stripe Android SDK | `platform_adaptation.me §2` | `system_contracts.me §2` |
+| FCM push notifications | `platform_adaptation.me §3` | `system_contracts.me §4` |
+| Deep links | `platform_adaptation.me §4` | — |
+| Layout constraints | `client_guardrails.me §5` | — |
+| UX copy and labels | `ux_parity.me` | — |
+| Race conditions | `edge_cases.me` | `backend_authority.me` |
+| Android v1 feature scope | `android_v1_scope.me` | — |
+| App architecture | `android_architecture.me` | `client_guardrails.me`, `backend_authority.me` |
+| Test cases | `android_test_matrix.me` | `edge_cases.me`, `system_contracts.me` |
+
+---
+
+## CONFLICT RESOLUTION ORDER
+
+If two files appear to say different things about the same behaviour, resolve in this order:
+
+1. **`system_contracts.me`** — wins for all product lifecycle behaviour
+2. **`backend_authority.me`** — wins for all server-side enforcement decisions
+3. **`data_contracts.me`** — wins for all schema and data format questions
+4. **`client_guardrails.me`** — wins for all client-side restrictions
+5. **`ux_parity.me`** — wins for all display and copy decisions
+6. **`platform_adaptation.me`** — wins for Android-specific implementation choices
+7. **`edge_cases.me`** — wins for failure handling specifics
+8. **`android_v1_scope.me`** — wins for what is in/out of scope for v1
+9. **`android_architecture.me`** — wins for structural and layering decisions
+10. **`android_test_matrix.me`** — wins for test coverage requirements
+
+If a conflict cannot be resolved by this order, the iOS production behaviour is the
+tiebreaker — the Android app must match what is live on iOS unless explicitly scoped out.
+
+---
+
+## RECOMMENDED READ ORDER
+
+Read these files in order before writing any Android code:
+
+1. `README.me` (this file) — orientation
+2. `android_v1_scope.me` — know what you are building
+3. `system_contracts.me` — understand the product rules
+4. `data_contracts.me` — understand the data structures
+5. `backend_authority.me` — understand what the server enforces
+6. `client_guardrails.me` — understand client constraints
+7. `platform_adaptation.me` — understand iOS → Android mappings
+8. `ux_parity.me` — understand required UX behaviour
+9. `edge_cases.me` — understand what can go wrong
+10. `android_architecture.me` — design the app structure
+11. `android_test_matrix.me` — plan validation
+
+Do not start implementing a feature until you have read the file that governs it.
+Do not invent behaviour for a missing case — check the iOS app or ask.
+
+---
+
+## KNOWN DEPRECATIONS
+
+The following patterns exist in the iOS codebase but are explicitly deprecated.
+Do NOT port them to Android:
+
+| Deprecated | Replacement | File |
+|---|---|---|
+| Global `creditBalanceCents: Int` | `creditBalanceByClubID: [UUID: Int]` | `system_contracts.me §3` |
+| `use_credits` RPC via PostgREST | Direct PATCH on `player_credits` | `system_contracts.me §3` |
+| `issue_cancellation_credit` RPC via PostgREST | Direct PATCH/INSERT on `player_credits` | `system_contracts.me §3` |
+| `bookadink-preset://` URL scheme | Not used | `client_guardrails.me §1` |
+| `tournament` as skill_level value | Use `advanced` | `data_contracts.me §3` |
+| Global platform subscription billing via Google Play | Stripe subscriptions only | `platform_adaptation.me §10` |

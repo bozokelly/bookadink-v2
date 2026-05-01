@@ -1,13 +1,27 @@
 import CoreLocation
 import Foundation
 
+// MARK: - Geocode Result
+
+/// Typed result from a venue address geocoding attempt.
+/// Callers must handle all cases — no case is treated as a silent success.
+enum GeocodeResult {
+    /// Geocoding succeeded and returned a valid coordinate.
+    case success(CLLocation)
+    /// No address text was provided — nothing to geocode.
+    case emptyAddress
+    /// Geocoder ran successfully but returned no matching location.
+    case noResult
+    /// Geocoder threw an error (network failure, rate limit, etc.).
+    case failed
+}
+
 // MARK: - Geocoding
 
 extension LocationService {
-    /// Geocodes a ClubVenueDraft's address fields and returns the best coordinate.
-    /// Returns nil when address fields are empty or geocoding fails.
-    /// Caller decides how to handle failure — never throws.
-    static func geocode(draft: ClubVenueDraft) async -> CLLocation? {
+    /// Geocodes a ClubVenueDraft's address fields.
+    /// Returns a typed GeocodeResult — callers must not treat non-success as acceptable.
+    static func geocode(draft: ClubVenueDraft) async -> GeocodeResult {
         let parts = [
             draft.streetAddress.trimmingCharacters(in: .whitespacesAndNewlines),
             draft.suburb.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -15,11 +29,17 @@ extension LocationService {
             draft.postcode.trimmingCharacters(in: .whitespacesAndNewlines),
             draft.country.trimmingCharacters(in: .whitespacesAndNewlines)
         ].filter { !$0.isEmpty }
-        guard !parts.isEmpty else { return nil }
+        guard !parts.isEmpty else { return .emptyAddress }
         let addressString = parts.joined(separator: ", ")
         return await withCheckedContinuation { continuation in
-            CLGeocoder().geocodeAddressString(addressString) { placemarks, _ in
-                continuation.resume(returning: placemarks?.first?.location)
+            CLGeocoder().geocodeAddressString(addressString) { placemarks, error in
+                if error != nil {
+                    continuation.resume(returning: .failed)
+                } else if let location = placemarks?.first?.location {
+                    continuation.resume(returning: .success(location))
+                } else {
+                    continuation.resume(returning: .noResult)
+                }
             }
         }
     }
@@ -57,41 +77,43 @@ enum LocationService {
     //
     // RULE: Two entity types. Two distinct coordinate sources. Never mixed.
     //
-    //   CLUBS  → always club.latitude / club.longitude (the club's registered base address).
-    //            No venue lookup. The clubs table is the single source of truth for where
-    //            the club is located. Used by: Explore Nearby, club list, club map pins.
+    //   CLUBS  → primary venue coordinates (Stage 4: venue is the source of truth).
+    //            When venues are available, primary venue coordinates take precedence.
+    //            club.latitude / club.longitude is a fallback cache only.
+    //            Use location(for:venues:) wherever venues are loaded.
+    //            Use location(for:) only where venues are unavailable.
     //
     //   GAMES  → venue-first resolution.
-    //            1. game.venueName matched to a ClubVenue with coordinates
-    //            2. Fallback: club.latitude / club.longitude
+    //            1. game.venueId FK match → ClubVenue coordinates
+    //            2. game.venueName fallback match → ClubVenue coordinates
+    //            3. Primary venue fallback
+    //            4. club.latitude / club.longitude
     //            Used by: Home "Your Next Game", Games Near You, Game Detail.
-    //
-    // This boundary prevents venue coordinates from leaking into club distance labels,
-    // which would make the club distance reflect a specific game venue instead of
-    // where the club itself is registered.
 
-    /// Returns a CLLocation for a Club if it has stored coordinates.
+    /// Returns a CLLocation for a Club using only its stored club-level coordinates.
+    /// Use this only where venue data is unavailable.
+    /// Prefer location(for:venues:) wherever venues are loaded.
     static func location(for club: Club) -> CLLocation? {
         guard let lat = club.latitude, let lng = club.longitude else { return nil }
         return CLLocation(latitude: lat, longitude: lng)
     }
 
-    /// Returns a CLLocation for a Club, falling back to its primary ClubVenue
-    /// when club-level coordinates are missing.
+    /// Returns a CLLocation for a Club, using primary venue coordinates as the
+    /// authoritative source (Stage 4). Club-level coordinates are a fallback only.
     ///
     /// Priority:
-    ///   1. club.latitude / club.longitude
-    ///   2. Primary ClubVenue coordinates (isPrimary == true)
+    ///   1. Primary ClubVenue coordinates (isPrimary == true, has lat/lng)
+    ///   2. Any ClubVenue with coordinates (non-primary fallback)
+    ///   3. club.latitude / club.longitude (legacy fallback cache)
     ///
-    /// Use this for Explore Nearby map pins and club distance labels so that
-    /// clubs whose venue geocoding ran before club-level geocoding are still visible.
+    /// Use this for Explore Nearby map pins and club distance labels.
     static func location(for club: Club, venues: [ClubVenue]) -> CLLocation? {
-        if let loc = location(for: club) { return loc }
-        // Try primary venue first, then any venue with coordinates.
+        // Primary venue is the source of truth — check it first.
         let candidate = venues.first(where: { $0.isPrimary && $0.latitude != nil })
                      ?? venues.first(where: { $0.latitude != nil })
         if let candidate, let loc = location(for: candidate) { return loc }
-        return nil
+        // Fallback: club-level coordinate cache (pre-Stage 4 clubs, no venues yet).
+        return location(for: club)
     }
 
     /// Returns a CLLocation for a ClubVenue if it has stored coordinates.

@@ -1,0 +1,749 @@
+# ios_feature_parity_map.me
+# Purpose: Captures the iOS app as it is implemented — every surface, screen,
+#          local state, navigation behaviour, role-based difference, optimistic
+#          update, confirmation dialog, inline action, and edge-case visual — so
+#          Android can reproduce exact parity without guessing.
+#
+# HOW THIS DIFFERS FROM OTHER FILES:
+#   - ux_parity.me: rules and CTA labels. This file: actual implemented behaviour
+#     with source references.
+#   - client_guardrails.me: DO/DO NOT rules. This file: what iOS actually DOES.
+#   - android_v1_scope.me: what Android must build. This file: what iOS has built.
+#   - backend_schema_map.me: DB structures. This file: UI/UX against those structures.
+#
+# Source files audited (SwiftUI views, services, models):
+#   AppState.swift, MainTabView.swift, BookingsListView.swift,
+#   NotificationsView.swift, ClubNewsView.swift, ProfileDashboardView.swift,
+#   HomeView.swift, NearbyDiscoveryView.swift, NearbyGamesView.swift,
+#   ProfileSetupView.swift, ClubDetailView.swift (partial, prior session),
+#   GameDetailView.swift (partial, prior session), ClubOwnerSheets.swift,
+#   Models/Models.swift (prior session), FeatureGateService.swift (prior session)
+#
+# Scope: iOS production app as of 2026-04-21.
+
+---
+
+## 1. iOS SOURCE INVENTORY
+
+| File | Primary Responsibility | Android Parity Required |
+|---|---|---|
+| `App/AppState.swift` | All global app state, auth, booking, credits, notifications, club chat | Yes — `AppStateHolder` |
+| `Views/Main/MainTabView.swift` | 5-tab scaffold, deep link routing, notification badge | Yes |
+| `Views/Home/HomeView.swift` | Home tab: next booking, nearby games carousel, news feed | Yes (v1) |
+| `Views/Home/NearbyDiscoveryView.swift` | Map + bottom panel for nearby game discovery | Yes |
+| `Views/Home/NearbyGamesView.swift` | Full list of nearby games with filters | Yes |
+| `Views/Home/SafariView.swift` | In-app browser for news articles | Chrome Custom Tabs |
+| `Views/Clubs/ClubsListView.swift` | Club browse + search | Yes |
+| `Views/Clubs/ClubDetailView.swift` | Club detail (4 tabs: Info/Games/Members/Chat) | Yes |
+| `Views/Clubs/ClubGameRow.swift` | Admin game row with rich status card | Admin-only — v1 exclude |
+| `Views/Clubs/ClubNewsView.swift` | Chat/news tab with composer | Yes |
+| `Views/Clubs/ClubOwnerSheets.swift` | All admin sheets (manage games, join requests, etc.) | Admin-only — v1 exclude |
+| `Views/Clubs/ClubDashboardView.swift` | Admin dashboard fullScreenCover | Admin-only — v1 exclude |
+| `Views/Clubs/ClubAnalyticsDashboardView.swift` | Pro-tier analytics | Admin-only — v1 exclude |
+| `Views/Clubs/ClubUpgradePaywallView.swift` | Subscription upgrade UI | Admin-only — v1 exclude |
+| `Views/Games/GameDetailView.swift` | Booking CTA, payment sheet, attendees | Yes |
+| `Views/Games/GameScheduleSheet.swift` | Game result sharing, calendar/reminder | Calendar/Reminder — v1 exclude |
+| `Views/Games/NearbyGamesView.swift` | Filtered nearby games list | Yes |
+| `Views/Bookings/BookingsListView.swift` | Grouped bookings list, credit pills | Yes |
+| `Views/Notifications/NotificationsView.swift` | Notification list, review sheet trigger | Yes |
+| `Views/Profile/ProfileDashboardView.swift` | Profile summary + DUPR + badges + credits | Partial (v1 excludes DUPR chart) |
+| `Views/Profile/ProfileSetupView.swift` | Onboarding profile completion | Yes |
+| `Views/Profile/BadgesCard.swift` | Achievement badges display | v1 exclude |
+| `Views/Profile/DUPRHistoryCard.swift` | DUPR history chart | v1 exclude |
+| `Views/Profile/ReviewGameSheet.swift` | Review submission sheet | Yes |
+| `Services/AppState.swift` | All domain logic and Supabase calls | Yes — ViewModel/UseCase layer |
+| `Services/FeatureGateService.swift` | Feature access control by entitlement | Admin-only — v1 exclude |
+| `Services/LocationService.swift` | Location resolution for games and clubs | Yes |
+| `Services/PickleballNewsService.swift` | RSS news feed (The Dink) | v1 exclude |
+| `Services/PlaceSearchService.swift` | Suburb geocoding for home view filter | Yes |
+| `Models/Models.swift` | All data models, enums, computed properties | Yes — domain model layer |
+
+---
+
+## 2. SCREEN / SURFACE INVENTORY
+
+### Player-facing surfaces (Android v1 must implement all)
+
+| Surface | Presentation | Entry Point |
+|---|---|---|
+| Auth — Welcome / Sign In / Sign Up | Full screen | App launch when signed out |
+| Profile Setup (onboarding) | Full screen | After sign-up, before main tabs |
+| Home Tab | Tab root | Tab bar |
+| Nearby Discovery (map) | Sheet over Home | Home tab "Games Near You" CTA |
+| Nearby Games (list) | Sheet over Home | "More games" CTA on Home |
+| Clubs List | Tab root | Tab bar |
+| Club Detail | NavigationStack push | Club list tap, deep link, notification tap |
+| Game Detail | Full screen push or modal sheet | Various (game list, deep link, notification) |
+| Bookings List | Tab root | Tab bar |
+| Notifications List | Own NavigationStack | Tab bar |
+| Profile Dashboard | Tab root (no nav bar) | Tab bar |
+| Review Sheet | ModalBottomSheet | Notification tap |
+| Edit Profile (hub) | Sheet | Profile dashboard edit button |
+| Personal Info, Contact, DUPR, Emergency Contact, Security, Notifications | NavigationLink inside Edit Profile sheet | Edit Profile |
+
+### Admin / owner surfaces (Android v1 EXCLUDES — document for reference only)
+
+| Surface | Presentation | Entry Point |
+|---|---|---|
+| Club Dashboard | fullScreenCover | Admin toolbar button (grid icon) on ClubDetailView |
+| Manage Games | Sheet from Dashboard | Dashboard quick-nav |
+| Create Game | Sheet | Dashboard / owner tools |
+| Edit Game | Sheet | Manage Games or ClubGameRow swipe |
+| Join Requests | Sheet | Dashboard / owner tools |
+| Manage Members | Sheet | Dashboard / owner tools |
+| Club Settings (edit club) | Sheet | Dashboard / owner tools |
+| Analytics Dashboard | Sheet | Dashboard (Pro plan only) |
+| Upgrade Paywall | Sheet | When feature gated and tier too low |
+| Game Schedule Sheet (result sharing) | Sheet | After game ends |
+
+---
+
+## 3. APP BOOTSTRAP AND AUTH GUARD
+
+### Bootstrap sequence (AppState.init)
+1. Restore persisted session from UserDefaults
+2. Restore DUPR ID store, DUPR ratings store, DUPR history store
+3. Sync current user DUPR data from those stores
+4. Restore checked-in booking IDs, club news notification preference, pinned club IDs
+5. Background Task starts:
+   a. If already signed in → `refreshSessionIfPossible(silent: true)`
+   b. `refreshClubs()` (always, even signed-out — clubs are public)
+   c. If signed in: `loadProfileFromBackendIfAvailable()`, `loadNotificationPreferencesIfNeeded()`, `refreshBookings(silent: true)`, `refreshUpcomingGames()`
+   d. Set `isInitialBootstrapComplete = true`
+
+### Auth guard (RootView pattern — NOT fullScreenCover)
+```
+authState != .signedOut && !isInitialBootstrapComplete && profile == nil
+```
+While this condition is true: show loading/splash screen.
+NEVER use `fullScreenCover(isPresented: .constant(appState.isAuthenticating))` — this fires on token refresh and overlays MainTabView.
+
+### After sign-in: `postAuthenticationBootstrap()`
+- `loadProfileFromBackendIfAvailable()` → syncs Supabase → UserDefaults DUPR
+- `loadNotificationPreferencesIfNeeded()`
+- `refreshBookings(silent: true)`
+- `refreshUpcomingGames()`
+- `refreshMemberships()`
+- `registerRemotePushTokenIfNeeded()`
+- `isInitialBootstrapComplete = true`
+
+### On sign-out
+- Push token cleared from server (PATCH profiles with nil APNs token) BEFORE wiping session
+- All @Published state reset to empty
+- All realtime club chat clients stopped
+- All background tasks cancelled
+- `dataProvider.setAccessToken(nil)` called
+
+---
+
+## 4. MAIN TAB VIEW
+
+### Tab order and icons
+| Index | Tab | Label | Icon |
+|---|---|---|---|
+| 0 | Home | "Home" | `house.fill` |
+| 1 | Clubs | "Clubs" | `building.2` |
+| 2 | Bookings | "Bookings" | `calendar` |
+| 3 | Notifications | "Notifications" | `bell` |
+| 4 | Profile | "Profile" | `person.crop.circle` |
+
+### Tab bar behaviour
+- `tint`: `Brand.primaryText` (dark text, not a color accent)
+- Style: `DefaultTabViewStyle()` — MUST be set explicitly on iPad (iOS 18+ defaults to sidebar/top-bar without it)
+- `toolbarBackground(.visible, for: .tabBar)` — always opaque tab bar
+- Notification tab shows badge: `appState.unreadNotificationCount` (hidden when 0)
+
+### Deep link handling (MainTabView.handleDeepLink)
+```
+.club(id):
+  1. Find club in appState.clubs (memory only — no DB fallback)
+  2. selectedTab = .clubs
+  3. DispatchQueue.main.asyncAfter(0.1) → set deepLinkClub (NavigationDestination on Clubs stack)
+  4. pendingDeepLink = nil
+
+.game(id):
+  1. Search memory: gamesByClubID.values + bookings cache
+  2. If found → asyncAfter(0.1) → set deepLinkGame (sheet presentation)
+  3. If NOT found → appState.resolveGame(id:) → fetch from DB → then set deepLinkGame
+  4. pendingDeepLink = nil in both paths
+
+.review:
+  → no-op (pendingDeepLink = nil only)
+```
+- Cold-launch deep link: `.task` checks `appState.pendingDeepLink` once on first appear because `onChange` won't fire for a value that was already set when the view first enters the hierarchy.
+- NotificationCenter `.bookADinkOpenNotificationsTab` → switches `selectedTab = .notifications`
+
+### Navigation presentation styles
+- Club detail: `navigationDestination(item: $deepLinkClub)` — pushed within Clubs NavigationStack
+- Game detail: `.sheet(item: $deepLinkGame)` — presented as sheet from MainTabView level
+- NotificationsView: owns its OWN `NavigationStack` so club taps push inline
+
+---
+
+## 5. HOME TAB
+
+### HomeView layout
+- Header: "Hi, {firstName}" greeting (first name only from profile.fullName)
+- **Next booking card**: shows only if upcoming confirmed booking exists, with same-day follow-on count indicator (hidden when 0 follow-ons)
+- **"Games Near You" carousel**: scrollable horizontal card list
+  - Data: `allUpcomingGames` filtered to: `status == "upcoming"`, next 7 days, within 75 km of effective user location, NOT already booked (confirmed/waitlisted only)
+  - Games whose club has no coordinates resolved yet: INCLUDED (not silently dropped)
+  - Sorted: soonest first, then nearest first
+- **"More games" CTA**: opens `NearbyGamesView` (full list) as sheet
+- **Suburb search**: allows geocoding a suburb name via `PlaceSearchService` to use as fake GPS origin for distance sorting
+- **Pickleball news section**: RSS feed (The Dink), up to 5 articles, opens in `SafariView` (Chrome Custom Tabs equivalent) — **OUT OF SCOPE for Android v1**
+
+### Nearby games filter logic
+- Games hidden from carousel if `booking.state` is `.confirmed` or `.waitlisted` for that game
+- Cancelled and failed-payment bookings do NOT hide the game
+- Distance filter: 75 km radius when location available; all games when no location
+- Location source priority: `locationManager.userLocation` → `suburbSearchLocation` (geocoded)
+- Log line emitted: `[HomeFilter] DROP 'title' status=X days=Y booked=Z inWindow=W` (debug only, not for Android)
+
+### NearbyDiscoveryView (map + bottom panel)
+- Presented as `.sheet` over HomeView
+- Map: `Map` with game pins colored by spot availability
+- Bottom panel: custom draggable panel — three states: `.minimized` (72dp), `.collapsed` (320dp), `.expanded` (82% screen height)
+- Pin tap → scrolls list panel to that game, highlights card
+- Card tap → centers map on pin AND centers scroll
+- Card body tap → opens `GameDetailView` (full screen, not sheet in this context)
+- Filters:
+  - Distance: Any / 5 km / 10 km / 25 km
+  - Skill: nil (any) or specific skill level string
+  - Day: Any / Today / This Week
+- Game sort: available-today → available-soon → full games last; capped at 50 games
+
+---
+
+## 6. CLUBS TAB
+
+### ClubsListView
+- Full list of all clubs (appState.clubs, pre-loaded at bootstrap)
+- Search/filter UI
+- Pull-to-refresh calls `appState.refreshClubs()`
+- Nearby clubs sort: distance from user location
+- Tapping club → pushes `ClubDetailView` in Clubs NavigationStack
+
+### ClubDetailView — key behaviours
+*(Full detail in prior session — key supplement here)*
+
+**Toolbar:**
+- Leading: back button (Capsule .ultraThinMaterial material background)
+- Trailing (admin only): grid icon (`square.grid.2x2`) with red dot badge when `pendingCount > 0` → opens `ClubDashboardView` as **`fullScreenCover`** (not a sheet)
+
+**Tab structure (NOT separate nav destinations — internal tab switch only):**
+- Info / Games / Members / Chat
+- Tab switch triggers lazy data load (not on open)
+
+**Admin ClubDashboardView (fullScreenCover):**
+- Contains: `OwnerToolSheet` enum cases: `dashboard`, `manageGames`, `joinRequests`, `createGame`, `editClub`, `members`, `analytics`
+- Club tools menu order (both toolbar Menu and ownerToolsPanel card):
+  1. View / Edit Games
+  2. Create Game
+  3. Divider
+  4. Club Settings
+  5. Divider
+  6. Join Requests
+  7. Manage Members
+
+**On `.onAppear` (ClubDetailView triggers these tasks):**
+- `refreshMemberships()`
+- `refreshClubAdminRole(for: club)`
+- `refreshGames(for: club)`
+- `fetchReviews(for: club.id)`
+- `refreshCreditBalance(for: club.id)`
+- If already known admin: `refreshOwnerJoinRequests(for: club)` + `fetchClubEntitlements(for: club.id)`
+
+**Delete game confirmation dialog (NOT confirmationDialog on Club Actions):**
+- If game has `recurrenceGroupID`: 3 destructive options: "Delete This Event" / "Delete This & Future" / "Delete Entire Series"
+- If no recurrence: single "Delete Game" destructive option
+
+**isMemberOrAdmin logic:**
+- Handles: `.approved`, `.unknown` (club owner case), AND `isClubAdminUser`
+- Floating CTA bar (join/leave) shown only when NOT `isMemberOrAdmin`
+
+---
+
+## 7. GAME DETAIL VIEW
+
+*(Partial read from prior session — key supplement here)*
+
+### PaymentSheet result handling
+```
+.completed:
+  → if isDeferred (waitlist hold path):
+       appState.confirmPendingBooking(bookingID:, stripePaymentIntentID:, platformFeeCents:,
+                                       clubPayoutCents:, creditsAppliedCents:, clubID: game.clubID)
+  → else (new booking):
+       appState.requestBooking(for: game, stripePaymentIntentID:, platformFeeCents:,
+                               clubPayoutCents:, creditsAppliedCents:)
+
+.canceled:
+  → clear all pending* state, no booking insert
+
+.failed(error):
+  → clear all pending* state, set paymentErrorMessage
+```
+
+### Inline booked actions (shown when booking is confirmed)
+- "Add to Calendar" / "Remove from Calendar" button (EKEventStore integration)
+- "Set Reminder" / "Remove Reminder" button (UNUserNotificationCenter local push)
+- Both buttons use `appState.scheduleStore` (separate @EnvironmentObject — not AppState)
+- Calendar export state: `appState.hasCalendarExport(for: game)`, `appState.isExportingCalendar(for: game)`
+- Reminder state: `appState.hasReminder(for: game)`
+- **Android v1 does NOT include calendar/reminder actions** — these are platform-specific iOS features
+
+### Computed properties critical for Android parity
+- `isClubAdminUser`: `appState.isClubAdmin(for: game.clubID)` — gates admin sections
+- `canViewAttendees`: members + admins (not non-members); shown as locked icon + count otherwise
+- `canBookGameByClubMembership`: must be approved/unknown member (or admin) to book
+- `currentGame`: live-resolved game from `appState.gamesByClubID` — NOT the init-injected `game` param (which may be stale)
+- `spotsLeft`: `currentGame.maxPlayers - confirmedCount` (server count not local)
+- `isGameFull`: `spotsLeft <= 0`
+- `tagLine`: composite label from skill level, game type, duration
+
+### Hold countdown (pending_payment state)
+- Live timer: `GameDetailViewModel` (or @State Timer) updating every second
+- Displays: "Complete Booking · $X.XX" CTA with countdown "X:XX remaining"
+- On hold expiry: CTA switches to "Spot hold expired" with "Refresh" button
+- When user opens app AFTER expiry: shows expired state immediately (no countdown shown)
+
+---
+
+## 8. BOOKINGS LIST VIEW
+
+### Grouping logic
+- Groups: `thisWeek`, `nextTwoWeeks`, `laterThisMonth`, `past`
+- `thisWeek`: same ISO week (Calendar.current weekOfYear) as now
+- `nextTwoWeeks`: after this week, within 14 days from now
+- `laterThisMonth`: beyond 14 days
+- `past`: before now
+- Default expanded groups on launch: `thisWeek`, `nextTwoWeeks`, `laterThisMonth`
+- Past group: collapsed by default; toggled via "Show Past Bookings" button
+
+### Visibility rules
+- **Upcoming sections**: cancelled bookings HIDDEN (would look like game cancellations)
+- **Past section**: only `confirmed` bookings shown (confirmed at game time = assumed attendance)
+- Past section only appears when "Show Past Bookings" toggle is on
+
+### "Next booking" accent
+- The earliest confirmed upcoming booking gets a subtle lime accent (regardless of which section bucket it's in)
+- `nextBookingID` computed from `appState.bookings` filtered to confirmed + future
+
+### Credit pills
+- Shown below bookings list: one pill per club with positive balance
+- Loaded in `.task` via `withTaskGroup` concurrently for all club IDs in user's bookings
+- On `lastCancellationCredit` change: immediately refresh that club's balance (no pull-to-refresh needed)
+
+### History toggle button
+- Shows: clock icon + "Show Past Bookings" when off / "Showing Past + Future" when on
+- Also shows "Upcoming Only" chip when off
+- Past group auto-expanded (spring animation) when toggle turns on
+
+### Pull-to-refresh
+- Calls `appState.refreshBookings()`
+
+### Booking card tap
+- Sets `selectedGame` → `navigationDestination(item:)` push to `GameDetailView`
+
+---
+
+## 9. NOTIFICATIONS VIEW
+
+### Structure
+- Uses its OWN inner `NavigationStack` (not the tab's outer one)
+- Title: "Notifications" (large, rounded, no navigation bar — `.toolbar(.hidden, for: .navigationBar)`)
+- Refresh: pull-to-refresh calls `appState.refreshNotifications()`
+
+### Action row (shown when notifications exist)
+- Unread count label: "X unread" (hidden if 0)
+- "Mark all read" button (shown only if unread > 0)
+- "Clear" button (trash icon, errorRed tint) → shows `.alert` confirmation → calls `appState.clearAllNotifications()`
+
+### Notification row visual
+- `iconBadge`: 42×42 circle, color from `notification.type.accentColorName`, SF Symbol icon
+- Read indicator: 8×8 teal circle (top-right) — shown when `!notification.read`
+- Chevron: shown when `hasDestination == true`
+- Unread border: 1.5pt stroke with accentColor.opacity(0.35)
+- Read border: 1pt `Brand.softOutline`
+- Relative timestamp: `.formatted(.relative(presentation: .named))` (e.g. "2 hours ago")
+
+### Notification tap routing
+```
+.game(id):
+  → search gamesByClubID.values + bookings cache
+  → if found: set selectedGame (sheet over NotificationsView)
+  → if NOT found: returns nil, hasDestination = false, no navigation (unlike MainTabView which fetches from DB)
+  NOTE: game notifications where the game is not in memory show no chevron and are NOT tappable
+
+.club(id):
+  → find in appState.clubs
+  → set selectedClub → navigationDestination push inline (back returns to Notifications)
+
+.review(gameID):
+  → ALWAYS tappable (hasDestination always true for review type)
+  → extracts game title from notification.title: strips "How was " prefix and "?" suffix
+  → fallback title: "Your Session"
+  → set pendingReview → ReviewGameSheet as sheet
+```
+
+### Review sheet trigger
+- `ReviewGameSheet(gameID: review.id, gameTitle: review.gameTitle)` — does NOT pass a Game object
+- Club resolved inside ReviewGameSheet via `appState.clubForGame(gameID:)` (memory → DB fallback)
+- After submit, "View [Club Name]" button available: calls `onViewClub` closure → dismiss sheet + open club via selectedClub
+
+### Notification type → icon + color mapping
+See `AppNotification.NotificationType` in Models.swift. Key mappings:
+- `booking_confirmed` → `checkmark.seal.fill` / emeraldAction
+- `game_cancelled` → `xmark.circle.fill` / errorRed
+- `waitlist_promoted` → `arrow.up.circle.fill` / pineTeal
+- `club_announcement` → `megaphone.fill` / spicyOrange
+- `club_chat_mention` → `at.circle.fill` / slateBlue
+- `game_review_request` → `star.bubble.fill` / pineTeal
+- `new_game` → `plus.circle.fill` / emeraldAction
+- `membership_approved` → `person.badge.checkmark.fill` / emeraldAction
+- `membership_rejected` → `person.badge.minus.fill` / errorRed
+
+---
+
+## 10. CLUB CHAT (ClubNewsView)
+
+### Composer
+- `postText`: `@State` in `ClubNewsView` (NOT in AppState — view-level only)
+- `isAnnouncementPost`: toggle in ClubNewsView — only shown when `isClubModerator == true`
+- Announcement mode post → different visual treatment (megaphone icon, distinct background)
+- Draft images: `[DraftNewsImage]` — `@State` in view; cleared on post
+- Photo picker: `PhotosPickerItem` via SwiftUI `PhotosUI`
+- Camera: UIImagePickerController wrapped as sheet (`showCamera`)
+- Attachment options: sheet showing camera vs. photo library choice
+- Mention candidates: `[ClubDirectoryMember]` — populated as user types `@`
+
+### Who can post
+```
+canPost:
+  - isClubModerator → always true
+  - membershipState: .approved or .unknown → true
+  - .none, .pending, .rejected → false (composer shown but disabled or hidden)
+```
+
+### Comment draft (CRITICAL — do not lift)
+- `commentDraft` lives as `@State private var commentDraft: String = ""` INSIDE `ClubNewsPostCard`
+- Lifting to `ClubNewsView` or parent as `[UUID: String]` causes FULL re-render of ALL cards on every keystroke (keyboard lag)
+- This is a known iOS production bug that was fixed by keeping state card-local
+- Android: comment draft must be `remember { mutableStateOf("") }` inside the card Composable, NOT in the ViewModel
+
+### Optimistic updates
+- Like: increment `likeCount` on post locally, revert on failure
+- Comment: increment `commentCount` locally, append comment, revert on failure
+- Post: append to local list before server confirmation
+- Do NOT call full `refreshClubNews` after every interaction
+
+### Hidden posts
+- `hiddenPostIDs: Set<UUID>` — locally hidden by "hide" action (not a DB write in v1)
+- Posts filtered: `posts = appState.clubNewsPosts(for: club).filter { !hiddenPostIDs.contains($0.id) }`
+
+### Realtime / refresh
+- Realtime clients per club: `clubChatRealtimeClients: [UUID: SupabaseClubChatRealtimeClient]`
+- Started when club chat tab first opens; stopped on sign-out
+- `scenePhase` change triggers refresh when app returns to foreground
+
+### Push error banner
+- `appState.remotePushRegistrationErrorMessage`: shown as error banner at top of chat view when non-nil
+
+---
+
+## 11. PROFILE DASHBOARD
+
+### Layout (scroll, no navigation bar)
+- Title: "My Profile" (32pt, bold, rounded, left-aligned)
+- Cards (order, with cardAppear stagger animation):
+  1. profileHeader (avatar initials circle, name, email, skill + DUPR badge)
+  2. DUPRHistoryCard (chart — **OUT OF SCOPE Android v1**)
+  3. GamesPlayedCard (games played count — **OUT OF SCOPE Android v1**)
+  4. BadgesCard (achievements — **OUT OF SCOPE Android v1**)
+  5. creditsCard (only shown when `clubCreditRows` is non-empty)
+  6. signOutButton
+
+### Credit card on profile
+- Lists all clubs where `creditBalanceByClubID[clubID] > 0`
+- Sorted alphabetically by club name
+- One row per club: club name + formatted balance
+- Loaded in `.task` via `withTaskGroup` for all booking club IDs
+
+### Refresh (pull-to-refresh)
+- `refreshProfile()` + `refreshBookings(silent: true)` + `refreshMemberships()` + concurrent credit refresh for all booking club IDs
+
+### Edit Profile button → `EditProfileSheet` (navigation hub)
+Sections inside the hub sheet:
+1. Personal Info → `ProfilePersonalInfoView` (full name, date of birth)
+2. Contact → `ProfileContactView` (email read-only, phone editable)
+3. DUPR → `ProfileDUPRView` (DUPR ID + doubles + singles ratings)
+4. Emergency Contact → `ProfileEmergencyContactView` (name + phone)
+5. Password & Security → `ProfileSecurityView`
+6. Notifications → `ProfileNotificationsView`
+
+Then:
+- Sign Out (alert confirmation)
+- Delete Account (destructive alert — not yet implemented server-side)
+
+### ProfileDUPRView storage split
+- DUPR ID: UserDefaults only (no Supabase column); key: `bookadink.profile.duprIDByUserID`
+- Doubles rating: UserDefaults + synced to `profiles.dupr_rating` via PATCH
+- Singles rating: UserDefaults only (`@AppStorage("duprSinglesRating")`) — NO Supabase column
+- Rating validation: 1.0–8.0 enforced client-side
+- DUPR history: UserDefaults (`bookadink.profile.duprHistoryByUserID`); NOT synced to Supabase in v1
+
+### ProfileNotificationsView (notification preferences)
+- Reads iOS push authorization status via `UNUserNotificationCenter`
+- Shows "Open iOS Settings" button if `pushStatus != .authorized`
+- Push toggles only shown when `pushStatus == .authorized`
+- Push types: booking confirmations, new games, waitlist updates, member chat/posts
+- Email types: booking confirmations, new games, waitlist updates
+- Footer: "Club announcements always push through regardless of these settings"
+- Saved to Supabase via `appState.saveNotificationPreferences()` on `onChange(of: prefs)`
+
+### Pinned clubs
+- `pinnedClubIDs: [UUID]` stored in UserDefaults (`bookadink.home.pinnedClubIDs`)
+- Used to sort Home tab club section
+
+---
+
+## 12. ONBOARDING / PROFILE SETUP
+
+### ProfileSetupView (shown after sign-up when profile.fullName is blank)
+- Fields: Full Name (required), Home Club optional, Skill Level (segmented picker)
+- "Continue to Clubs" button — disabled until name non-empty, shows `ProgressView` while saving
+- On save: `appState.completeProfile(name:, homeClub:, skillLevel:)` → inserts profile row → triggers `postAuthenticationBootstrap()`
+- Error shown below button with `AppCopy.friendlyError(error)` mapping
+- Skill level options from `SkillLevel.allCases` — MUST exclude `.tournament` (DB bans it)
+
+---
+
+## 13. SHARED STATE (AppState @Published properties — complete list)
+
+### Auth / identity
+- `pendingDeepLink: DeepLink?`
+- `authState: AuthState` (.signedOut, .signedIn)
+- `authUserID: UUID?`
+- `authEmail: String?`
+- `authAccessToken: String?`, `authRefreshToken: String?`
+- `profile: UserProfile?`
+- `isAuthenticating: Bool`, `isRefreshingSession: Bool`
+- `isInitialBootstrapComplete: Bool`
+- `isPerformingPostSignInBootstrap: Bool`
+- `authErrorMessage: String?`, `authInfoMessage: String?`
+
+### Clubs / games
+- `clubs: [Club]` — initial value is `MockData.clubs` (swapped to live on first fetch)
+- `gamesByClubID: [UUID: [Game]]`
+- `allUpcomingGames: [Game]` — next 14 days, fetched at bootstrap, powers Home + Nearby
+- `clubVenuesByClubID: [UUID: [ClubVenue]]`
+
+### Bookings
+- `bookings: [BookingWithGame]`
+- `attendeesByGameID: [UUID: [GameAttendee]]`
+- `requestingBookingGameIDs: Set<UUID>` — used for CTA spinner/disable
+- `cancellingBookingIDs: Set<UUID>` — per-booking cancel spinner
+
+### Membership / club roles
+- `membershipStatesByClubID: [UUID: ClubMembershipState]`
+- `clubAdminRoleByClubID: [UUID: String]`
+- `requestingMembershipClubIDs: Set<UUID>`
+- `removingMembershipClubIDs: Set<UUID>`
+
+### Notifications
+- `notifications: [AppNotification]`
+- `isLoadingNotifications: Bool`
+- `unreadNotificationCount: Int` (computed, not @Published — derived from notifications)
+
+### Credits
+- `creditBalanceByClubID: [UUID: Int]` — ONLY credit container; club-scoped; keyed by lowercase UUID
+- `lastCancellationCredit: CancellationCreditResult?` — signal for post-cancellation UI updates
+
+### Admin / owner state
+- `ownerJoinRequestsByClubID: [UUID: [ClubJoinRequest]]`
+- `ownerMembersByClubID: [UUID: [ClubOwnerMember]]`
+- `clubDirectoryMembersByClubID: [UUID: [ClubDirectoryMember]]`
+- `clubNewsPostsByClubID: [UUID: [ClubNewsPost]]`
+- `reviewsByClubID: [UUID: [GameReview]]`
+- `dashboardSummaryByClubID: [UUID: ClubDashboardSummary]`
+- `analyticsKPIsByClubID: [UUID: ClubAnalyticsKPIs]` etc. (Pro plan only)
+- `subscriptionsByClubID: [UUID: ClubSubscription]`
+- `entitlementsByClubID: [UUID: ClubEntitlements]`
+
+### Attendance / check-in (admin only)
+- `checkedInBookingIDs: Set<UUID>` — persisted to UserDefaults
+- `noShowBookingIDs: Set<UUID>` — persisted to UserDefaults
+- `attendancePaymentByBookingID: [UUID: String]` — "unpaid" | "cash" | "stripe"
+
+### Misc
+- `duprID: String?` — current user's DUPR ID (UserDefaults)
+- `duprDoublesRating: Double?` — current user's doubles rating
+- `duprHistory: [DUPREntry]`
+- `pinnedClubIDs: [UUID]` — persisted to UserDefaults
+- `mutedClubChatIDs: Set<UUID>`
+- `notificationPreferences: NotificationPreferences`
+- `remotePushTokenHex: String?` — current APNs token hex
+
+### Android equivalent: AppStateHolder
+Must expose as `StateFlow`:
+- `currentUser: UserProfile?`
+- `creditBalanceByClubId: Map<UUID, Int>` (NOT a global Int)
+- `pendingDeepLink: DeepLink?`
+- `authState: AuthState`
+See `android_architecture.me §7` for full specification.
+
+---
+
+## 14. LOCAL STATE / SWIFTUI BEHAVIOUR RISKS FOR ANDROID
+
+These patterns exist in iOS and have caused bugs. Android must NOT repeat them.
+
+| iOS Pattern | Risk | Android Rule |
+|---|---|---|
+| `commentDraft` lifted to parent as `[UUID: String]` | Full card list re-render on every keystroke | Keep as `remember { mutableStateOf("") }` inside card Composable |
+| `fullScreenCover(isPresented: .constant(appState.isAuthenticating))` | Fires on token refresh; overlays MainTabView | Do NOT gate a fullScreenCover on the auth-loading boolean |
+| `GameDetailView` reading `game.feeAmount` (injected param, possibly stale) | Credit balance loads against wrong fee | Always use `currentGame.feeAmount` (live-resolved from gamesByClubID) |
+| `confirmPendingBooking` called without `clubID` | Credit deduction skipped; balance not updated | Always pass `clubID` — it is required, not optional |
+| Loading all club data on ClubDetailView open | Causes performance freeze on tab switch | Load on tab change only (lazy by selected tab) |
+| Global `creditBalanceCents: Int` | Club-scoped credits collapse; multi-club users get wrong balance | Use `creditBalanceByClubId: Map<UUID, Int>` exclusively |
+| UUID keys not lowercased in PostgREST filters | Returns 0 rows silently | Always `.lowercase()` before filter |
+| `tournament` sent as skill_level | PostgreSQL enum error (22P02) | Map `.tournament` to `"advanced"` if it ever appears |
+
+---
+
+## 15. ROLE-BASED BEHAVIOUR MATRIX
+
+| Surface | Player (non-member) | Approved Member | Club Admin / Owner |
+|---|---|---|---|
+| Club detail toolbar | No admin button | No admin button | Grid icon (opens Dashboard fullScreenCover) |
+| Join/Leave CTA | "Request to Join" / "Leave" visible | "Leave Club" (if removable) | Hidden (owner can't leave) |
+| Games tab — scheduled games | Hidden | Hidden | Shown (dimmed, orange "Not visible" banner) |
+| Attendee list on GameDetailView | Locked icon + count only | Full list with initials | Full list + payment badges |
+| Payment badge (Card/Comp/Unpaid) | Hidden | Hidden | Shown in attendee list |
+| Chat composer | Cannot post (canPost = false) | Can post; no announcement toggle | Can post; announcement toggle visible |
+| Book CTA | Disabled if not member | Enabled per booking rules | Enabled (can also admin-add others) |
+| Cancel booking | Own bookings only | Own bookings only | Can cancel any attendee's booking |
+| Admin add player | N/A | N/A | "Add Player" section in GameDetailView |
+| Attendance check-in | N/A | N/A | Tappable attendance controls in GameDetailView |
+| Club Dashboard (fullScreenCover) | Not accessible | Not accessible | Opened via grid toolbar button |
+
+---
+
+## 16. NAVIGATION AND PRESENTATION PATTERNS
+
+| Destination | Presentation Style | Back/Dismiss |
+|---|---|---|
+| ClubDetailView from ClubsList | NavigationStack push | Back arrow |
+| ClubDetailView from Notification | `navigationDestination(item:)` inline in Notifications NavigationStack | Back arrow → returns to Notifications |
+| ClubDetailView from deep link | `navigationDestination(item:)` in Clubs NavigationStack | Back arrow → returns to Clubs list |
+| GameDetailView from game list | NavigationStack push | Back arrow |
+| GameDetailView from notification tap | `.sheet(item:)` | Dismiss → returns to Notifications |
+| GameDetailView from deep link | `.sheet(item:)` at MainTabView level | Dismiss → returns to previous tab |
+| ReviewGameSheet | `ModalBottomSheet` / `.sheet` | Dismiss, or "View [Club Name]" button then dismiss |
+| EditProfileSheet | `.sheet(isPresented:)` | Close button |
+| ClubDashboardView (admin) | `.fullScreenCover(isPresented:)` | Dismiss (no back arrow) |
+| NearbyDiscoveryView | `.sheet` from HomeView | Dismiss (drag-down or system gesture) |
+| PaymentSheet (Stripe) | System modal (SDK-managed) | Cancel / complete |
+
+---
+
+## 17. FEATURE COMPLETENESS CHECKLIST (Android v1 vs iOS)
+
+| Feature | iOS Status | Android v1 |
+|---|---|---|
+| Email + password auth | Live | Must implement |
+| Session persistence (auto re-auth) | Live | Must implement |
+| Profile setup (onboarding) | Live | Must implement |
+| Profile view + edit (name, DOB, phone, DUPR, emergency, password) | Live | Must implement (DOB optional) |
+| Notification preferences (push + email toggles) | Live | Must implement |
+| Avatar preset selection | Live | Must implement |
+| DUPR doubles rating sync to Supabase | Live | Must implement |
+| DUPR history chart | Live | v1 EXCLUDE |
+| BadgesCard | Live | v1 EXCLUDE |
+| Club browse + search | Live | Must implement |
+| Club detail (4 tabs) | Live | Must implement |
+| Nearby clubs | Live | Must implement |
+| Game list (upcoming) | Live | Must implement |
+| Game detail (full) | Live | Must implement |
+| Nearby discovery (map + panel) | Live | Must implement |
+| Booking — free game | Live | Must implement |
+| Booking — paid game (Stripe + Google Pay) | Live | Must implement (Google Pay) |
+| Credits — view, apply, post-cancellation | Live | Must implement |
+| Waitlist (free + paid) | Live | Must implement |
+| pending_payment hold countdown | Live | Must implement |
+| Calendar export ("Add to Calendar") | Live (EKEventStore) | v1 EXCLUDE |
+| Local reminder ("Set Reminder") | Live (UNUserNotificationCenter) | v1 EXCLUDE |
+| Cancellation flow (< 6h / > 6h credit) | Live | Must implement |
+| Bookings list (grouped, history toggle) | Live | Must implement |
+| Notifications list + routing | Live | Must implement |
+| FCM push notifications | BLOCKED (APNs only today) | Blocked — backend change required |
+| Club chat (view, post, comment, like) | Live | Must implement |
+| Club chat image display | Live | Must implement (view only) |
+| Club chat image upload | Live | v1 EXCLUDE |
+| Club chat real-time updates | Live (Supabase realtime) | Must implement |
+| Club announcements (admin post type) | Live | v1 EXCLUDE (admin-only action) |
+| Reviews (submit + view on club) | Live | Must implement |
+| Deep links (club/game/booking) | Live | Must implement |
+| Deep link — review → no-op | Live | Must implement |
+| Home tab (next booking + nearby carousel) | Live | Must implement |
+| Pickleball news feed | Live | v1 EXCLUDE |
+| Admin tools (all) | Live | v1 EXCLUDE |
+| Analytics dashboard | Live | v1 EXCLUDE |
+| Subscription upgrade paywall | Live | v1 EXCLUDE |
+| Stripe Connect onboarding | Live | v1 EXCLUDE |
+| Game result / session result sharing | Live | v1 EXCLUDE |
+
+---
+
+## 18. ANDROID PARITY GAPS SUMMARY
+
+### Gaps requiring backend changes before Android can ship
+| Gap | Backend Change Required |
+|---|---|
+| FCM push notifications | Add `fcm_token` column to `profiles`; update 5+ Edge Functions to send to FCM |
+
+### Android equivalents (platform mapping)
+| iOS | Android |
+|---|---|
+| APNs token → `profiles.apns_token` | FCM token → `profiles.fcm_token` |
+| `UNUserNotificationCenter` | `NotificationManager` / `FirebaseMessagingService` |
+| `SafariView` (SFSafariViewController) | Chrome Custom Tabs |
+| `EKEventStore` (calendar) | NOT required for v1 |
+| Local push reminder | NOT required for v1 |
+| UserDefaults | DataStore Preferences |
+| `@AppStorage` | DataStore Preferences |
+| `PhotosPickerItem` (image upload) | NOT required for v1 |
+| `StripePaymentSheet` | `PaymentSheet` (Stripe Android SDK) |
+| Apple Pay | Google Pay via `GooglePayConfig(countryCode="AU", currencyCode="aud")` |
+| `CLLocationManager` | `FusedLocationProviderClient` |
+| `fullScreenCover` | `Dialog` (full-screen) or new Activity |
+| `NavigationStack` + `navigationDestination(item:)` | Navigation Compose `NavHost` + `navigate()` |
+| `LazyVStack` / `LazyHStack` | `LazyColumn` / `LazyRow` |
+| `ScrollView { }` | `Column` inside `Scaffold` or `LazyColumn` |
+
+### State management equivalences
+| iOS | Android |
+|---|---|
+| `@StateObject AppState` | `@Singleton AppStateHolder` (Hilt) |
+| `@Published var X` | `StateFlow<X>` |
+| `@State private var X` (screen-scoped) | `var X by remember { mutableStateOf(...) }` |
+| `@State private var commentDraft` (card-scoped) | `var draft by remember { mutableStateOf("") }` in Card Composable |
+| `@EnvironmentObject appState` | `@HiltViewModel` + `collectAsState()` |
+
+---
+
+## 19. VIOLATION IMPACT
+
+| Violation | Impact |
+|---|---|
+| Lifting comment draft to ViewModel/feed | Full card list recomposition on every keystroke — keyboard lag |
+| Global credit balance instead of club-scoped Map | Multi-club users show wrong credit balance; credits applied to wrong club |
+| Reading injected game param instead of currentGame | Credit balance check against stale fee; user sees wrong net price |
+| Calling confirmPendingBooking without clubID | Credit deduction silently skipped |
+| Not lowercasing UUIDs in PostgREST filters | 0 rows returned silently — bookings, credits, attendees all appear empty |
+| Sending `tournament` as skill_level | PostgreSQL enum error 22P02 — game creation or profile save fails |
+| Presenting fullScreenCover on isAuthenticating | Overlays main tab view during token refresh — user sees loading screen mid-session |
+| Loading all club tab data on ClubDetailView open | Performance freeze; violates "load on tab change only" rule |
+| Using use_credits or issue_cancellation_credit via PostgREST | PGRST202 — function not found; credit operations silently fail |
+| Not handling notification.game not in memory | Game notifications become untappable when game not cached |

@@ -11,7 +11,7 @@ enum MapNavigationURL {
         guard coordinate.latitude != 0 || coordinate.longitude != 0 else { return nil }
         let lat = String(format: "%.7f", coordinate.latitude)
         let lng = String(format: "%.7f", coordinate.longitude)
-        return URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(lat),\(lng)")
+        return URL(string: "https://maps.apple.com/?daddr=\(lat),\(lng)&dirflg=d")
     }
 
     /// String-search directions URL — fallback when exact coordinates are unavailable.
@@ -21,6 +21,6 @@ enum MapNavigationURL {
         guard !trimmed.isEmpty else { return nil }
         guard trimmed.count <= maxDestinationLength else { return nil }
         guard let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return nil }
-        return URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(encoded)")
+        return URL(string: "https://maps.apple.com/?q=\(encoded)")
     }
 }

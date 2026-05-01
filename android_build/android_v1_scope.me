@@ -1,0 +1,257 @@
+# android_v1_scope.me
+# Purpose: Defines the exact feature scope for Android v1. Explicitly lists what
+#          is included, what is excluded, feature priority, dependencies, and
+#          blockers that must be resolved before implementation can begin.
+# Scope: Android v1 only. Does not define iOS behaviour or backend changes.
+
+---
+
+## SCOPE PRINCIPLE
+
+Android v1 is a **player-facing app**. It covers everything a player needs to
+discover, book, attend, and pay for pickleball games. Club owner and admin tools
+are out of scope for v1 with specific exceptions noted below.
+
+Backend is shared with iOS. No new Supabase tables, RPCs, or Edge Functions are
+required for Android v1, with two exceptions noted in §4.
+
+---
+
+## 1. IN SCOPE — INCLUDED FEATURES
+
+### Authentication
+- Email + password sign up and sign in
+- Session persistence (auto re-auth on app launch)
+- Sign out
+- Auth state bootstrap guard (see `client_guardrails.me §7`)
+
+### Profile
+- View own profile (name, email, phone, skill level, DUPR rating)
+- Edit and save profile
+- Avatar display (preset selection — not upload in v1)
+- DUPR rating display (from Supabase + local cache)
+- DUPR rating sync from backend after every profile fetch
+
+### Club Discovery
+- Browse clubs list (all clubs)
+- Nearby clubs (location-based, sorted by distance)
+- Club detail view:
+  - Info tab (name, address, description, membership status)
+  - Games tab (upcoming games for that club)
+  - Members tab (club member list)
+  - Club Chat tab (see Club Chat below)
+- Join / leave club (membership request and approval flow)
+- Pull-to-refresh on all club lists
+
+### Game Discovery
+- Upcoming games feed (cross-club)
+- Nearby games (location-based)
+- Game detail view (full info, attendee list, booking CTA)
+- Filter by skill level
+- Scheduled/unpublished games: hidden from player view entirely
+
+### Booking — Free Games
+- Book a free game
+- Cancel a confirmed booking (no credit window — free)
+- View booking confirmation state
+- Waitlist join for full free games
+- Automatic waitlist promotion for free games (multi-promote)
+
+### Booking — Paid Games
+- Book a paid game via Stripe PaymentSheet (card + Google Pay)
+- Credit application at checkout (toggle, net price display)
+- Full credit cover path (skip Stripe, deduct credits only)
+- Cancel a paid booking:
+  - Within 6h of game: no credit
+  - Outside 6h: credit issued to club-scoped balance
+- Cancellation credit feedback (amount credited, new balance)
+- `pending_payment` state display with live countdown
+- "Complete Booking" CTA for promoted waitlist players
+- "Spot hold expired" passive state + Refresh
+
+### Credits
+- View credit balance per club (on club detail and booking screen)
+- View credit balance pills on bookings list (one per club with positive balance)
+- Apply credits at checkout (partial and full cover)
+- Balance refresh after cancellation, booking, and on view load
+- All operations are club-scoped (see `system_contracts.me §3`)
+
+### Notifications
+- Push notifications via FCM (see `platform_adaptation.me §3`)
+- In-app notifications list
+- Mark as read
+- Clear all
+- Notification tap routing:
+  - Club → club detail inline navigation
+  - Game → game detail modal
+  - Review prompt → review sheet modal
+- Notification types: booking_confirmed, game_cancelled, waitlist_promoted,
+  club_announcement, club_chat_mention, club_chat_reply, game_review_request
+
+### Bookings List
+- View all upcoming and past bookings
+- Booking state displayed per item (confirmed, waitlisted, pending_payment, cancelled)
+- Cancel booking from list
+- Credit balance pills per club
+
+### Club Chat
+- View club news / chat feed
+- Post a text message (player post, not announcement)
+- Comment on a post
+- Like a post
+- View images in posts (display only — no upload in v1)
+- Mentions (@username) — display only; mention notifications received
+- Real-time or pull-to-refresh updates
+
+### Reviews
+- Receive review prompt notification 24h after game ends
+- Submit a star rating (1–5) + optional comment via review sheet
+- View reviews section on club detail (aggregate stars, individual reviews)
+- Duplicate review handling: "You have already left a review for this session."
+
+### Deep Links
+- Handle `bookadink://club/{id}` → open club detail
+- Handle `bookadink://game/{id}` → open game detail
+- Handle `bookadink://booking/{id}` → open booking detail
+- Handle `bookadink://review/{gameID}` → no-op (review comes via notification only)
+
+---
+
+## 2. OUT OF SCOPE — EXCLUDED FROM ANDROID V1
+
+These features exist on iOS but are NOT included in Android v1.
+
+### Club Owner and Admin Tools (entire category)
+- Club creation
+- Club editing (name, description, address, image, settings)
+- Club analytics dashboard
+- Game creation and editing
+- Manage games modal (admin game cards, fill status, cancellations)
+- Add player to game (admin)
+- Attendance tracking and check-in
+- Join request approval / rejection
+- Manage members (promote, remove)
+- Club subscription management UI
+- Stripe Connect onboarding
+- "Delayed publish" (publish_at) game scheduling UI
+- Club announcement posts (admin-only post type)
+- Announcement mode toggle in club chat composer
+
+### Profile Features
+- DUPR rating history chart (`DUPRHistoryCard`)
+- Custom avatar upload (view preset only)
+- Badges card
+
+### Payment Features
+- Stripe Connect onboarding for club owners
+- Subscription upgrade / downgrade UI
+- Billing portal
+
+### Media
+- Image upload (club banners, club avatars, chat images)
+- Splash screen video (use static splash)
+
+### Content
+- Pickleball news feed (The Dink RSS — deferred to v1.x)
+
+### Misc
+- "Win Rate" stat — no data backing; never implement on any platform
+
+---
+
+## 3. FEATURE PRIORITY AND DEPENDENCY MAP
+
+Priority order for implementation. Each feature depends on those above it.
+
+```
+P0 — FOUNDATION (must ship before anything else)
+├── Auth (sign up, sign in, session persistence)
+├── Profile (view + edit)
+└── Supabase client setup + token injection
+
+P1 — DISCOVERY (required before booking)
+├── Club list + Club detail
+├── Game list + Game detail
+└── Nearby games + clubs (location permission)
+
+P2 — BOOKING — FREE (core player value)
+├── Book a free game
+├── Cancel a booking
+├── Waitlist join
+└── Auto-promote waitlist (free games)
+
+P3 — BOOKING — PAID (requires P2 complete + Stripe SDK wired)
+├── Stripe PaymentSheet integration
+├── Book a paid game (card + Google Pay)
+├── pending_payment state + hold countdown
+└── Complete booking (waitlist hold path)
+
+P4 — CREDITS (requires P3 complete)
+├── Credit balance fetch (club-scoped)
+├── Apply credits at checkout
+├── Cancellation credit issuance
+└── Credit display (club detail, bookings list, checkout)
+
+P5 — NOTIFICATIONS (can develop in parallel with P3/P4)
+├── FCM token registration
+├── In-app notification list
+├── Notification tap routing
+└── Clear all
+
+P6 — CLUB CHAT (requires P1 complete)
+├── Feed view (posts, comments, likes)
+├── Post + comment composer
+└── Mention display
+
+P7 — REVIEWS (requires P5 complete)
+├── Review sheet (submit rating + comment)
+├── Reviews section on club detail
+└── Duplicate review handling
+```
+
+---
+
+## 4. BACKEND CHANGES REQUIRED FOR ANDROID V1
+
+All other backend systems are shared with iOS and require no changes.
+Only these two additions are needed before Android v1 can fully ship:
+
+### FCM Token Storage
+- Supabase needs to store per-user FCM tokens alongside APNs tokens.
+- Required DB change: `profiles` (or a separate `device_tokens` table) must support
+  a `fcm_token TEXT NULL` column.
+- All Edge Functions that send push notifications (`booking-confirmed`,
+  `game-cancelled-notify`, `club-announcement-notify`, `club-chat-push`,
+  `waitlist-promoted`) must be updated to send to both APNs and FCM targets.
+- This is a **blocker** for Android push notifications.
+
+### Deep Link Domain Verification
+- `bookadink://` custom scheme works without domain verification.
+- If App Links (HTTPS) are desired for shareable URLs, a `.well-known/assetlinks.json`
+  file must be hosted at the app's domain.
+- Not a hard blocker for v1 — custom scheme is sufficient.
+
+---
+
+## 5. BLOCKERS BEFORE IMPLEMENTATION CAN BEGIN
+
+| Blocker | Required Action | Owner |
+|---|---|---|
+| FCM token storage | Add `fcm_token` column to profiles or create `device_tokens` table | Backend |
+| FCM push sending | Update all 5 push-sending Edge Functions to support FCM | Backend |
+| Stripe Android publishable key | Confirm `SupabaseConfig.stripePublishableKey` is accessible to Android build | Backend/iOS |
+| Google Pay merchant ID | Register `bookadink` merchant with Google Pay API console | Business |
+| `bookadink://` scheme | Register custom scheme intent filter (no external dependency) | Android |
+| Test Supabase project | Confirm Android can connect to same Supabase project as iOS (no separate instance) | Backend |
+
+---
+
+## 6. EXPLICIT NON-GOALS FOR V1
+
+- Do NOT implement any club owner or admin screen.
+- Do NOT implement Google Play Billing — Stripe handles all payments (see `platform_adaptation.me §10`).
+- Do NOT implement custom image upload.
+- Do NOT create new Supabase tables or RPCs (beyond FCM token storage in §4).
+- Do NOT implement offline mode or local DB caching beyond in-memory state.
+- Do NOT implement push notification preferences or muting in v1.
+- Do NOT implement a DUPR integration or chart.

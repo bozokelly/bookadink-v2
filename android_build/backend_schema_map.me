@@ -1,0 +1,1056 @@
+# backend_schema_map.me
+# Purpose: Maps the real Supabase backend as it exists in the repository — tables,
+#          triggers, RPCs, views, policies, and Edge Functions derived from actual
+#          migration files and source code. This is evidence-based, not summary.
+# Scope: Android v1 implementation, cross-referenced against iOS production behaviour.
+#
+# How this differs from existing docs:
+#   data_contracts.me     — defines what clients must query; this file describes what
+#                           exists on the backend including internal systems clients
+#                           never call, and explains WHY each piece exists.
+#   backend_authority.me  — defines rules; this file describes the actual implementation
+#                           of those rules including trigger names, function signatures,
+#                           known bugs, and migration history.
+
+---
+
+## 1. BACKEND SOURCE INVENTORY
+
+Sources inspected for this file:
+
+```
+supabase/migrations/
+  20260403_club_entitlements.sql
+  20260406_active_game_limit_trigger.sql
+  20260406_club_debug_views.sql
+  20260406_get_club_fill_rate_summary.sql
+  20260406_get_club_revenue_summary.sql
+  20260406_platform_analytics_views.sql
+  20260407_booking_status_pending_payment.sql
+  20260407_bookings_hold_expires_at.sql
+  20260407_bookings_member_read_policy.sql
+  20260407_game_attendance_status.sql
+  20260407_notification_type_waitlist_promoted.sql
+  20260407_promote_top_waitlisted_phase3.sql
+  20260407_promote_top_waitlisted_push.sql
+  20260409_stage4_primary_venue_location.sql
+  20260413_clear_venue_name.sql
+  20260413_club_avatar_color.sql
+  20260413_club_scoped_credits.sql
+  20260413_club_venues_rls.sql
+  20260413_credits_bootstrap.sql
+  20260413_credits_cancellation_policy.sql
+  20260413_dupr_rating_precision.sql
+  20260413_notification_type_new_game.sql
+  20260413_player_credits_insert_policy.sql
+  20260413_player_credits_update_policy.sql
+  20260415_fix_club_admins_recursion.sql
+  20260415_promote_waitlist_player_fn.sql
+  20260415_rls_hardening.sql
+  20260416_notification_preferences.sql
+  20260417_analytics_rpcs.sql
+  20260417_canceling_entitlements_fix.sql
+  20260417_pro_game_features.sql
+  20260419_analytics_kpis_always_1_row.sql
+  20260419_analytics_supplemental.sql
+  20260419_backfill_owner_members.sql
+  20260419_cancellation_policy.sql
+  20260419_club_dashboard_summary.sql
+  20260419_dupr_update_tracking.sql
+  20260421_security_hardening.sql
+  20260423_enforce_game_fee_entitlement.sql
+  20260424_analytics_revenue_breakdown.sql
+  20260424_analytics_hardening.sql
+  20260424_analytics_custom_range.sql
+  20260424_analytics_tz_grouping.sql
+  20260425_entitlements_repair.sql
+  20260425_protect_subscription_tier.sql
+  20260425_delete_club_rpc.sql
+  20260425_subscription_source.sql
+  20260425_club_subscriptions_schema.sql
+  20260425_admin_force_expire_subscription.sql
+  20260426_analytics_top_games_patterns.sql
+  20260426_analytics_peak_times_fix.sql
+  20260426_analytics_top_games_time_to_fill.sql
+  20260426_analytics_revenue_session_breakdown.sql
+  20260426_waitlist_hold_expiry_cron.sql
+  20260426_book_game_rpc.sql
+  20260426_avatar_palettes.sql
+  20260426_profiles_avatar_color_key.sql
+  20260426_get_club_reviews_avatar_color_key.sql
+  20260427_waitlist_compaction.sql
+  20260427_standardise_plan_limits.sql
+  20260427_app_config.sql
+  20260427_notification_type_game_reminder_2h.sql
+  20260427_member_only_booking_gate.sql
+  20260428_subscription_plans.sql
+  20260428_analytics_manual_revenue.sql
+  20260428_book_game_dupr_enforcement.sql
+  20260428_normalize_skill_level_tournament.sql
+  20260428_entitlement_locked_features_rpc.sql
+  20260429_normalize_game_format.sql
+  20260429_field_length_constraints.sql
+  20260429_dupr_validation_constraints.sql
+  20260429_dupr_rating_3dp_precision.sql
+  20260429_analytics_fix_refunded_label.sql
+  20260430_bookings_payment_method_constraint.sql
+
+supabase/functions/
+  archive-old-games/index.ts
+  booking-confirmed/index.ts
+  cancel-club-subscription/index.ts
+  club-announcement-notify/index.ts
+  club-chat-push/index.ts
+  connect-onboarding/index.ts
+  create-club-subscription/index.ts
+  create-payment-intent/index.ts
+  game-cancelled-notify/index.ts
+  game-published-notify/index.ts
+  game-reminder-2h/index.ts          ← canonical; reads offset from app_config
+  game-updated-notify/index.ts
+  notify/index.ts
+  promote-top-waitlisted-push/index.ts
+  send-notification-email/index.ts
+  send-review-prompts/index.ts
+  stripe-webhook/index.ts
+```
+
+**Note**: No `seed.sql` or `schema.sql` baseline found. Schema is built entirely from incremental migrations. Some original table DDL (e.g. `games`, `bookings`, `clubs`) predates the migrations directory and was created directly in Supabase Dashboard — the column list for those tables is inferred from migration ADD COLUMN statements, iOS model structs, and PostgREST select strings.
+
+---
+
+## 2. ENTITY INVENTORY
+
+### `profiles`
+- **Purpose**: Stores extended user data for authenticated users. `id = auth.uid()`.
+- **Android v1**: Required for auth, profile display and edit, credit scoping, avatar rendering.
+- **Audience**: User-facing.
+- **Key columns**:
+  - `id UUID PK` — matches `auth.users.id`
+  - `full_name TEXT`
+  - `email TEXT`
+  - `phone TEXT NULL`
+  - `date_of_birth DATE NULL`
+  - `emergency_contact_name TEXT NULL`
+  - `emergency_contact_phone TEXT NULL`
+  - `dupr_rating NUMERIC(5,3) NULL` — **exactly 3 decimal places, range 2.000–8.000**. Column type `NUMERIC(5,3)` enforces 3dp at storage level. DB CHECK: `profiles_dupr_rating_precision_range_check`. Android must validate: 3dp exactly + range 2.0–8.0 before PATCH. Never send `3.52` or `3` — send `3.520` or `3.000`. Do not silently round or cap — reject and surface error to user. Required for DUPR API integration (external API expects canonical 3dp). Migration: `20260429_dupr_rating_3dp_precision.sql`.
+  - `dupr_id TEXT NULL` — player's DUPR player ID string (e.g. "ABC-12345"). **Server gate**: `book_game()` checks this column when `games.requires_dupr = true`. Must be persisted to DB when the user saves their DUPR ID — not just stored locally. DB CHECK constraints: length 6–24 chars, `^[A-Z0-9-]+$` (uppercase alphanumeric + hyphen), must contain at least one digit. Always PATCH uppercase. Android must normalize to uppercase before sending. Migrations: `20260428_book_game_dupr_enforcement.sql`, `20260429_field_length_constraints.sql`, `20260429_dupr_validation_constraints.sql`.
+  - `dupr_updated_by UUID NULL` — user who last updated this DUPR (admin audit trail)
+  - `dupr_updated_at TIMESTAMPTZ NULL`
+  - `dupr_updated_by_name TEXT NULL` — resolved full_name snapshot at update time
+  - `skill_level TEXT NULL`
+  - `avatar_preset_id TEXT NULL`
+  - `avatar_color_key TEXT NULL FK → avatar_palettes(palette_key)` — user's chosen palette key. NULL = use `midnight_navy` default. Never derive a colour from the user's initials or ID hash — read from DB only.
+  - `stripe_customer_id TEXT NULL` — Stripe Customer ID for subscription billing
+- **RLS**: UPDATE requires `WITH CHECK (auth.uid() = id)` — MUST include or upserts silently corrupt data (CLAUDE.md production incident).
+- **DANGEROUS TO OMIT**: `dupr_rating` (numeric rating display), `dupr_id` (server DUPR gate — omitting it means dupr_required errors even for valid users), `avatar_color_key` (avatars render wrong colour).
+- **Android dependency**: PATCH profiles on edit. SELECT on profile fetch. Sync `dupr_rating` and `dupr_id` to DataStore after every fetch. When user saves DUPR ID, PATCH `profiles.dupr_id` to DB immediately. Always include `avatar_color_key` in SELECT.
+
+---
+
+### `avatar_palettes`
+- **Purpose**: Server-authoritative gradient palette definitions for all player and club avatars. The DB is the single source of truth — clients render by palette_key, never compute independently.
+- **Migration**: `20260426_avatar_palettes.sql`
+- **Android v1**: Required. Fetch at bootstrap. Cache for the session.
+- **Key columns**:
+  - `palette_key TEXT PK` — e.g. `'midnight_navy'`, `'electric_blue'`
+  - `palette_name TEXT` — display label
+  - `category TEXT CHECK IN ('premium_dark', 'neon_accent', 'soft_luxury')`
+  - `gradient_start_hex TEXT` — 6-char hex WITHOUT `#` prefix, e.g. `'0B1F3A'`
+  - `gradient_end_hex TEXT` — 6-char hex WITHOUT `#` prefix
+  - `is_default BOOL` — exactly ONE row has `is_default = TRUE` (enforced by unique partial index)
+  - `is_active BOOL` — only active palettes should be offered in UI
+  - `display_order INT` — ascending sort order for UI picker
+- **Default**: `midnight_navy` (`#0B1F3A → #1E3A5F`) is the authoritative platform-neutral default for all clients when `profiles.avatar_color_key` is NULL.
+- **Constraint note**: `profiles_avatar_color_key_fk` and `clubs_avatar_background_color_fk` are both `NOT VALID` — meaning existing rows with legacy hex values are not retroactively validated. New writes must use valid `palette_key` values.
+- **RLS**: SELECT requires `auth.role() = 'authenticated'` AND `is_active = TRUE`. DML via service_role only.
+- **Android bootstrap pattern**:
+```kotlin
+// Fetch all active palettes once at launch, cache in memory.
+val palettes: List<AvatarPalette> = supabase.from("avatar_palettes")
+    .select("palette_key,palette_name,category,gradient_start_hex,gradient_end_hex,is_default,display_order")
+    .eq("is_active", true)
+    .order("display_order", ascending = true)
+    .decodeList()
+
+// Resolve a user's colour — NEVER hash the user ID.
+fun resolveGradient(paletteKey: String?, palettes: List<AvatarPalette>): AvatarPalette {
+    return palettes.firstOrNull { it.paletteKey == paletteKey }
+        ?: palettes.first { it.isDefault }  // midnight_navy fallback
+}
+```
+
+---
+
+### `app_config`
+- **Purpose**: Server-authoritative key/value store for cross-platform runtime constants. Clients and Edge Functions read these at bootstrap so timing rules and limits have a single DB source of truth.
+- **Migration**: `20260427_app_config.sql`
+- **Android v1**: Required. Fetch at bootstrap alongside plan tier limits.
+- **Key columns**:
+  - `key TEXT PK`
+  - `value TEXT NOT NULL`
+  - `description TEXT NULL`
+  - `updated_at TIMESTAMPTZ`
+- **Required keys** (must exist in every environment):
+
+  | key | example value | meaning |
+  |---|---|---|
+  | `game_reminder_offset_minutes` | `"120"` | Minutes before game start to fire the pre-game push + local notification |
+
+- **RLS**: SELECT for `auth.role() = 'authenticated'`. DML via service_role only.
+- **Bootstrap endpoint**: `GET /rest/v1/app_config?select=key,value`
+- **Nil handling rule**: If a required key is absent, callers must surface the nil state to the user — **no hardcoded silent fallback allowed**. Example: if `game_reminder_offset_minutes` is missing, the reminder scheduling path must show an error ("Configuration hasn't loaded yet. Please try again.") rather than defaulting to 120.
+- **Android bootstrap pattern**:
+```kotlin
+// In AppRepository.init(), fetch concurrently with plan tier limits.
+val configRows = supabase.from("app_config")
+    .select("key,value")
+    .decodeList<AppConfigRow>()
+val config: Map<String, String> = configRows.associate { it.key to it.value }
+
+// Stored as StateFlow<Int?> — null until loaded, never defaulted.
+_gameReminderOffsetMinutes.value = config["game_reminder_offset_minutes"]?.toIntOrNull()
+    ?: throw IllegalStateException("app_config: game_reminder_offset_minutes missing")
+```
+
+---
+
+### `subscription_plans`
+- **Purpose**: Server-authoritative catalogue of purchasable subscription plans. Clients (iOS, Android, Web) read this table at bootstrap to obtain Stripe price IDs and display prices. **No client may hardcode a Stripe price ID or display price string** — all pricing comes from this table exclusively.
+- **Migration**: `20260428_subscription_plans.sql`
+- **Android v1**: Required. Fetch at bootstrap alongside `app_config` and plan tier limits.
+- **Key columns**:
+  - `plan_id TEXT PK` — `'starter'` | `'pro'` — matches `club_subscriptions.plan_type`
+  - `display_name TEXT` — shown in paywall UI (`'Starter'`, `'Pro'`)
+  - `stripe_price_id TEXT` — Stripe Price API ID sent to `create-club-subscription` Edge Function
+  - `display_price TEXT` — localised price string shown to users (`'A$19/mo'`)
+  - `billing_interval TEXT` — `'monthly'`
+  - `sort_order INT` — ascending display order in paywall
+  - `active BOOL` — `false` hides the plan from clients (deprecated plan support)
+- **RLS**: SELECT for `auth.role() = 'authenticated' AND active = true`. DML via service_role only.
+- **RPC**: `get_subscription_plans()` — STABLE, SECURITY DEFINER. Returns active plans ordered by `sort_order`. Callable by authenticated users.
+- **Updating prices**: `UPDATE subscription_plans SET stripe_price_id = 'price_...', display_price = 'A$29/mo' WHERE plan_id = 'starter';` — takes effect on next app launch, no app release required.
+- **Android bootstrap pattern**:
+```kotlin
+// In AppRepository.init(), fetch concurrently with app_config.
+data class SubscriptionPlanRow(
+    @SerialName("plan_id")         val planId: String,
+    @SerialName("display_name")    val displayName: String,
+    @SerialName("stripe_price_id") val stripePriceId: String,
+    @SerialName("display_price")   val displayPrice: String,
+    @SerialName("billing_interval") val billingInterval: String,
+    @SerialName("sort_order")      val sortOrder: Int
+)
+
+val plans = supabase.postgrest.rpc("get_subscription_plans")
+    .decodeList<SubscriptionPlanRow>()
+// Store as StateFlow<List<SubscriptionPlanRow>>; empty until loaded.
+// Paywall disables subscribe buttons when list is empty — never default to local price IDs.
+```
+
+---
+
+### `clubs`
+- **Purpose**: Core entity for every pickleball club. One row per club.
+- **Android v1**: Required for all club discovery, detail, booking, and credit flows.
+- **Audience**: Player-facing and owner-facing.
+- **Key columns**:
+  - `id UUID PK`
+  - `name TEXT`
+  - `description TEXT NULL`
+  - `created_by UUID FK → auth.users` — club owner
+  - `image_url TEXT NULL` — preset key string OR full Supabase Storage URL (custom upload wins)
+  - `custom_banner_url TEXT NULL` — custom banner URL; nil = use preset
+  - `hero_image_key TEXT NULL` — one of: `hero_1`–`hero_6`; maps to local asset name
+  - `latitude FLOAT8 NULL` — LEGACY: prefer `club_venues` for coordinates; fallback only
+  - `longitude FLOAT8 NULL` — LEGACY: same
+  - `venue_name TEXT NULL` — LEGACY: prefer primary `ClubVenue.venueName`
+  - `street_address TEXT NULL` — LEGACY
+  - `suburb TEXT NULL` — LEGACY
+  - `state TEXT NULL` — LEGACY
+  - `postcode TEXT NULL` — LEGACY
+  - `country TEXT NULL` — LEGACY
+  - `stripe_connect_id TEXT NULL` — denormalised from `club_stripe_accounts`; used by payment intent creation
+  - `subscription_tier TEXT DEFAULT 'free'` — denormalised from `club_subscriptions` via `stripe-webhook`; do not write from client
+  - `avatar_background_color TEXT NULL FK → avatar_palettes(palette_key)` — NOT VALID constraint; legacy hex values may exist in old rows; new saves must use a valid palette_key
+  - `timezone TEXT DEFAULT 'Australia/Perth'` — IANA timezone; set at club creation
+  - `code_of_conduct TEXT NULL` — policy text; displayed and accepted by new members
+  - `cancellation_policy TEXT NULL` — cancellation policy text
+  - `win_condition TEXT`
+  - `default_court_count INT`
+  - `members_only BOOL` — when TRUE, booking into this club's games requires an approved `club_members` row; enforced server-side by `book_game` RPC and bookings INSERT RLS
+- **MUST APPEAR in all 5 club select strings**: `latitude`, `longitude` (omitting silently breaks nearby discovery).
+- **LEGACY note**: Club-level address fields (`venue_name`, `street_address`, `suburb`, `state`, `postcode`, `country`, `latitude`, `longitude`) were soft-deprecated at Stage 4. `club_venues` is now the authoritative location source. Android must implement the same fallback logic.
+
+---
+
+### `club_venues`
+- **Purpose**: Structured venues for a club. Replaces free-text club-level address fields as the location source of truth.
+- **Android v1**: Required for venue display on game detail and club detail. Used for distance sorting.
+- **Key columns**:
+  - `id UUID PK`
+  - `club_id UUID FK → clubs`
+  - `venue_name TEXT NOT NULL`
+  - `street_address TEXT NULL`
+  - `suburb TEXT NULL`
+  - `state TEXT NULL`
+  - `postcode TEXT NULL`
+  - `country TEXT NULL DEFAULT 'Australia'`
+  - `is_primary BOOL NOT NULL DEFAULT false` — exactly ONE primary per club
+  - `latitude FLOAT8 NULL`
+  - `longitude FLOAT8 NULL`
+  - `created_at TIMESTAMPTZ`
+- **Relationship**: one-to-many per club; a game's `venue_id FK → club_venues.id`.
+- **Android dependency**: Always fetch venues when loading a club. Use `is_primary = true` row as the primary display venue. Fall back to club-level coordinates only when no venue rows exist.
+
+---
+
+### `games`
+- **Purpose**: A scheduled pickleball session at a club.
+- **Android v1**: Required for all discovery, booking, and credit flows.
+- **Key columns** (note: baseline DDL predates migrations; inferred from iOS models and Edge Functions):
+  - `id UUID PK`
+  - `club_id UUID FK → clubs`
+  - `recurrence_group_id UUID NULL` — ties together games in a recurring series
+  - `title TEXT`
+  - `description TEXT NULL`
+  - `date_time TIMESTAMPTZ`
+  - `duration_minutes INT`
+  - `skill_level TEXT` — enum values: `all`, `beginner`, `intermediate`, `advanced` (NOT `tournament`)
+  - `game_format TEXT`
+  - `game_type TEXT`
+  - `max_spots INT`
+  - `fee_amount FLOAT8 NULL` — 0 or NULL = free; >0 = paid in dollars (not cents)
+  - `fee_currency TEXT NULL` — e.g. `"aud"`
+  - `platform_fee_bps INT DEFAULT 1000`
+  - `venue_id UUID NULL FK → club_venues`
+  - `venue_name TEXT NULL` — legacy fallback
+  - `location TEXT NULL`
+  - `latitude FLOAT8 NULL` — legacy
+  - `longitude FLOAT8 NULL`
+  - `status TEXT` — `"active"`, `"cancelled"`
+  - `notes TEXT NULL`
+  - `requires_dupr BOOL DEFAULT false`
+  - `court_count INT DEFAULT 1`
+  - `confirmed_count INT NULL` — denormalised; can be stale; prefer live attendee query
+  - `waitlist_count INT NULL`
+  - `publish_at TIMESTAMPTZ NULL` — NULL = published; future = scheduled/hidden
+  - `win_condition TEXT NULL`
+  - `created_by UUID NULL`
+- **Active game limit trigger**: `check_active_game_limit()` fires BEFORE INSERT. Reads `club_entitlements.max_active_games`. If no entitlement row exists, rejects the insert entirely (deny-by-default). `-1` = unlimited.
+- **ANDROID IMPORTANT**: `fee_amount` is stored as FLOAT8 (dollars). PaymentIntent `amount` must be in **cents** (multiply × 100). Android must do the same conversion.
+
+---
+
+### `bookings`
+- **Purpose**: A player's seat reservation at a game.
+- **Android v1**: Required for all booking, credit, and waitlist flows.
+- **Key columns**:
+  - `id UUID PK`
+  - `game_id UUID FK → games`
+  - `user_id UUID FK → auth.users`
+  - `status booking_status enum` — `confirmed`, `waitlisted`, `cancelled`, `pending_payment`
+  - `waitlist_position INT NULL` — always sequential (1, 2, 3 …); gaps auto-healed by `trg_compact_waitlist_on_leave`
+  - `fee_paid BOOL`
+  - `paid_at TIMESTAMPTZ NULL`
+  - `payment_method TEXT NULL` — `"stripe"`, `"admin"`, NULL
+  - `stripe_payment_intent_id TEXT NULL`
+  - `platform_fee_cents INT NULL`
+  - `club_payout_cents INT NULL`
+  - `credits_applied_cents INT NULL`
+  - `hold_expires_at TIMESTAMPTZ NULL` — non-null when `status='pending_payment'`
+  - `promoted_at TIMESTAMPTZ NULL` — set by trigger when waitlisted → pending_payment
+  - `credit_refund_issued_at TIMESTAMPTZ NULL` — idempotency guard for cancellation refunds
+  - `created_at TIMESTAMPTZ`
+- **RLS INSERT policies**:
+  - `"Users can create own bookings"`: `auth.uid() = user_id` AND (club is public OR caller has approved `club_members` row OR is club owner/admin). This is the defence-in-depth gate for direct API bypasses — the `book_game` RPC enforces the same rule internally.
+  - `"Club owner or admin can create bookings for others"`: owner/admin can insert bookings for any `user_id` in their club (the `ownerCreateBooking` admin path). No membership requirement — this is intentional.
+- **Member read expansion** (`20260407_bookings_member_read_policy.sql`): approved club members and club admins can read ALL bookings for their club's games (not just their own).
+- **DANGEROUS TO OMIT**: `payment_method` — omitting causes all attendees to show as "Unpaid". `hold_expires_at` — omitting causes 400 error that breaks attendee list entirely.
+- **Trigger — promotion**: `trg_promote_top_waitlisted` AFTER UPDATE OF status ON bookings. Fires when `confirmed → cancelled`. Promotes top waitlisted player using `FOR UPDATE SKIP LOCKED`. Paid: `pending_payment` + 30-min hold. Free: `confirmed` directly.
+- **Trigger — compaction**: `trg_compact_waitlist_on_leave` AFTER UPDATE ON bookings. Fires when `OLD.status = 'waitlisted' AND NEW.status != 'waitlisted'`. Calls `recompact_waitlist_positions(game_id)` to restore sequential positions. Admin drag-reorder (position swap, same status) does NOT fire this trigger.
+
+---
+
+### `player_credits`
+- **Purpose**: Club-scoped credit balance per player. Earned from cancellation refunds, spent at booking.
+- **Android v1**: Required for credit display, deduction at checkout, and cancellation refunds.
+- **Key columns**:
+  - `id UUID PK`
+  - `user_id UUID FK → auth.users`
+  - `club_id UUID FK → clubs` — credits are club-scoped
+  - `amount_cents INT NOT NULL DEFAULT 0 CHECK (amount_cents >= 0)`
+  - `currency TEXT DEFAULT 'aud'`
+  - `UNIQUE(user_id, club_id, currency)` — `player_credits_user_club_currency_key`
+- **RLS**: SELECT, UPDATE, INSERT — all require `auth.uid() = user_id`. UPDATE has additional `WITH CHECK (amount_cents >= 0)`.
+- **Legacy note**: Earlier design used a global (non-club-scoped) constraint. Android must NEVER implement a global credit balance.
+- **DANGEROUS**: Do NOT call `use_credits` or `issue_cancellation_credit` RPCs via PostgREST — PGRST202 schema cache failure makes them unreachable. Use direct PATCH/INSERT on the table instead.
+
+---
+
+### `club_members`
+- **Purpose**: Records club membership relationships.
+- **Android v1**: Required for membership join/leave, member list, booking permission check.
+- **Key columns**:
+  - `club_id UUID FK → clubs`
+  - `user_id UUID FK → auth.users`
+  - `status TEXT` — `'approved'`, `'pending'`, `'rejected'`, `'removed'`
+  - `requested_at TIMESTAMPTZ NULL`
+  - `conduct_accepted_at TIMESTAMPTZ NULL`
+  - `cancellation_policy_accepted_at TIMESTAMPTZ NULL`
+  - `UNIQUE(club_id, user_id)`
+- **Backfill note**: `20260419_backfill_owner_members.sql` added club owners as approved members for clubs created before the `createClub` path was updated to auto-insert the owner. Any club owner without a `club_members` row must be synthesised on the client (membership state = owner/approved).
+- **Membership gate**: For `clubs.members_only = true`, `book_game` enforces that the caller has `club_members.status = 'approved'` OR is the club owner OR a club admin. Pending, rejected, and absent members cannot book into members-only games regardless of UI state.
+
+---
+
+### `club_admins`
+- **Purpose**: Grants admin roles to non-owner club members.
+- **Android v1**: Required for admin permission checks (read-only; admins not created from Android v1).
+- **Key columns**:
+  - `club_id UUID FK → clubs`
+  - `user_id UUID FK → auth.users`
+  - `role TEXT NULL` — canonical values: `owner`, `admin` only. **Never compare as raw strings.** iOS uses `ClubAdminRole` enum (`rawValue` = DB value). Android must implement an equivalent sealed class/enum with the same two cases.
+- **Known RLS bug (fixed)**: `20260415_fix_club_admins_recursion.sql` fixed infinite recursion. Remaining policies: `auth.uid() = user_id` (own row) + club owner can read all. Non-owner admins can only see their own row — intentional.
+- **Role check contract**: `isClubAdmin` = row exists with role `owner` OR `admin`; `isClubOwner` = role is `owner` OR `club.created_by = current_user`. RLS is always authoritative; client role checks are display-only fast-fail.
+
+---
+
+### `game_attendance`
+- **Purpose**: Records whether a player attended a past game. Admin-only write.
+- **Android v1**: Out of scope (admin feature). Android must display attendance status but not write it.
+- **Key columns**: `id UUID PK`, `game_id UUID FK → games`, `user_id UUID FK → auth.users`, `attendance_status TEXT DEFAULT 'attended' CHECK IN ('attended', 'no_show')`
+
+---
+
+### `notifications`
+- **Purpose**: In-app notification inbox per user.
+- **Android v1**: Required for notification list, routing, and clear-all.
+- **Key columns**:
+  - `id UUID PK`
+  - `user_id UUID FK → auth.users`
+  - `type notification_type enum` — full canonical list in §4
+  - `title TEXT`
+  - `body TEXT`
+  - `data JSONB NULL` — contextual payload; includes `reference_id`, `club_id`, `game_id`
+  - `is_read BOOL DEFAULT false`
+  - `created_at TIMESTAMPTZ`
+- **RLS**: Users can SELECT and DELETE own rows.
+
+---
+
+### `notification_preferences`
+- **Purpose**: Per-user opt-in/out for push and email notification categories.
+- **Android v1**: Required for notification settings screen.
+- **Key columns**:
+  - `user_id UUID PK`
+  - `booking_confirmed_push BOOL DEFAULT true`
+  - `booking_confirmed_email BOOL DEFAULT true`
+  - `new_game_push BOOL DEFAULT true`
+  - `new_game_email BOOL DEFAULT true`
+  - `waitlist_push BOOL DEFAULT true`
+  - `waitlist_email BOOL DEFAULT true`
+  - `chat_push BOOL DEFAULT true`
+  - `updated_at TIMESTAMPTZ`
+- **IMPORTANT**: A missing row means ALL preferences are true (defaults). Treat nil response as all-on.
+- **Note**: `chat_push` may be NULL in older rows. Treat NULL as opted-in.
+
+---
+
+### `club_entitlements`
+- **Purpose**: Derived feature entitlements per club. The ONLY correct source for feature gating.
+- **Android v1**: Required for feature gate checks.
+- **Key columns**:
+  - `club_id UUID PK FK → clubs`
+  - `plan_tier TEXT DEFAULT 'free'` — display label only; do NOT branch on this in app code
+  - `max_active_games INT DEFAULT 3` — `-1` = unlimited
+  - `max_members INT DEFAULT 20` — `-1` = unlimited (DEFAULT changed from 50 → 20 in `20260427_standardise_plan_limits.sql`)
+  - `can_accept_payments BOOL DEFAULT false`
+  - `analytics_access BOOL DEFAULT false`
+  - `can_use_recurring_games BOOL DEFAULT false`
+  - `can_use_delayed_publishing BOOL DEFAULT false`
+  - `updated_at TIMESTAMPTZ`
+- **Single source of truth**: `derive_club_entitlements(p_club_id)` computes all values from `club_subscriptions`. Never duplicate this logic client-side.
+- **Paywall rule**: Android must call `get_plan_tier_limits()` at bootstrap and render paywall UI from server values only. No hardcoded plan limits in client code.
+- **DENY BY DEFAULT**: If no `club_entitlements` row exists, game creation trigger denies the insert entirely.
+- **`canceling` status**: keeps features active until period end.
+
+---
+
+### `club_subscriptions`
+- **Purpose**: Stripe subscription state for club owners.
+- **Android v1**: Read-only. Subscription management is out of scope.
+- **Key columns**: `id`, `club_id UNIQUE`, `stripe_subscription_id UNIQUE`, `plan_type TEXT`, `status TEXT`, `current_period_end TIMESTAMPTZ`
+- **Status values**: `"incomplete"`, `"active"`, `"trialing"`, `"canceling"`, `"past_due"`, `"canceled"`
+- **Authority**: Written ONLY by `stripe-webhook`. Never write from client.
+
+---
+
+### `club_stripe_accounts`
+- **Purpose**: Stripe Connect Express account for a club.
+- **Android v1**: Read-only. Onboarding out of scope.
+- **Key columns**: `club_id UNIQUE`, `stripe_account_id`, `onboarding_complete BOOL`, `payouts_enabled BOOL`
+
+---
+
+### `reviews`
+- **Purpose**: Player ratings (1–5) and comments for a game/club.
+- **Android v1**: Read (club detail) and write (submit review from notification prompt).
+- **Key columns**: `id UUID PK`, `game_id UUID FK → games`, `user_id UUID FK → auth.users`, `rating INT CHECK (1–5)`, `comment TEXT NULL`, `created_at TIMESTAMPTZ`
+- **UNIQUE(game_id, user_id)**: DB constraint. HTTP 409 on duplicate = "already reviewed".
+- **Fetch via RPC only**: `get_club_reviews(p_club_id)` — SECURITY DEFINER to bypass `profiles` RLS. Returns `reviewer_avatar_color_key` since `20260426_get_club_reviews_avatar_color_key.sql`.
+
+---
+
+### `platform_plan_config` (INTERNAL)
+- **Purpose**: Stores monthly price per subscription tier for MRR calculations.
+- **Android v1**: No dependency. Internal analytics table. Service role only.
+
+### Debug/Support Views (INTERNAL — service_role only)
+- `v_club_debug_summary`, `get_club_recent_games(p_club_id)`, `get_club_recent_bookings(p_club_id)` — Studio/service_role only.
+
+### Platform Analytics Views (INTERNAL — service_role only)
+- `v_active_subscriptions`, `v_platform_revenue`, `v_subscription_events`, `v_club_growth`
+
+---
+
+## 3. RELATIONSHIP MAP
+
+```
+auth.users (Supabase managed)
+  ↓
+  profiles (1:1 — id = auth.uid())
+    ↓ avatar_color_key FK
+    avatar_palettes (lookup table — fetch once at bootstrap)
+  ↓ stripe_customer_id
+  club_subscriptions (via clubs.created_by)
+  ↓ user_id
+  player_credits (UNIQUE per user+club+currency)
+  ↓ user_id
+  bookings (many per user)
+    ↓ game_id
+    games (many per club)
+      ↓ club_id
+      clubs (1:1 created_by → profiles)
+        ↓ club_id
+        club_entitlements (1:1)
+        club_subscriptions (1:1)
+        club_stripe_accounts (1:1)
+        club_members (1:many)
+        club_admins (1:many)
+        club_venues (1:many, ONE is_primary)
+          ↑ venue_id (on games)
+  bookings
+    ↓ game_id → games → club_id → player_credits (club-scoped refunds)
+
+app_config (global key/value — fetch at bootstrap)
+avatar_palettes (global lookup — fetch at bootstrap)
+notifications (1:many per user)
+notification_preferences (1:1 per user)
+reviews (1:many per game, UNIQUE per game+user)
+game_attendance (1:many per game, admin-write)
+```
+
+### Fragile Join Areas
+
+1. **`games.venue_id` vs `games.venue_name`**: `venue_id` is canonical FK. `venue_name` is legacy fallback. Use `venue_id → club_venues` for map/address; `venue_name` for display fallback only.
+
+2. **Club address vs `club_venues`**: Same duality at club level. Primary `ClubVenue` (`is_primary = true`) is authoritative for coordinates.
+
+3. **`confirmed_count` on `games`**: Denormalised; can be stale. Use for initial display only; refresh via live attendee query for accuracy.
+
+4. **`profiles → club_admins` join path**: Non-owner admins can only see their own row. Use SECURITY DEFINER RPCs for cross-user admin lookups.
+
+5. **`avatar_color_key` nullable**: NULL means `midnight_navy` default. Never hash user IDs or names to derive a colour — this was the pre-DB design and is explicitly banned.
+
+---
+
+## 4. ENUM INVENTORY
+
+### `booking_status` (PostgreSQL enum)
+Values: `confirmed`, `waitlisted`, `cancelled`, `pending_payment`
+
+- `pending_payment` added by `20260407_booking_status_pending_payment.sql`. If this migration was not run, PostgREST returns error 400.
+- **CRITICAL**: When comparing in PL/pgSQL, cast to text first: `v_booking.status::text != 'cancelled'`. Direct string comparison raises 22P02.
+- Android must handle all 4 values. Unknown values should be treated as `.unknown` and not crash.
+
+### `notification_type` (PostgreSQL enum)
+Full canonical list — all values exist in the DB enum, iOS NotificationType, and validate.ts:
+```
+booking_confirmed, booking_waitlisted, waitlist_promoted, booking_cancelled,
+membership_approved, membership_rejected, membership_removed,
+membership_request_received, admin_promoted,
+club_new_post, club_announcement, club_new_comment,
+game_cancelled, game_updated, game_review_request,
+game_reminder_2h, new_game
+```
+
+- `game_reminder_2h` is the canonical active type — the 2-hour pre-game push and local notification. Added `20260427_notification_type_game_reminder_2h.sql`. Timing offset is read from `app_config.game_reminder_offset_minutes` at runtime.
+- `game_reminder_24h` — LEGACY. Kept in DB enum for backward compatibility with existing notification rows. **Never emitted by any function going forward.** Android must not expect it; do not use as a case label in switch statements (handle as `.unknown`).
+- `club_new_post`, `club_new_comment` — added in same migration; were previously handled iOS-side but missing from DB enum.
+- Unknown values must decode as `.unknown` on the client — do not crash.
+- `game_reminder_2h` routes to the game sheet (same as `game_updated`).
+
+### `app_config` (key/value table — not an enum)
+Required keys and current values:
+
+| key | current value | notes |
+|---|---|---|
+| `game_reminder_offset_minutes` | `"120"` | T-minus minutes for pre-game reminder. Changing this updates the Edge Function invocation window and both iOS/Android local scheduling. |
+
+Bootstrap: `GET /rest/v1/app_config?select=key,value` (authenticated). Cache for session. If key is missing, surface error — no silent fallback.
+
+### `skill_level` (TEXT, not a PG enum)
+Valid DB values: `all`, `beginner`, `intermediate`, `advanced`
+
+**BANNED**: `"tournament"` — causes 22P02 on RPCs that validate this field. Android must enforce the 4-value list client-side.
+
+### `game_format` (TEXT on `games`, DB CHECK constraint)
+Migration: `20260429_normalize_game_format.sql`
+Valid values: `"open_play"`, `"random"`, `"round_robin"`, `"king_of_court"`, `"dupr_king_of_court"`
+
+**BANNED**: `"ladder"` — was a legacy client-side alias for `"king_of_court"`. All existing rows normalised to `"king_of_court"` by the migration. The CHECK constraint rejects any new row with `"ladder"`. Display labels are UI-layer only — the wire value is always the canonical DB value.
+
+### `attendance_status` (TEXT on `game_attendance`)
+Values: `attended`, `no_show`. Default: `attended`. "Unmarked" = absence of row.
+
+### `payment_method` (TEXT on `bookings`)
+Plain TEXT — not a PG enum. DB CHECK constraint added (`20260430_bookings_payment_method_constraint.sql`).
+Canonical values: `"stripe"`, `"admin"`, `"cash"`, `"credits"`, NULL.
+Legacy value `"free"` normalised to NULL by the same migration — do not write it.
+See data_contracts.me §3 for the full value/writer table.
+
+### `cancellation_reason` (TEXT on `bookings`)
+Values: `"player_cancelled"`, `"admin_cancelled"`, `"game_cancelled"`.
+
+### `subscription status` (TEXT on `club_subscriptions`)
+Values: `"incomplete"`, `"active"`, `"trialing"`, `"canceling"`, `"past_due"`, `"canceled"`
+
+Note: `"canceling"` is app-defined (Stripe is `"active"` with `cancel_at_period_end=true`). The function translates this for simpler client interpretation.
+
+---
+
+## 5. TRIGGER / FUNCTION / RPC INVENTORY
+
+### `book_game(p_game_id, p_user_id, p_fee_paid?, p_stripe_pi_id?, p_payment_method?, p_platform_fee_cents?, p_club_payout_cents?, p_credits_applied_cents?, p_hold_for_payment?)` — RPC
+- **Migration**: `20260426_book_game_rpc.sql`, updated by `20260427_member_only_booking_gate.sql`, `20260427_book_game_hold_for_payment.sql`, `20260428_book_game_dupr_enforcement.sql`
+- **Purpose**: The ONLY path for self-booking. Atomically determines `confirmed` vs `waitlisted` and enforces all booking rules under a row-level lock. Android must use this RPC; never INSERT directly into `bookings` for self-bookings.
+- **Security**: SECURITY DEFINER (bypasses RLS on the INSERT). Row-level `FOR UPDATE` lock on `games`. Caller identity enforced internally — not via RLS.
+- **Execution order**:
+  1. Asserts `p_user_id = auth.uid()` — prevents booking on behalf of another user
+  2. Locks `games` row with `SELECT FOR UPDATE`; reads `max_spots` and `requires_dupr`
+  3. Raises `'game_not_found'` if game doesn't exist
+  4. Fetches `clubs.members_only` for the game's club
+  5. If `members_only = TRUE`: checks `club_members.status = 'approved'` OR caller is club owner OR club admin → raises `'membership_required'` if none match
+  6. **DUPR gate** (updated `20260429_dupr_validation_constraints.sql`): if `requires_dupr = TRUE`, reads `profiles.dupr_id` for `p_user_id`. Raises `'dupr_required'` if `dupr_id IS NULL OR length(trim(dupr_id)) < 6 OR dupr_id !~ '^[A-Z0-9-]+$' OR dupr_id !~ '[0-9]'`. Applies to both confirmed spot and waitlist join.
+  7. Counts `confirmed + pending_payment` bookings inside the lock
+  8. If full: assigns next `waitlist_position`; status = `waitlisted`
+  9. If available: status = `confirmed` (or `pending_payment` if `p_hold_for_payment = TRUE`)
+  10. Inserts into `bookings`; returns the new row
+- **Error codes** (raised as EXCEPTION — PostgREST returns HTTP 500 with the message in the body):
+
+  | code | condition | client message |
+  |---|---|---|
+  | `game_not_found` | game row absent | "This game is no longer available." |
+  | `membership_required` | members-only club, not approved | "You must be an approved club member to book this game." / pending variant |
+  | `dupr_required` | `games.requires_dupr = true` and caller has no valid `profiles.dupr_id` | "Add and confirm your DUPR ID before booking this game." |
+  | `unauthorized` | `p_user_id != auth.uid()` | generic auth error |
+  | HTTP 409 (duplicate key) | player already has booking | "You already have a booking for this game." |
+
+- **Admin bypass**: `ownerCreateBooking` (direct `bookings` INSERT via PostgREST) intentionally bypasses `book_game()` — club owners/admins can add players regardless of DUPR requirements. This is correct behaviour; do not add DUPR enforcement to the admin path.
+- **Return**: one `bookings` row with all columns including `hold_expires_at`.
+- **Grant**: `authenticated`
+- **Android endpoint**: `POST /rest/v1/rpc/book_game`
+- **Android error handling**:
+```kotlin
+try {
+    val booking = supabase.postgrest.rpc("book_game", params).decodeSingle<BookingRow>()
+    handleBookingResult(booking)
+} catch (e: HttpRequestException) {
+    val body = e.response?.bodyAsText() ?: ""
+    when {
+        body.contains("game_not_found")      -> showError("This game is no longer available.")
+        body.contains("membership_required") -> showMembershipError(cachedMembershipState)
+        body.contains("dupr_required")       -> showError("Add and confirm your DUPR ID before booking this game.")
+        body.contains("unauthorized")        -> showAuthError()
+        e.response?.status?.value == 409     -> showError("You already have a booking for this game.")
+        else                                 -> showGenericError(body)
+    }
+}
+```
+
+---
+
+### `recompact_waitlist_positions(p_game_id UUID)` — UTILITY FUNCTION
+- **Migration**: `20260427_waitlist_compaction.sql`
+- **Purpose**: Restores sequential positions (1, 2, 3 …) on the waitlist after any departure. Called by the `compact_waitlist_after_leave` trigger — never call directly from Android.
+- **Race safety**: Acquires `SELECT games FOR UPDATE` — the same lock held by `book_game` — before rewriting positions. This serialises compaction against concurrent new-booking inserts so no gap can form between the two operations.
+- **Admin reorder exception**: `ownerUpdateBooking` swaps `waitlist_position` integers while keeping both bookings in status `'waitlisted'`. The trigger condition `OLD.status = 'waitlisted' AND NEW.status != 'waitlisted'` evaluates FALSE → reorder is completely unaffected by compaction.
+- **Grant**: `authenticated` (but called by SECURITY DEFINER trigger, not directly by clients)
+
+---
+
+### `compact_waitlist_after_leave()` — TRIGGER FUNCTION
+- **Migration**: `20260427_waitlist_compaction.sql`
+- **Trigger name**: `trg_compact_waitlist_on_leave` AFTER UPDATE ON bookings FOR EACH ROW
+- **Fires when**: `OLD.status = 'waitlisted' AND NEW.status != 'waitlisted'` — i.e., any departure from the waitlist
+- **Covered events** (all five leave paths):
+  1. Player self-cancels waitlisted booking
+  2. Admin cancels a waitlisted booking
+  3. `promote_top_waitlisted` trigger fires (waitlisted → pending_payment or confirmed)
+  4. `promote_waitlist_player` RPC called manually by admin
+  5. `revert_expired_holds_and_repromote` cron re-promotes the next player
+- **No infinite loop**: the compaction UPDATE only changes `waitlist_position`, not `status` → trigger condition stays FALSE for position-only updates.
+- **Android must know**: `waitlist_position` values are always 1-based sequential from the server's perspective. Android should display them directly without client-side renumbering.
+
+---
+
+### `promote_top_waitlisted()` — TRIGGER FUNCTION
+- **Migration**: `20260407_promote_top_waitlisted_push.sql` (supersedes Phase 3 version)
+- **Trigger**: `trg_promote_top_waitlisted` AFTER UPDATE OF status ON bookings FOR EACH ROW
+- **Fires when**: `OLD.status = 'confirmed' AND NEW.status = 'cancelled'`
+- **Behaviour**:
+  - `FOR UPDATE SKIP LOCKED` on top waitlisted booking (prevents double-promotion)
+  - Paid game: `status='pending_payment'`, `hold_expires_at = now() + 30 min`, `promoted_at = now()`
+  - Free game: `status='confirmed'`, `waitlist_position = NULL`
+  - Sends push notification via `pg_net.http_post` → `notify` Edge Function
+- **Android must know**: This trigger fires automatically. Android must handle `pending_payment` state appearing without explicit client action. Always refresh booking state after any cancellation.
+- **Push copy**: `"⚠️ Action required: complete your booking"` / `"A spot opened in {title}. Pay now to confirm — hold expires in 30 minutes."`
+
+---
+
+### `revert_expired_holds_and_repromote()` — FUNCTION (called by pg_cron)
+- **Migration**: `20260426_waitlist_hold_expiry_cron.sql`
+- **Replaces**: the earlier `expire_waitlist_holds()` Phase 3 function (which only reverted to position 1; this version places the player at the BOTTOM of the waitlist and immediately re-promotes the next eligible player)
+- **Schedule**: pg_cron every minute (`* * * * *`) — job name `revert_expired_holds_and_repromote`
+- **Missed-hold rule (decided, do not change without updating this doc)**:
+  Expired hold → player moves to the **bottom** of the waitlist (not removed). They remain eligible for future promotion. This is fair: they lose priority but are not removed due to a possible connectivity issue.
+- **Behaviour**:
+  1. Finds `pending_payment` bookings with `hold_expires_at < now()` (`FOR UPDATE SKIP LOCKED`)
+  2. Reverts each to `waitlisted` at `position = MAX(current_waitlist) + 1` (bottom)
+  3. Recounts confirmed seats for the game
+  4. If spot still open: promotes the next eligible waitlisted player (paid → `pending_payment` + fresh 30-min hold; free → `confirmed`)
+  5. Sends push notification for paid promotions (best-effort via pg_net)
+- **Android must know**: `pending_payment` can silently flip back to `waitlisted` between poll cycles. Android must handle both transitions and display the expiry state without requiring a manual refresh.
+- **Hold constant**: `v_hold_minutes CONSTANT INT := 30` — must match `AppState.waitlistHoldMinutes = 30` on iOS and Android's equivalent constant.
+
+---
+
+### `check_active_game_limit()` — TRIGGER FUNCTION
+- **Migration**: `20260406_active_game_limit_trigger.sql`
+- **Trigger**: `enforce_active_game_limit` BEFORE INSERT ON games
+- **Behaviour**: Rejects insert if `active_count >= max_active_games`. `-1` = unlimited. No entitlement row → deny by default.
+- **Error message**: `"Active game limit reached (X). Upgrade your plan to add more games."`
+- **Android**: Out of scope for v1, but handle this error if admin game-creation is added later.
+
+---
+
+### `derive_club_entitlements(p_club_id UUID)` — RPC (INTERNAL)
+- **Migration**: `20260403_club_entitlements.sql`, updated by `20260417_canceling_entitlements_fix.sql`, `20260417_pro_game_features.sql`, `20260427_standardise_plan_limits.sql`
+- **Authority**: SINGLE SOURCE OF TRUTH for tier → feature mapping. Never duplicate client-side.
+- **Called by**: `stripe-webhook` and `create-club-subscription` after any subscription change.
+- **Tier mapping — canonical values** (updated `20260427_standardise_plan_limits.sql`; previous values are now stale):
+
+  | plan | max_active_games | max_members | payments | analytics | recurring | delayed_publish |
+  |---|---|---|---|---|---|---|
+  | `free` | 3 | 20 | false | false | false | false |
+  | `starter` | 10 | 100 | true | false | false | false |
+  | `pro` | -1 (unlimited) | -1 (unlimited) | true | true | true | true |
+
+- **Grant**: `service_role` only. Never callable from authenticated clients.
+- **Android**: Never call. Only read `club_entitlements` and `get_plan_tier_limits()`.
+
+---
+
+### `get_plan_tier_limits()` — RPC
+- **Migration**: `20260427_standardise_plan_limits.sql`
+- **Purpose**: Returns all plan tier definitions so iOS/Android/Web render paywalls from server data only. No hardcoded plan limits allowed in any client.
+- **Input**: none
+- **Output**: one row per tier with `plan_tier, max_active_games, max_members, can_accept_payments, analytics_access, can_use_recurring_games, can_use_delayed_publishing`
+- **Values**: same as tier mapping table above (this function is the authoritative readable form)
+- **Grant**: `authenticated`
+- **Android bootstrap pattern**:
+```kotlin
+// Fetch at launch alongside app_config.
+val planLimits = supabase.postgrest.rpc("get_plan_tier_limits")
+    .decodeList<PlanTierLimits>()
+// Store in ViewModel. Paywall UI reads from this list only — no hardcoded numbers.
+```
+- **Nil handling**: If the RPC call fails, show a loading state — never render hardcoded fallback limits.
+
+---
+
+### `promote_waitlist_player(p_game_id, p_booking_id, p_hold_minutes)` — RPC
+- **Migration**: `20260415_promote_waitlist_player_fn.sql`
+- **Purpose**: Manual admin promotion of a specific waitlisted player.
+- **Rejects if**: game not found, game full, booking not waitlisted, active `pending_payment` hold already exists for the game.
+- **Grant**: `authenticated`
+- **Android**: Admin feature (out of scope for v1). Android must handle `pending_payment` state caused by this RPC.
+
+---
+
+### `get_club_dashboard_summary(p_club_id UUID)` — RPC
+- **Migration**: `20260419_club_dashboard_summary.sql`
+- **Returns**: `total_members`, `member_growth_30d`, `monthly_active_players_30d`, `prev_active_players_30d`, `fill_rate_30d`, `prev_fill_rate_30d`, `upcoming_bookings_count`
+- **Android**: Admin feature (out of scope for v1).
+
+---
+
+### Analytics RPCs — Pro admin only
+`get_club_analytics_kpis`, `get_club_analytics_supplemental`, `get_club_revenue_trend`, `get_club_top_games`, `get_club_peak_times`
+- **Requirements**: `analytics_access = true` (Pro plan). Access check inside SECURITY DEFINER — returns `P0001 Analytics requires a Pro plan.` if denied.
+- **Android**: Out of scope for v1.
+
+---
+
+### `admin_update_member_dupr(member_user_id, new_rating)` — RPC
+- **SECURITY DEFINER**: reads updater's `full_name` from `profiles`.
+- **Android**: Admin feature (out of scope for v1).
+
+---
+
+### `get_club_reviews(p_club_id UUID)` — RPC
+- **Migration**: updated by `20260426_get_club_reviews_avatar_color_key.sql`
+- **Purpose**: Fetches reviews with reviewer names, game titles, and avatar palette keys.
+- **SECURITY DEFINER**: bypasses `profiles` RLS for reviewer name and avatar_color_key resolution.
+- **Returns** (all columns):
+  `id, game_id, user_id, rating, comment, created_at, reviewer_name, game_title, reviewer_avatar_color_key`
+- **Android**: Required for reviews section on club detail. Use `reviewer_avatar_color_key` to render reviewer avatar — do not hash or derive independently.
+- **Grant**: `authenticated`
+
+---
+
+### `games_ending_between(window_start, window_end)` — RPC
+- **Purpose**: Used by `send-review-prompts` to find games ending in a window.
+- **Android**: No direct dependency. Review prompts come via FCM push.
+
+---
+
+### `issue_cancellation_credit(p_user_id, p_booking_id)` — RPC (EXISTS BUT DO NOT USE VIA POSTGREST)
+- **Note**: Correct logic but PGRST202 schema-cache failure makes it unreachable via PostgREST. Use direct PATCH/INSERT on `player_credits` instead (same as iOS).
+
+---
+
+## 6. RLS / PERMISSION IMPLICATIONS
+
+### Booking read access
+- **Own rows only** (default): player reads their own bookings
+- **Member read expansion**: approved club members and admins can read ALL bookings for their club's games
+- **Silent failure**: non-member fetching attendees gets 0 rows (not an error). Must distinguish RLS-blocked from truly empty.
+
+### Booking INSERT — members-only gate (defence-in-depth)
+Two layers enforce that non-approved users cannot book members-only club games:
+1. **`book_game` RPC**: checks membership inside the `FOR UPDATE` lock (primary gate)
+2. **Bookings INSERT RLS**: `"Users can create own bookings"` policy now enforces the same condition for direct API INSERTs that bypass the RPC
+3. **Admin override** (`"Club owner or admin can create bookings for others"` policy): no membership requirement — admins can add any player. This is intentional for `ownerCreateBooking`.
+
+### `club_admins` recursion fix
+After `20260415_fix_club_admins_recursion.sql`, any RLS policy querying `club_admins` must use `auth.uid()` as the filter — not a sibling-admin lookup.
+
+### Analytics RPC access
+All analytics RPCs perform their own access check (owner OR admin + `analytics_access = true`). Client does not pre-check — will get `P0001 Access denied` or `P0001 Analytics requires a Pro plan.` if not authorised.
+
+### `profiles` RLS
+UPDATE policy requires `WITH CHECK (auth.uid() = id)` — production incident without it.
+
+### Silent failure patterns
+- Omitting a required column from PostgREST `select=` → decodes as nil, no error
+- Uppercase UUID in PostgREST filter → 0 rows, no error
+- Calling `use_credits` / `issue_cancellation_credit` via PostgREST → PGRST202
+
+---
+
+## 7. EDGE FUNCTION INVENTORY
+
+### `create-payment-intent`
+- **Trigger**: iOS/Android client POST
+- **Input**: `{ amount: cents, currency?: string, club_id?: string, metadata?: {} }`
+- **Hold gate** (Gate 0.5): when `game_id` is in metadata, validates the caller's `pending_payment` booking hold BEFORE calling Stripe. Expired hold → HTTP 409 `hold_expired`. DB query error → HTTP 503. No charge is created if the hold is expired or the DB is unavailable (fail-closed).
+- **Enforces AUD only**: rejects non-AUD with 400
+- **Returns**: `{ client_secret, platform_fee_cents, club_payout_cents }`
+- **Platform fee**: 10% (`floor(amount * 1000 / 10000)`)
+- **Android dependency**: Call with `amount` in cents, `currency="aud"`, `club_id` for destination charge. Handle HTTP 409 by resetting promoted state and refreshing bookings.
+
+### `stripe-webhook`
+- **Trigger**: Stripe platform events
+- **Handles**: subscription created/updated/deleted, invoice payment
+- **Side effects**: upserts `club_subscriptions`, calls `derive_club_entitlements`, updates `clubs.subscription_tier`
+- **Deploy with**: `--no-verify-jwt`
+- **Android dependency**: None (no client call).
+
+### `create-club-subscription`
+- **Trigger**: Club owner POST from iOS settings
+- **Android**: Out of scope for v1.
+
+### `cancel-club-subscription`
+- **Trigger**: Club owner POST
+- **Android**: Out of scope for v1.
+
+### `club-chat-push`
+- **Trigger**: iOS client POST after posting/commenting in club chat
+- **Push**: APNs only — **Android FCM NOT YET SUPPORTED**
+- **Android blocker**: FCM support must be added before Android receives chat push.
+
+### `booking-confirmed`
+- **Trigger**: iOS/Android client POST after successful booking
+- **Input**: `{ user_id, game_id, club_id?, game_title, game_date }`
+- **Push**: APNs only — **Android FCM NOT YET SUPPORTED**
+
+### `game-cancelled-notify`
+- **Push**: APNs only — **Android FCM NOT YET SUPPORTED**
+
+### `game-published-notify`
+- **Push**: APNs only
+
+### `game-updated-notify`
+- **Push**: APNs only
+
+### `game-reminder-2h`
+- **Previously**: named `game-reminder-24h` (the naming was wrong — actual behaviour was always ~2h). Renamed and updated.
+- **Trigger**: pg_cron scheduled (centred ±15 minutes on `game_reminder_offset_minutes`)
+- **Behaviour**: reads `game_reminder_offset_minutes` from `app_config` at invocation (no hardcoded constant). Sends `game_reminder_2h` notification type.
+- **Push**: APNs only
+- **Android**: local notification must also read from `app_config.game_reminder_offset_minutes`. The pg_cron window and Android scheduling must stay in sync when the config value changes.
+
+### `send-review-prompts`
+- **Trigger**: pg_cron hourly
+- **Behaviour**: Finds games ending 23–25h ago. Sends `game_review_request` notification to each confirmed attendee without an existing review.
+- **Push**: APNs only — **Android FCM NOT YET SUPPORTED**
+
+### `notify`
+- **Trigger**: Internal (called by DB trigger via pg_net)
+- **Input**: `{ user_id, title, body, type, reference_id?, send_push? }`
+- **Behaviour**: Inserts `notifications` row (fires email DB trigger), optionally sends APNs push
+- **Android blocker**: FCM support must be added here for waitlist promotion notifications.
+
+### `send-notification-email`
+- **Trigger**: DB trigger `send_notification_email` on `notifications` INSERT
+- **Uses**: Resend API
+- **Android**: No change needed — email is server-side.
+
+### `connect-onboarding`
+- **Trigger**: Club owner POST
+- **Android**: Out of scope for v1.
+
+### `archive-old-games`
+- **Trigger**: Scheduled cron
+- **Android**: No client dependency.
+
+---
+
+## 8. DO NOT REINTRODUCE
+
+These patterns were explicitly removed or corrected. Any Android implementation must avoid them from day one.
+
+### ❌ Client-side booking status assignment
+The client must NEVER decide `confirmed` vs `waitlisted`. The `book_game` RPC is the only place this decision is made — under a `FOR UPDATE` lock on the game row. Any code path that inserts a booking with a client-computed status bypasses the race-condition protection and the membership gate.
+
+### ❌ Hardcoded subscription plan limits
+Free=3/20, Starter=10/100 are the correct canonical values. Earlier code hardcoded different values (Free=3/50, Starter=20/200). Call `get_plan_tier_limits()` at bootstrap and render paywall UI from server data only. Any hardcoded integer limit in client code for plan tiers is wrong by definition.
+
+### ❌ Hardcoded notification timing constants
+`game_reminder_offset_minutes = 120` must be read from `app_config` at bootstrap — not hardcoded. If the value is not loaded, block the scheduling action with a user-visible error. Never silently fall back to a constant.
+
+### ❌ Local avatar palette derivation
+Avatar gradient colours must be resolved from `profiles.avatar_color_key → avatar_palettes`. The previous design derived colours by hashing the user's name or ID hash on the client. This approach is explicitly banned: it produces inconsistent results across platforms and ignores user preference. If `avatar_color_key` is NULL, use the `midnight_navy` default (the row with `is_default = TRUE`). Never hash locally.
+
+### ❌ Client-authoritative membership checks for booking
+The client-side "join club before booking" check is fast-fail UX guidance only. The server (`book_game` RPC + bookings INSERT RLS) is the final and authoritative gate. Android must handle `membership_required` from the server response and should not treat a passing client-side check as permission to book.
+
+### ❌ Client-authoritative DUPR checks for booking
+The `games.requires_dupr` flag must NEVER be enforced solely on the client. `book_game()` checks `profiles.dupr_id` server-side and returns `dupr_required` if missing. Android may show a fast-fail hint before the network call (UX only), but must handle `dupr_required` from the server response. Prerequisite: always PATCH `profiles.dupr_id` to Supabase when the user saves their DUPR ID — the server cannot enforce the gate if the field is only stored locally.
+
+### ❌ Direct bookings INSERT for self-bookings
+Use `book_game` RPC. A direct POST to `/bookings` for self-bookings bypasses the `FOR UPDATE` lock (race condition), the membership gate, and the waitlist position logic. It is only acceptable for the admin override path (`ownerCreateBooking`) which has its own RLS guard.
+
+### ❌ Calling `use_credits` or `issue_cancellation_credit` via PostgREST
+PGRST202 schema-cache failure. Use direct PATCH/INSERT on `player_credits` table.
+
+### ❌ `game_reminder_24h` notification type in new code
+Dead type. Use `game_reminder_2h`. The old type remains in the DB enum for row backward compatibility only.
+
+### ❌ Labelling `curr_credits_returned_cents` as "Refunded" or "Cash Refunded"
+Migration `20260429_analytics_fix_refunded_label.sql` renamed this column from `refunded` to `credits_returned`. The column measures club credits issued on cancellation — NOT Stripe cash refunds. No Stripe reversal flow exists. Android analytics UI must label this **"Credits Returned"**. If a true cash-refund flow is added in future it must use a separate column.
+
+### ❌ `"ladder"` as a game_format value
+Legacy alias, normalized out. DB CHECK constraint now rejects it. Use `"king_of_court"` for the same game type.
+
+### ❌ `"free"` as a payment_method value
+Normalised to NULL in migration `20260430_bookings_payment_method_constraint.sql`. DB CHECK constraint now rejects it. Write NULL for free games.
+
+---
+
+## 9. BACKEND RISK REGISTER
+
+| Risk | Description | Mitigation |
+|---|---|---|
+| `booking_status` enum cast | Direct string comparison raises 22P02 | Always cast to `::text` in PL/pgSQL |
+| PGRST202 for new RPCs | PostgREST schema cache doesn't pick up new functions | Use PATCH/INSERT directly for `use_credits` and `issue_cancellation_credit` |
+| Legacy address fields | `clubs.latitude/longitude` may be stale or missing if venue rows exist | Always check `club_venues` first; fall back to club fields |
+| `confirmed_count` stale | Denormalised game count can be behind | Use live attendee query for accurate `spotsLeft` |
+| FCM missing from all push Edge Functions | Android devices won't receive push notifications | Must update 5+ Edge Functions before Android v1 ships |
+| `promote_top_waitlisted` trigger fires on cancel | Causes booking status changes without explicit client action | Android must poll/refresh booking state after any cancellation |
+| `revert_expired_holds_and_repromote` cron | `pending_payment` can flip to `waitlisted` between poll cycles | Android must handle both transitions gracefully |
+| `club_admins` recursion policy removed | Non-owner admins can only see their own admin row | Use `auth.uid() = user_id` queries; no sibling-lookup |
+| `tournament` skill_level in legacy iOS model | **FIXED 2026-04-28** — `SkillLevel` enum updated, migration `20260428_normalize_skill_level_tournament.sql` normalizes DB rows | Never send `"tournament"` to DB; iOS `SkillLevel` enum now has 4 cases only: `all`, `beginner`, `intermediate`, `advanced` |
+| `chat_push NULL` in old rows | `notification_preferences.chat_push` can be NULL | Treat NULL as true (opted-in) |
+| `pg_net` settings required for push trigger | `app.supabase_url` and `app.supabase_anon_key` DB settings must be configured | Without these, waitlist push silently skipped (promotion still works) |
+| `avatar_color_key` nullable | NULL profiles use wrong colour if default not handled | Always resolve against `midnight_navy` (is_default=TRUE) when key is NULL |
+| `app_config` key missing | Nil key causes reminder scheduling to fail | Surface error to user; never silently default |
+| `waitlist_position` gaps | Brief gap between compaction and new insert within same transaction | Shared `games FOR UPDATE` lock in both `book_game` and `recompact_waitlist_positions` prevents any persistent gap |
+
+---
+
+## 10. ANDROID BACKEND DEPENDENCY SUMMARY
+
+### Mandatory for Android v1
+| Entity/Function | Why |
+|---|---|
+| `profiles` SELECT + PATCH | Auth, profile display, edit |
+| `clubs` SELECT (all select strings with lat/lng + members_only) | Club discovery, detail, booking gate |
+| `club_venues` SELECT (by club_id) | Venue display, distance sorting |
+| `games` SELECT (all columns inc. publish_at) | Game discovery, booking |
+| `book_game` RPC | Self-booking (replaces direct INSERT) |
+| `bookings` SELECT + PATCH | View state, cancel, confirm pending payment |
+| `player_credits` SELECT + PATCH (atomic) | Credit balance, deduction |
+| `notifications` SELECT + PATCH (mark read) + DELETE | Notification inbox |
+| `notification_preferences` SELECT + INSERT + UPDATE | Notification settings |
+| `reviews` INSERT | Submit review |
+| `get_club_reviews(p_club_id)` RPC | View reviews on club detail (returns avatar_color_key) |
+| `get_plan_tier_limits()` RPC | Paywall rendering — no hardcoded limits |
+| `app_config` SELECT | Game reminder offset, other runtime constants |
+| `avatar_palettes` SELECT | Avatar gradient rendering for all users |
+| `create-payment-intent` Edge Function | Paid game booking |
+| FCM token registration (NEW — not yet implemented) | Push notifications |
+
+### Mandatory backend changes before Android v1 ships
+1. Add `fcm_token TEXT NULL` to `profiles` (or create `device_tokens` table)
+2. Update `booking-confirmed`, `game-cancelled-notify`, `club-chat-push`, `notify`, `send-review-prompts` Edge Functions to send FCM push in addition to APNs
+
+### Optional for Android v1 (available but not required)
+- `club_entitlements` SELECT — needed only if admin game creation is added
+- `get_club_dashboard_summary()` RPC — admin dashboard (out of scope)
+- Analytics RPCs — Pro admin feature (out of scope)
+- `admin_update_member_dupr()` RPC — admin feature (out of scope)
+- Subscription Edge Functions — out of scope
+
+---
+
+## 11. VIOLATION IMPACT
+
+- **Wrong UUID case in filters** → 0 rows returned; features silently broken
+- **Missing `payment_method` in booking select** → all attendees shown as "Unpaid"
+- **Missing `hold_expires_at` in booking select** → 400 error; attendee list shows 0 players
+- **Using `use_credits` via PostgREST** → PGRST202; credits not deducted; player gets free booking
+- **Using `"tournament"` as skill_level** → 22P02 on any RPC that validates the field. Valid values: `all`, `beginner`, `intermediate`, `advanced` only. Any other value must be rejected client-side before sending to DB.
+- **Using `"ladder"` as game_format** → DB CHECK constraint rejects with 400. Use `"king_of_court"`.
+- **Writing `"free"` or any other non-canonical value as payment_method** → DB CHECK constraint rejects with 400.
+- **Labelling `curr_credits_returned_cents` as "Refunded"** → misleads users; no Stripe cash refund flow exists. The correct UI label is "Credits Returned".
+- **Ignoring `club_venues`, using only legacy club address** → wrong coordinates; map navigation fails for relocated clubs
+- **Not handling `pending_payment` state** → player sees wrong CTA; can't complete waitlist-promoted booking
+- **Not adding FCM support to Edge Functions** → Android users receive no push; waitlist holds expire unnoticed; review prompts never delivered
+- **Hardcoding plan limits (Free=3/50, Starter=20/200)** → wrong UI; paywall misrepresents what the user is buying; pre-fix values no longer match server
+- **Deriving avatar colour from user ID hash** → colour mismatch across platforms; ignores user preference; banned pattern
+- **Hardcoding reminder offset = 120** → reminder fires at wrong time if `app_config` value changes; other platforms stay in sync while Android drifts
+- **Direct self-booking INSERT bypassing `book_game` RPC** → race condition on capacity; membership gate bypassed; non-member can book members-only games
+- **Ignoring `membership_required` error from `book_game`** → app shows confusing error or crashes; user has no guidance on how to resolve the block

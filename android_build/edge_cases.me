@@ -1,0 +1,219 @@
+# edge_cases.me
+# Purpose: All critical edge cases, race conditions, partial failure states, and
+#          failure handling scenarios. Explicit handling is required for every item
+#          below. "It probably won't happen" is not acceptable for financial flows.
+# Scope: iOS, Android, Supabase backend
+
+---
+
+## 1. PAYMENT RACE CONDITIONS
+
+### Scenario: Stripe completes but booking insert fails
+- Cause: network loss after PaymentSheet returns `.completed`; DB insert never executes.
+- Risk: Player charged but no booking exists.
+- Required handling:
+  - Use idempotency key on PaymentIntent: `{gameID}_{userID}` (set at intent creation).
+  - On app relaunch, check for unresolved PaymentIntents via Stripe API (or by checking `stripe_payment_intent_id` exists without a matching booking row).
+  - Retry insert on next app open with the existing intent ID.
+
+### Scenario: PaymentIntent created but player closes app
+- Cause: App killed between intent creation and PaymentSheet presentation.
+- Risk: Dangling PaymentIntent; spot not held; no booking.
+- Required handling:
+  - Do NOT hold a spot at intent creation time.
+  - Stripe expires uncaptured intents automatically (1h default).
+  - No DB cleanup needed — no booking row was inserted.
+
+### Scenario: Double-tap on "Book" button
+- Cause: User taps Book twice before async operation completes.
+- Risk: Two bookings inserted for the same player.
+- Required handling:
+  - Disable Book CTA immediately on first tap. Re-enable only on failure.
+  - Server-side: `UNIQUE(game_id, user_id)` constraint on `bookings` (or equivalent guard) prevents duplicate insert.
+  - If DB returns 409/conflict: treat as already booked; refresh booking state.
+
+### Scenario: Game fills up between CTA tap and booking insert
+- Cause: Another player books the last spot between the user's tap and the DB write.
+- Risk: Game exceeds max_spots.
+- Required handling:
+  - On booking insert, check `confirmed_count < max_spots` in the RPC/Edge Function.
+  - If game is now full: return an error. Client shows "This game is now full. You've been added to the waitlist." and inserts as `waitlisted` instead.
+
+
+---
+
+## 2. WAITLIST RACE CONDITIONS
+
+### Scenario: Two players promoted simultaneously
+- Cause: Two admins trigger promotion at the same time, or pg_cron fires while admin is promoting.
+- Risk: Two players hold `pending_payment` for the same game simultaneously.
+- Prevention: `promote_waitlist_player` RPC acquires `FOR UPDATE` lock on game row. Second call returns `FALSE`.
+- Required client handling: if `promote_waitlist_player` returns `FALSE`, do NOT notify the player. Log and skip.
+
+### Scenario: Hold expires while player is mid-payment
+- Cause: Player opens PaymentSheet 1 second before hold expires.
+- Risk: Hold is reverted server-side; player pays; booking insert fails (game may be full again).
+- Required handling:
+  - On `pending_payment` booking insert, re-verify hold is still valid (`hold_expires_at > now()`).
+  - If expired: return error to client. Client shows "Your spot hold expired" and does NOT confirm booking.
+  - Stripe charge must be voided (cancel/refund the PaymentIntent server-side).
+  - Do NOT leave a player charged without a confirmed booking.
+
+### Scenario: Waitlist player cancels during hold window
+- Cause: Player in `pending_payment` taps cancel.
+- Required handling:
+  - Set booking `status = 'cancelled'`.
+  - Do NOT issue a credit (player never paid).
+  - Promote next waitlisted player.
+
+### Scenario: pg_cron fails to run
+- Cause: Supabase pg_cron extension failure.
+- Risk: Expired holds not reverted; game appears full to new players.
+- Mitigation: Client checks `holdExpiresAt` locally and shows expired state. Does NOT rely solely on server cleanup for UX.
+
+
+---
+
+## 3. CREDIT RACE CONDITIONS
+
+### Scenario: Double credit deduction (double-spend)
+- Cause: Two rapid booking requests both read the same balance and both pass the `amount >= amountCents` check.
+- Prevention: PATCH atomic guard: `WHERE user_id=eq.{id} AND club_id=eq.{clubID} AND amount_cents=gte.{amountCents}`. Only one PATCH succeeds; the other returns 0 rows.
+- Required client handling: if PATCH returns 0 rows (no match), treat as insufficient balance; abort booking.
+
+### Scenario: Credit deduction succeeds but booking insert fails
+- Cause: Network loss between credit PATCH and booking insert.
+- Risk: Credits deducted but booking never created.
+- Required handling:
+  - Wrap credit deduction and booking insert in a server-side transaction (RPC) if possible.
+  - If not, detect orphaned deduction on app relaunch: check if a booking exists for the deducted credits. If no matching booking, re-credit the player.
+  - This is a known v1 limitation — document for future RPC consolidation.
+
+### Scenario: Cancellation credit issued multiple times (retry)
+- Cause: Network timeout on first credit issuance; client retries.
+- Prevention: Check `credit_transactions` for existing `(booking_id, reason='cancellation_refund')` before inserting.
+- Idempotency is best-effort — `credit_transactions.UNIQUE(user_id, booking_id, reason)` prevents duplicate rows at DB level.
+
+### Scenario: Credit balance goes negative
+- Prevention: RLS UPDATE policy `WITH CHECK (amount_cents >= 0)`. PostgREST rejects the PATCH.
+- Required client handling: if PATCH returns 403 or 0 rows, show "Insufficient credits" and abort.
+
+---
+
+## 4. BOOKING CANCELLATION EDGE CASES
+
+### Scenario: Admin cancels a game with waitlisted players
+- Required handling:
+  - All confirmed bookings: `status = 'cancelled'`, `cancellation_reason = 'game_cancelled'`.
+  - All waitlisted bookings: `status = 'cancelled'` (no credit — never paid).
+  - All `pending_payment` holds: `status = 'cancelled'`; void any active PaymentIntents.
+  - Push notification to all affected players.
+
+### Scenario: Player cancels within 6 hours, refund window closed
+- Required handling:
+  - Booking marked `cancelled`. No credit issued. No error shown for missing credit.
+  - Show pre-cancel warning before confirmation: "No credit will be issued within 6 hours of game start."
+
+### Scenario: Game is free but has `credits_applied_cents > 0`
+- This should not occur (credits only applied to paid games).
+- If it does: refund = 0. Do NOT issue a credit for a free booking regardless of `credits_applied_cents`.
+
+### Scenario: Admin cancels booking vs player cancels
+- Admin cancel: `cancellation_reason = 'admin_cancelled'`. Credits MAY be issued (admin discretion — v1: no credit on admin cancel).
+- Player cancel: `cancellation_reason = 'player_cancelled'`. Standard 6h window applies.
+
+---
+
+## 5. SUBSCRIPTION EDGE CASES
+
+### Scenario: Club owner deletes club while subscription is active
+- Required handling: `delete-club` flow must cancel Stripe subscription before deleting club row.
+- Cascade: `club_subscriptions` has `ON DELETE CASCADE` — row auto-deleted when club deleted. But Stripe subscription must be cancelled first via API call.
+
+### Scenario: Stripe webhook delivers the same event twice
+- Prevention: `stripe-webhook` uses upsert on `stripe_subscription_id`. Idempotent by design.
+- Required: do NOT use INSERT without ON CONFLICT handling in `stripe-webhook`.
+
+### Scenario: Subscription goes `past_due` while games are scheduled
+- Required handling: existing games remain active. New paid game creation is blocked.
+- UI: show upgrade/payment prompt in club owner settings. Do NOT delete or cancel existing games.
+
+### Scenario: Club downgrades from pro to free mid-billing period
+- Required handling: retain all existing data. Block new paid game creation. Existing paid bookings continue.
+- Do NOT cancel existing bookings on downgrade.
+
+---
+
+## 6. NETWORK AND CONNECTIVITY
+
+### Scenario: Request times out mid-booking
+- Required: show a retry button. Do NOT auto-retry silently (could cause double-insert).
+- Required: on return to the game detail view, always refresh booking state from DB to confirm current status.
+
+### Scenario: App goes to background during PaymentSheet
+- iOS/Android: PaymentSheet handles its own lifecycle.
+- Required: do NOT insert booking on foreground return unless PaymentSheet result was `.completed`.
+
+### Scenario: PostgREST returns PGRST202 (unknown RPC)
+- Cause: Supabase schema cache has not picked up a newly deployed RPC.
+- Known affected RPCs: `use_credits`, `issue_cancellation_credit`.
+- Required: use direct PATCH/INSERT on `player_credits` instead of calling these RPCs via PostgREST.
+- Mitigation: re-deploying the affected Edge Function refreshes `SUPABASE_SERVICE_ROLE_KEY` and sometimes helps with RPC visibility. Not reliable — use PATCH path.
+
+### Scenario: Edge Function returns "Unregistered API key"
+- Cause: `SUPABASE_SERVICE_ROLE_KEY` auto-injected into Edge Function needs refresh.
+- Fix: `supabase functions deploy <name> --no-verify-jwt --project-ref <ref>`
+- This is a Supabase hosting issue, not a code bug.
+
+---
+
+## 7. USER AND PROFILE EDGE CASES
+
+### Scenario: Club owner created before `club_members` backfill migration
+- Cause: Owners created before `20260419_backfill_owner_members.sql` may lack `club_members` row.
+- Impact: Owner excluded from `ownerMembers` query; cannot add themselves to games.
+- Fix: Generate synthetic `ClubOwnerMember` entry client-side when `authUserID == club.createdBy` but no matching membership row found. Use `isAdmin=true`, `isOwner=true`, `adminRole="owner"`.
+
+### Scenario: DUPR ratings out of sync between Supabase and UserDefaults
+- Cause: Admin updates rating in Supabase; client reads stale UserDefaults value.
+- Fix: `loadProfileFromBackendIfAvailable` syncs Supabase → UserDefaults after every profile fetch.
+- Required: always call this sync after a profile fetch, not just on first load.
+
+### Scenario: Multiple simultaneous profile writes
+- Cause: User edits profile while a background sync is also writing.
+- Prevention: RLS `WITH CHECK (auth.uid() = id)` prevents cross-user writes. Within the same user, last-write-wins (acceptable for v1).
+
+---
+
+## 8. REVIEW EDGE CASES
+
+### Scenario: Game not in memory when review notification is tapped
+- Required: `ReviewGameSheet` resolves club via `clubForGame(gameID:)` which:
+  1. Checks `gamesByClubID` cache
+  2. Checks `bookings` cache
+  3. Falls back to DB query `games?select=club_id&id=eq.{gameID}`
+- Do NOT require the game to be in memory. Always support the DB fallback.
+
+### Scenario: Review submitted twice (retry after network timeout)
+- DB returns HTTP 409 (UNIQUE constraint violation).
+- Required: show "You have already left a review for this session." — NOT a generic error.
+
+---
+
+## 9. IMAGE AND MEDIA EDGE CASES
+
+### Scenario: Custom club banner URL from an untrusted host
+- Required: validate all `image_url` and `custom_banner_url` values against the configured Supabase storage host before rendering.
+- Reject and fall back to preset if URL host does not match.
+
+### Scenario: Club image upload fails mid-upload
+- Required: show error. Do NOT save partial URL to `clubs.image_url`. Only save URL after upload confirms success.
+
+---
+
+## VIOLATION IMPACT
+- Not voiding PaymentIntent on expired hold → player charged with no confirmed booking; chargeback risk.
+- Not handling PGRST202 → credit deduction silently fails; player gets a free booking.
+- Not idempotency-guarding cancellation credits → duplicate credits issued; financial loss.
+- Not refreshing booking state on view appear → UI shows wrong booking state; player can't book or gets confused.
+- Not handling `pending_payment` hold expiry during PaymentSheet → booking confirmed after hold expired; another player may have taken the spot.

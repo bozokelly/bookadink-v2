@@ -13,10 +13,24 @@ enum DeepLink: Equatable {
     case club(id: UUID)
     case game(id: UUID)
     case review(gameID: UUID)
+    /// Stripe Connect onboarding return. `status` is "complete" or "refresh" (link expired).
+    case connectReturn(clubID: UUID, status: String)
 
     private static let knownHosts: Set<String> = ["bookadink.com", "www.bookadink.com"]
 
     init?(url: URL) {
+        // Stripe Connect return deep links:
+        //   bookadink://stripe-return/{clubID}  — owner completed all onboarding steps
+        //   bookadink://stripe-refresh/{clubID} — Account Link expired mid-flow
+        if url.scheme == "bookadink",
+           let host = url.host,
+           (host == "stripe-return" || host == "stripe-refresh"),
+           let clubID = UUID(uuidString: url.lastPathComponent) {
+            let status = host == "stripe-return" ? "complete" : "refresh"
+            self = .connectReturn(clubID: clubID, status: status)
+            return
+        }
+
         // Custom scheme: bookadink://club/{uuid}
         if url.scheme == "bookadink" {
             guard let host = url.host, let id = UUID(uuidString: url.lastPathComponent) else { return nil }
@@ -50,6 +64,9 @@ enum DeepLink: Equatable {
             return URL(string: "bookadink://game/\(id.uuidString)")!
         case .review(let gameID):
             return URL(string: "bookadink://game/\(gameID.uuidString)")!
+        case .connectReturn(let clubID, let status):
+            let host = status == "complete" ? "stripe-return" : "stripe-refresh"
+            return URL(string: "bookadink://\(host)/\(clubID.uuidString.lowercased())")!
         }
     }
 

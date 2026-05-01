@@ -4,9 +4,16 @@ struct BadgesCard: View {
     @EnvironmentObject private var appState: AppState
     let profile: UserProfile
     @State private var selectedBadge: ProfileBadge?
+    @State private var showAll = false
 
     private var badges: [ProfileBadge] {
-        BadgeEvaluator.evaluate(for: profile, appState: appState)
+        let all = BadgeEvaluator.evaluate(for: profile, appState: appState)
+        // Earned first, then unearned, preserving relative order within each group
+        return all.filter(\.isEarned) + all.filter { !$0.isEarned }
+    }
+
+    private var visibleBadges: [ProfileBadge] {
+        showAll ? badges : Array(badges.prefix(4))
     }
 
     private var earnedCount: Int { badges.filter(\.isEarned).count }
@@ -29,11 +36,25 @@ struct BadgesCard: View {
             progressBar
 
             LazyVGrid(columns: columns, spacing: 14) {
-                ForEach(badges) { badge in
+                ForEach(visibleBadges) { badge in
                     BadgeTile(badge: badge)
                         .onTapGesture { selectedBadge = badge }
                 }
             }
+
+            Button {
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                    showAll.toggle()
+                }
+            } label: {
+                Text(showAll ? "Show less" : "See all \(totalCount)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.pineTeal)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 34)
+                    .background(Brand.pineTeal.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            .buttonStyle(.plain)
         }
         .padding(16)
         .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))

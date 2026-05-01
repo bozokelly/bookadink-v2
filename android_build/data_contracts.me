@@ -1,0 +1,306 @@
+# data_contracts.me
+# Purpose: Authoritative entity structures, required fields, enums, relationships,
+#          and query field requirements. Any model in iOS or Android must conform to
+#          these definitions. Deviations cause silent decode failures.
+# Scope: iOS Models.swift, Android data layer, Supabase PostgREST queries
+
+---
+
+## 1. CRITICAL QUERY RULE
+
+PostgREST only returns columns you explicitly enumerate in `select=`. Omitting a column
+causes silent nil decode — no error is thrown. This has caused production bugs.
+
+**Every column listed in the entity definitions below must appear in all query strings
+for that table.** Adding a new column to a model without adding it to all query strings
+will silently decode as nil.
+
+---
+
+## 2. CORE ENTITIES
+
+### `clubs`
+Required columns in ALL select strings (5 query strings in SupabaseService):
+`fetchClubs`, `fetchClubDetail`, `createClub`, `updateClubOwnerFields`, delete helper
+
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| name | TEXT | Sanitise: max length cap + no raw URL injection |
+| description | TEXT NULL | |
+| address | TEXT NULL | |
+| latitude | FLOAT8 NULL | **MUST appear in all 5 select strings** — omission silently breaks NearbyDiscoveryView |
+| longitude | FLOAT8 NULL | **MUST appear in all 5 select strings** |
+| image_url | TEXT NULL | Custom upload URL or preset key |
+| custom_banner_url | TEXT NULL | Owner-uploaded banner; falls back to preset |
+| created_by | UUID FK → auth.users | Club owner |
+| subscription_tier | TEXT DEFAULT 'free' | Denormalised; values: `free`, `starter`, `pro`, `enterprise` |
+| stripe_connect_id | TEXT NULL | Denormalised from `club_stripe_accounts` |
+| membership_policy | TEXT | Membership join behaviour |
+| created_at | TIMESTAMPTZ | |
+
+Sanitisation at decode time (DB-authoritative — migration `20260429_field_length_constraints.sql`):
+- The DB enforces CHECK constraints. Client-side trimming is UX polish only — never define different limits.
+- `image_url`: validate URL scheme against allowed Supabase host OR preset key
+- DO NOT pass unbounded text fields directly into UI models
+
+Field length limits (DB CHECK constraints, Android must respect the same values):
+
+| Column | Max (chars) | Notes |
+|---|---|---|
+| `name` | 120 | required |
+| `description` | 2000 | |
+| `contact_email` | 320 | |
+| `contact_phone` | 30 | |
+| `website` | 260 | |
+| `manager_name` | 160 | |
+| `suburb` | 80 | |
+| `state` | 80 | |
+| `venue_name` | 260 | also applies to `club_venues.venue_name` |
+
+`club_venues` inherits the same `suburb` (80) and `state` (80) limits.
+
+### `games`
+Required in ALL 8 game select strings:
+
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| club_id | UUID FK → clubs | |
+| title | TEXT | |
+| date_time | TIMESTAMPTZ | |
+| duration_minutes | INT | |
+| max_spots | INT | |
+| skill_level | TEXT | Enum: `all`, `beginner`, `intermediate`, `advanced` — NO `tournament` |
+| fee_amount | INT | 0 = free |
+| currency | TEXT DEFAULT 'aud' | |
+| platform_fee_bps | INT DEFAULT 1000 | Basis points (1000 = 10%) |
+| cancellation_window_hours | INT DEFAULT 6 | Hours before game start |
+| publish_at | TIMESTAMPTZ NULL | NULL = published; future = scheduled/hidden |
+| created_by | UUID FK → auth.users | |
+| venue_name | TEXT NULL | |
+| latitude | FLOAT8 NULL | |
+| longitude | FLOAT8 NULL | |
+| notes | TEXT NULL | |
+| created_at | TIMESTAMPTZ | |
+
+Games field limits (DB CHECK constraints):
+- `title`: 1–200 chars (non-empty, ≤ 200)
+- `max_spots`: 2–64 (when not null)
+- `court_count`: 1–50 (when not null)
+
+Computed properties (client-side only):
+- `isScheduled: Bool` = `publishAt != nil && publishAt > now()`
+- `startsInPast: Bool` = `dateTime < now()`
+- `spotsLeft: Int` = `maxSpots - confirmedCount`
+- `spotsFilled: Bool` = `spotsLeft <= 0`
+
+### `bookings`
+Required in ALL booking select strings:
+
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| game_id | UUID FK → games | |
+| user_id | UUID FK → auth.users | |
+| status | TEXT | Enum: `confirmed`, `waitlisted`, `cancelled`, `pending_payment` |
+| fee_paid | BOOL | |
+| payment_method | TEXT NULL | `"stripe"`, `"admin"`, `"cash"`, `"credits"`, NULL — DB CHECK constraint enforced |
+| stripe_payment_intent_id | TEXT NULL | |
+| platform_fee_cents | INT NULL | |
+| club_payout_cents | INT NULL | |
+| credits_applied_cents | INT NULL | |
+| hold_expires_at | TIMESTAMPTZ NULL | Non-null when `status='pending_payment'` |
+| waitlist_position | INT NULL | |
+| created_at | TIMESTAMPTZ | |
+
+`payment_method` is admin/owner-visible only. Omitting it from SELECT causes everyone to appear as "Unpaid".
+
+### `player_credits`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| user_id | UUID FK → auth.users | |
+| club_id | UUID FK → clubs | Club-scoped |
+| amount_cents | INT NOT NULL | Current balance; never negative |
+| currency | TEXT DEFAULT 'aud' | |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+| UNIQUE | (user_id, club_id, currency) | One row per player per club |
+
+### `profiles`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK = auth.uid() | |
+| full_name | TEXT NULL | max 200 chars |
+| email | TEXT NULL | |
+| phone | TEXT NULL | max 30 chars |
+| emergency_contact_name | TEXT NULL | max 160 chars |
+| emergency_contact_phone | TEXT NULL | max 30 chars |
+| dupr_id | TEXT NULL | 6–24 chars, `^[A-Z0-9-]+$` + must contain digit; server-enforced |
+| dupr_rating | NUMERIC(5,3) NULL | 2.000–8.000, exactly 3 decimal places; server-enforced via column type + CHECK |
+| skill_level | TEXT NULL | |
+| stripe_customer_id | TEXT NULL | Reused across clubs for subscription billing |
+| created_at | TIMESTAMPTZ | |
+
+Profiles field limits (DB CHECK constraints — migrations `20260429_field_length_constraints.sql`, `20260429_dupr_validation_constraints.sql`, `20260429_dupr_rating_3dp_precision.sql`):
+- `full_name`: ≤ 200 chars
+- `phone`: ≤ 30 chars
+- `emergency_contact_name`: ≤ 160 chars
+- `emergency_contact_phone`: ≤ 30 chars
+- `dupr_id`: 6–24 chars, uppercase alphanumeric + hyphen only (`^[A-Z0-9-]+$`), must contain at least one digit (when not null). **Always PATCH uppercase.** DB rejects lowercase.
+- `dupr_rating`: column type `NUMERIC(5,3)` — exactly 3 decimal places always. Range 2.000–8.000 inclusive (when not null). **Android must send exactly 3dp** (e.g. `3.524`, never `3.52` or `3`). Do not cap silently — reject input and show error. Required by DUPR API integration.
+
+### `notifications`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| user_id | UUID FK → auth.users | |
+| type | notification_type enum | See enum values below |
+| title | TEXT | |
+| body | TEXT | |
+| data | JSONB NULL | Contextual payload (game_id, club_id, etc.) |
+| is_read | BOOL DEFAULT false | |
+| created_at | TIMESTAMPTZ | |
+
+`notification_type` enum values (must match DB exactly):
+```
+booking_confirmed, booking_waitlisted, waitlist_promoted, booking_cancelled,
+membership_approved, membership_rejected, membership_removed,
+membership_request_received, admin_promoted,
+club_new_post, club_announcement, club_new_comment,
+game_cancelled, game_updated, game_review_request,
+game_reminder_2h, new_game
+```
+`game_reminder_24h` — LEGACY, kept in DB enum for backward compatibility only. Never emitted by any current function. Handle as `.unknown`.
+Unknown values must decode as `.unknown` — do not crash.
+
+### `reviews`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| game_id | UUID FK → games | |
+| user_id | UUID FK → auth.users | |
+| rating | INT | 1–5 inclusive (CHECK constraint) |
+| comment | TEXT NULL | |
+| created_at | TIMESTAMPTZ | |
+| UNIQUE | (game_id, user_id) | One review per player per game |
+
+Fetched via `get_club_reviews(p_club_id)` RPC (SECURITY DEFINER). NOT via direct join on profiles.
+Response includes computed columns: `reviewer_name`, `game_title`.
+
+### `game_attendance`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| game_id | UUID FK → games | |
+| user_id | UUID FK → auth.users | |
+| status | TEXT | `attended`, `no_show` |
+| created_at | TIMESTAMPTZ | |
+
+RLS: admin-only writes. All reads by authenticated users.
+
+### `club_stripe_accounts`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| club_id | UUID FK → clubs | UNIQUE |
+| stripe_account_id | TEXT | `acct_xxx` — Stripe Express ID |
+| onboarding_complete | BOOL DEFAULT false | |
+| payouts_enabled | BOOL DEFAULT false | |
+| created_at | TIMESTAMPTZ | |
+
+### `club_subscriptions`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| club_id | UUID FK → clubs | UNIQUE |
+| stripe_subscription_id | TEXT | UNIQUE |
+| plan_type | TEXT | Derived from Stripe Price metadata |
+| status | TEXT | `incomplete`, `active`, `past_due`, `canceled` |
+| current_period_end | TIMESTAMPTZ NULL | |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+---
+
+## 3. ENUMS
+
+### `skill_level` (games and profiles)
+Valid values: `all`, `beginner`, `intermediate`, `advanced`
+DEPRECATED: `tournament` — do not use; causes 22P02 on RPC calls
+
+### `booking_status` (stored as TEXT in bookings.status)
+Valid values: `confirmed`, `waitlisted`, `cancelled`, `pending_payment`
+Note: PG enum exists as `booking_status`. When comparing in PL/pgSQL, cast to text first:
+`v_booking.status::text != 'cancelled'` — direct enum comparison with string literal raises error 22P02.
+
+### `payment_method` (bookings.payment_method, TEXT)
+Valid values: `"stripe"`, `"admin"`, `"cash"`, `"credits"`, NULL
+DB CHECK constraint enforced (migration `20260430_bookings_payment_method_constraint.sql`) — any other value is rejected.
+
+| Value | Meaning | Who writes it |
+|---|---|---|
+| `"stripe"` | Card or Apple Pay via Stripe | `confirmPendingBooking`, `updateBookingPaymentMethod` |
+| `"admin"` | Owner/admin manually added player | `ownerCreateBooking`, `updateBookingPaymentMethod` |
+| `"cash"` | Admin-recorded cash payment at check-in | `updateBookingPaymentMethod` |
+| `"credits"` | Credits-only booking (no Stripe PI) | `confirmPendingBooking` when no Stripe PI |
+| NULL | Free game, no payment collected | free game booking path |
+
+**NEVER write any other value** — the DB CHECK will reject it. The legacy value `"free"` was normalised to NULL in the same migration and no longer exists.
+
+### `game_format` (games.game_format, TEXT)
+DB CHECK constraint enforced (migration `20260429_normalize_game_format.sql`).
+Valid values: `"open_play"`, `"random"`, `"round_robin"`, `"king_of_court"`, `"dupr_king_of_court"`
+
+**BANNED**: `"ladder"` — was a legacy alias for `king_of_court`. Normalized out of the DB. **Never write `"ladder"` to the DB or accept it as a valid wire value.** Display labels live in the UI layer only.
+
+### `cancellation_reason` (bookings.cancellation_reason, TEXT)
+Valid values: `"player_cancelled"`, `"admin_cancelled"`, `"game_cancelled"`
+
+### `credit transaction reason` (credit_transactions.reason, TEXT)
+Valid values: `"booking_applied"`, `"cancellation_refund"`, `"admin_adjustment"`
+
+### `subscription_tier` (clubs.subscription_tier, TEXT)
+Valid values: `"free"`, `"starter"`, `"pro"`, `"enterprise"`
+
+### `subscription status` (club_subscriptions.status, TEXT)
+Valid values: `"incomplete"`, `"active"`, `"past_due"`, `"canceled"`
+
+---
+
+## 4. DATE HANDLING
+
+- All timestamps stored as `TIMESTAMPTZ` in UTC.
+- Supabase returns ISO 8601 strings (e.g. `2026-04-21T13:37:00+00:00`).
+- iOS: Decode via `SupabaseDateParser.parse` into `Date?`. Do NOT use `Date?` directly as a Codable type — JSONDecoder cannot parse ISO 8601 strings without a custom strategy and fails silently.
+- Android: Use `Instant.parse(string)` from `java.time`. Apply `DateTimeFormatter.ISO_OFFSET_DATE_TIME`.
+- NEVER store or compare dates as raw strings in business logic.
+
+---
+
+## 5. UUID HANDLING
+
+- All UUID filter values passed to PostgREST must be **lowercased** (`uuidString.lowercased()`).
+- Inconsistent UUID case causes PostgREST to return 0 rows (no error). This has caused production bugs.
+- This applies to all query parameters: `user_id=eq.{uuid}`, `club_id=eq.{uuid}`, etc.
+
+---
+
+## 6. CURRENCY
+
+- All monetary amounts stored as **cents (Integer)** — no floats.
+- Currency code: `"aud"` (lowercase) for all v1 operations.
+- Display format: `$X.XX AUD` or locale-appropriate format. Never display cents directly.
+
+---
+
+## VIOLATION IMPACT
+- Omitting `latitude`/`longitude` from club select → NearbyDiscoveryView silently shows no nearby clubs.
+- Omitting `payment_method` from booking select → all attendees appear as "Unpaid" to admins.
+- Writing any `payment_method` value not in the canonical set → DB CHECK constraint rejects with 400.
+- Writing `"free"` as `payment_method` → DB CHECK constraint rejects (normalised to NULL in migration `20260430_bookings_payment_method_constraint.sql`).
+- Using `tournament` as skill_level → PG enum error 22P02; query fails.
+- Using `"ladder"` as game_format → DB CHECK constraint rejects; was normalized to `"king_of_court"`.
+- Uppercase UUID in PostgREST filter → 0 rows returned; features silently break.
+- Direct `Date?` Codable decoding of Supabase timestamps → silent nil; date fields missing from models.

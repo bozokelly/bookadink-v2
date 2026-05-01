@@ -11,6 +11,8 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isUUID, clampStr, VALID_NOTIFICATION_TYPES } from "../_shared/validate.ts";
+import { getCallerID } from "../_shared/auth.ts";
 
 interface RequestBody {
   user_id: string;
@@ -33,15 +35,30 @@ serve(async (req: Request) => {
     return new Response("Invalid JSON body", { status: 400 });
   }
 
-  const { user_id, title, body: notifBody, type, reference_id, send_push } = body;
-  if (!user_id || !title || !notifBody || !type) {
-    return new Response("Missing required fields", { status: 400 });
+  const { user_id, title: rawTitle, body: rawBody, type, reference_id, send_push } = body;
+  if (!isUUID(user_id) || !rawTitle || !rawBody || !type) {
+    return new Response("Missing required fields; user_id must be a valid UUID", { status: 400 });
   }
+  if (!VALID_NOTIFICATION_TYPES.has(type)) {
+    return new Response(`Invalid notification type: ${type}`, { status: 400 });
+  }
+  if (reference_id !== undefined && reference_id !== null && !isUUID(reference_id)) {
+    return new Response("reference_id must be a valid UUID", { status: 400 });
+  }
+  const title = clampStr(rawTitle, 200);
+  const notifBody = clampStr(rawBody, 1000);
 
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
+
+  // Require an authenticated caller. Cross-user notifications (admin → member, member → admin)
+  // are intentional — the caller need not be the notification target.
+  const callerID = await getCallerID(supabase, req);
+  if (!callerID) {
+    return new Response("Authentication required", { status: 401 });
+  }
 
   // Insert into notifications table — DB trigger fires send-notification-email automatically
   const { data: notifRow, error: insertError } = await supabase

@@ -1,4 +1,5 @@
 import CoreLocation
+import MapKit
 import SwiftUI
 import UIKit
 import os
@@ -10,6 +11,11 @@ enum ContentTabKind: String, CaseIterable { case games = "Games", chat = "Chat" 
 // MARK: - Club Hero View
 
 struct ClubHeroView: View {
+    /// Single source of truth: banner width ÷ height.
+    /// This ratio is shared with ImageCropSheet so the crop preview
+    /// matches exactly what renders in the club header (WYSIWYG).
+    static let bannerAspectRatio: CGFloat = 1.5
+
     let club: Club
 
     private static func heroImageName(for key: String?) -> String {
@@ -25,28 +31,49 @@ struct ClubHeroView: View {
     }
 
     var body: some View {
-        let heroHeight: CGFloat = UIDevice.current.userInterfaceIdiom == .pad ? 320 : 280
-        let imageName = Self.heroImageName(for: club.heroImageKey)
+        // Derive height from aspect ratio so crop preview = final render.
+        // UIScreen.main.bounds.width is used only for the outer frame height
+        // computation; the inner image frame uses the GeometryReader width
+        // so it adapts correctly to any container width (split view, etc.).
+        let screenWidth = UIScreen.main.bounds.width
+        let heroHeight = min(380, screenWidth / Self.bannerAspectRatio)
 
         GeometryReader { geo in
-            Image(imageName)
-                .resizable()
-                .scaledToFill()
-                .frame(width: geo.size.width, height: heroHeight)
+            let innerHeight = min(380, geo.size.width / Self.bannerAspectRatio)
+            if let customURL = club.customBannerURL {
+                AsyncImage(url: customURL) { phase in
+                    switch phase {
+                    case let .success(image):
+                        image.resizable().scaledToFill()
+                    case .failure:
+                        Image(Self.heroImageName(for: club.heroImageKey))
+                            .resizable().scaledToFill()
+                    default:
+                        Color(UIColor.systemBackground)
+                    }
+                }
+                // Force AsyncImage to rebuild when the URL changes so the old
+                // cached image does not flash briefly before the new one loads.
+                .id(customURL)
+                .frame(width: geo.size.width, height: innerHeight)
                 .clipped()
+            } else {
+                Image(Self.heroImageName(for: club.heroImageKey))
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: geo.size.width, height: innerHeight)
+                    .clipped()
+            }
         }
         .frame(height: heroHeight)
-            // Fades hero bottom into the page background. Paired with .padding(.bottom, -65)
-            // at the call site so content starts at the original position and total
-            // page length is unchanged.
-            .overlay(
-                LinearGradient(
-                    colors: [.clear, Color(.systemBackground).opacity(0.5)],
-                    startPoint: UnitPoint(x: 0.5, y: 0.75),
-                    endPoint: .bottom
-                )
+        .overlay(
+            LinearGradient(
+                colors: [.clear, Color(.systemBackground).opacity(0.7)],
+                startPoint: UnitPoint(x: 0.5, y: 0.55),
+                endPoint: .bottom
             )
-            .ignoresSafeArea(edges: .top)
+        )
+        .ignoresSafeArea(edges: .top)
     }
 }
 
@@ -72,7 +99,7 @@ struct ClubDetailView: View {
     @State private var searchText = ""
 
     @State private var isShowingInviteSheet = false
-    @State private var ownerToolSheet: OwnerToolSheet?
+    @State private var isDashboardPresented = false
     @State private var editingOwnerGame: Game?
     @State private var ownerDeleteGameCandidate: Game?
     @State private var duplicatingGame: Game?
@@ -87,6 +114,8 @@ struct ClubDetailView: View {
     @State private var navigateToChat = false
     @State private var showLeaveClubConfirm = false
     @State private var showConductSheet = false
+    @State private var showCancellationPolicySheet = false
+    @State private var pendingConductDate: Date? = nil
     @State private var now = Date()
     private let minuteTick = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
@@ -119,12 +148,35 @@ struct ClubDetailView: View {
         appState.clubVenuesByClubID[club.id]?.first(where: { $0.isPrimary })
     }
 
+    /// Best available coordinate for map navigation: primary venue → club → nil.
+    private var clubMapCoordinate: CLLocationCoordinate2D? {
+        if let v = primaryVenueForContact, let lat = v.latitude, let lng = v.longitude {
+            return CLLocationCoordinate2D(latitude: lat, longitude: lng)
+        }
+        if let lat = club.latitude, let lng = club.longitude {
+            return CLLocationCoordinate2D(latitude: lat, longitude: lng)
+        }
+        return nil
+    }
+
+    /// Apple Maps URL: coordinate-based when available, string-address fallback.
+    private var clubMapURL: URL? {
+        if let coord = clubMapCoordinate {
+            return MapNavigationURL.directions(to: coord)
+        }
+        return MapNavigationURL.directions(to: safeAddress)
+    }
+
     private var safeDescription: String {
         cappedDisplayText(club.description, maxLength: Self.maxDescriptionLength)
     }
 
     private var safeContactEmail: String {
         cappedDisplayText(club.contactEmail, maxLength: Self.maxContactLength)
+    }
+
+    private var safeContactPhone: String? {
+        trimmedOptional(cappedDisplayText(club.contactPhone ?? "", maxLength: 30))
     }
 
     private var safeWebsite: String? {
@@ -135,12 +187,9 @@ struct ClubDetailView: View {
         trimmedOptional(cappedDisplayText(club.managerName ?? "", maxLength: Self.maxManagerLength))
     }
 
-    private var safeLocationDisplay: String {
-        cappedDisplayText(club.locationDisplay, maxLength: Self.maxAddressLength)
-    }
-
     private var filteredClubGames: [Game] {
         allClubGames
+            .filter { $0.status != "cancelled" }
             .filter { $0.dateTime >= now }
             .filter { isClubAdminUser || ($0.publishAt == nil || $0.publishAt! <= now) }
             .sorted { $0.dateTime < $1.dateTime }
@@ -185,21 +234,47 @@ struct ClubDetailView: View {
                         .background(Color(.systemBackground))
                     }
 
+                    // Credit balance banner — only shown when the user holds credits at this club
+                    let clubCredit = appState.creditBalance(for: club.id)
+                    if clubCredit > 0 {
+                        HStack(spacing: 8) {
+                            Image(systemName: "creditcard.fill")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(Brand.slateBlue)
+                            HStack(spacing: 4) {
+                                Text(String(format: "$%.2f", Double(clubCredit) / 100))
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundStyle(Brand.primaryText)
+                                Text("credit available")
+                                    .font(.system(size: 12, weight: .regular))
+                                    .foregroundStyle(Brand.secondaryText.opacity(0.8))
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(Brand.slateBlue.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Brand.slateBlue.opacity(0.2), lineWidth: 1))
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        .background(Color(.systemBackground))
+                    }
+
                     clubInfoSection
                     let reviewsData = appState.reviewsByClubID[club.id] ?? []
                     let reviewsLoading = appState.loadingReviewsClubIDs.contains(club.id)
                     if !reviewsData.isEmpty || reviewsLoading {
-                        Divider().padding(.horizontal, 20).background(Color(.systemBackground))
+                        Divider().overlay(Color(hex: "E5E5E5")).padding(.horizontal, 20).background(Color(.systemBackground))
                         reviewsSection
                     }
-                    Divider().padding(.horizontal, 20).background(Color(.systemBackground))
+                    Divider().overlay(Color(hex: "E5E5E5")).padding(.horizontal, 20).background(Color(.systemBackground))
                     aboutSection
-                    Divider().padding(.horizontal, 20).background(Color(.systemBackground))
+                    Divider().overlay(Color(hex: "E5E5E5")).padding(.horizontal, 20).background(Color(.systemBackground))
                     contactSection
-                    Divider().padding(.horizontal, 20).background(Color(.systemBackground))
+                    Divider().overlay(Color(hex: "E5E5E5")).padding(.horizontal, 20).background(Color(.systemBackground))
                     membersPreviewSection
 
-                    Divider().background(Color(.systemBackground))
+                    Divider().overlay(Color(hex: "E5E5E5")).background(Color(.systemBackground))
                     contentTabsSection
                 }
                 .padding(.bottom, 100)
@@ -210,6 +285,7 @@ struct ClubDetailView: View {
                 await appState.refreshGames(for: club)
                 await appState.refreshClubs()
                 await appState.fetchReviews(for: club.id)
+                await appState.refreshCreditBalance(for: club.id)
             }
             .ignoresSafeArea(edges: .top)
             .background(Color(.systemBackground))
@@ -235,30 +311,9 @@ struct ClubDetailView: View {
             if isClubAdminUser {
                 ToolbarItem(placement: .topBarTrailing) {
                     let pendingCount = appState.ownerJoinRequests(for: club).count
-                    Menu {
-                        Button { ownerToolSheet = .manageGames } label: {
-                            Label("View/Edit Games", systemImage: "calendar.badge.clock")
-                        }
-                        Button { ownerToolSheet = .createGame } label: {
-                            Label("Create Game", systemImage: "calendar.badge.plus")
-                        }
-                        Divider()
-                        Button { ownerToolSheet = .editClub } label: {
-                            Label("Club Settings", systemImage: "slider.horizontal.3")
-                        }
-                        Divider()
-                        Button { ownerToolSheet = .joinRequests } label: {
-                            Label(
-                                pendingCount > 0 ? "Join Requests (\(pendingCount))" : "Join Requests",
-                                systemImage: "person.badge.plus"
-                            )
-                        }
-                        Button { ownerToolSheet = .members } label: {
-                            Label("Manage Members", systemImage: "person.2")
-                        }
-                    } label: {
+                    Button { isDashboardPresented = true } label: {
                         ZStack(alignment: .topTrailing) {
-                            Image(systemName: "ellipsis")
+                            Image(systemName: "square.grid.2x2")
                                 .font(.system(size: 15, weight: .semibold))
                                 .foregroundStyle(Brand.ink)
                                 .frame(width: 36, height: 36)
@@ -272,17 +327,13 @@ struct ClubDetailView: View {
                             }
                         }
                     }
+                    .buttonStyle(.plain)
                 }
             }
         }
-        .sheet(item: $ownerToolSheet) { sheet in
-            switch sheet {
-            case .manageGames:  OwnerManageGamesView(club: club).environmentObject(appState)
-            case .joinRequests: OwnerJoinRequestsSheet(club: club).environmentObject(appState)
-            case .createGame:   OwnerCreateGameSheet(club: club).environmentObject(appState)
-            case .editClub:     OwnerEditClubSheet(club: club).environmentObject(appState)
-            case .members:      OwnerMembersSheet(club: club).environmentObject(appState)
-            }
+        .fullScreenCover(isPresented: $isDashboardPresented) {
+            ClubDashboardView(club: club)
+                .environmentObject(appState)
         }
         .sheet(item: $editingOwnerGame) { game in
             OwnerEditGameSheet(club: club, game: game, initialVenues: appState.venues(for: club)).environmentObject(appState)
@@ -340,10 +391,17 @@ struct ClubDetailView: View {
             Task { await appState.refreshClubAdminRole(for: club) }
             Task { await appState.refreshGames(for: club) }
             Task { await appState.fetchReviews(for: club.id) }
+            Task { await appState.refreshCreditBalance(for: club.id) }
             // If we already know the user is an admin (cached from a prior session), fetch requests now.
             if appState.isClubAdmin(for: club) {
                 Task { await appState.refreshOwnerJoinRequests(for: club) }
             }
+        }
+        .onChange(of: appState.lastCancellationCredit) { _, result in
+            // When a credit is issued for this club, refresh the balance immediately
+            // so the banner updates without the user having to pull-to-refresh.
+            guard result?.clubID == club.id else { return }
+            Task { await appState.refreshCreditBalance(for: club.id) }
         }
         .onChange(of: isClubAdminUser) { _, newValue in
             // Fires when the admin role resolves asynchronously on first open.
@@ -365,7 +423,7 @@ struct ClubDetailView: View {
             ClubNewsView(club: club, isClubModerator: appState.isClubAdmin(for: club))
                 .environmentObject(appState)
                 .navigationBarBackButtonHidden(true)
-                .navigationTitle("Member Chat")
+                .navigationTitle("Chat")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbarBackground(.visible, for: .navigationBar)
                 .toolbar(.hidden, for: .tabBar)
@@ -386,6 +444,14 @@ struct ClubDetailView: View {
 
     // MARK: - Club Info Section
 
+    private var canPinClub: Bool {
+        if isClubAdminUser { return true }
+        switch appState.membershipState(for: club) {
+        case .approved, .unknown: return true
+        default: return false
+        }
+    }
+
     private var clubInfoSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 8) {
@@ -398,37 +464,49 @@ struct ClubDetailView: View {
             .padding(.top, 20)
             .padding(.horizontal, 20)
 
-            if !club.addressLine1.isEmpty {
-                Button {
-                    if let url = MapNavigationURL.directions(to: safeAddress) {
-                        openURL(url)
-                    }
-                } label: {
-                    HStack(alignment: .top, spacing: 6) {
-                        Image(systemName: "mappin")
-                            .font(.subheadline)
-                            .foregroundStyle(Brand.mutedText)
-                            .padding(.top, 2)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(club.addressLine1)
-                                .font(.subheadline)
-                                .foregroundStyle(Brand.mutedText)
-                            if let line2 = club.addressLine2 {
-                                Text(line2)
-                                    .font(.subheadline)
-                                    .foregroundStyle(Brand.mutedText)
-                            }
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-                .padding(.top, 10)
-                .padding(.horizontal, 20)
+            if canPinClub {
+                pinPill
+                    .padding(.top, 8)
+                    .padding(.horizontal, 20)
             }
         }
         .padding(.bottom, 20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.systemBackground))
+    }
+
+    @State private var showPinCapAlert = false
+
+    private var pinPill: some View {
+        let isPinned = appState.isClubPinned(club)
+        return Button {
+            let success = appState.togglePinClub(club)
+            if !success { showPinCapAlert = true }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: isPinned ? "pin.fill" : "pin")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(isPinned ? "Pinned to Home" : "Pin to Home")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundStyle(isPinned ? Brand.pineTeal : Brand.secondaryText)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(isPinned ? Brand.pineTeal.opacity(0.1) : Brand.secondarySurface)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(isPinned ? Brand.pineTeal.opacity(0.35) : Brand.softOutline, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .alert("Pinned Clubs Full", isPresented: $showPinCapAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("You can pin up to 3 clubs. Unpin one to add this club.")
+        }
     }
 
     // MARK: - Reviews Section
@@ -456,15 +534,15 @@ struct ClubDetailView: View {
             } else if reviews.isEmpty {
                 EmptyView()
             } else {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .center, spacing: 6) {
                         Text("Reviews")
                             .font(.title3.weight(.bold))
                             .foregroundStyle(Brand.ink)
                         Spacer()
                         if let avg = avgRating {
-                            HStack(spacing: 4) {
-                                HStack(spacing: 2) {
+                            HStack(spacing: 3) {
+                                HStack(spacing: 1) {
                                     ForEach(1...5, id: \.self) { star in
                                         Image(systemName: starImageName(star: star, avg: avg))
                                             .font(.caption2)
@@ -472,44 +550,55 @@ struct ClubDetailView: View {
                                     }
                                 }
                                 Text(String(format: "%.1f", avg))
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(Brand.mutedText)
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(Brand.ink)
                                 Text("(\(reviews.count))")
                                     .font(.caption)
-                                    .foregroundStyle(Brand.mutedText.opacity(0.7))
+                                    .foregroundStyle(Brand.mutedText)
                             }
                         }
                     }
 
                     ForEach(displayed) { review in
-                        HStack(alignment: .top, spacing: 12) {
-                            ZStack {
-                                Circle()
-                                    .fill(Brand.secondarySurface)
-                                    .frame(width: 42, height: 42)
-                                Text(review.initials)
-                                    .font(.footnote.weight(.semibold))
-                                    .foregroundStyle(Brand.secondaryText)
-                            }
-                            VStack(alignment: .leading, spacing: 5) {
-                                HStack(spacing: 2) {
-                                    ForEach(1...5, id: \.self) { star in
-                                        Image(systemName: star <= review.rating ? "star.fill" : "star")
-                                            .font(.caption)
-                                            .foregroundStyle(star <= review.rating ? Color(hex: "FFB800") : Brand.softOutline)
+                        VStack(spacing: 0) {
+                            HStack(alignment: .top, spacing: 10) {
+                                // Avatar colour is identity data. Do not derive per-view.
+                                ZStack {
+                                    Circle()
+                                        .fill(AvatarGradients.resolveGradient(forKey: review.avatarColorKey))
+                                        .frame(width: 34, height: 34)
+                                    Text(review.initials)
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.white)
+                                }
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 1) {
+                                        ForEach(1...5, id: \.self) { star in
+                                            Image(systemName: star <= review.rating ? "star.fill" : "star")
+                                                .font(.caption)
+                                                .foregroundStyle(star <= review.rating ? Color(hex: "FFB800") : Brand.softOutline)
+                                        }
+                                    }
+                                    if let gameTitle = review.gameTitle {
+                                        Text(gameTitle)
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(Brand.mutedText)
+                                    }
+                                    if let comment = review.comment, !comment.isEmpty {
+                                        Text(comment)
+                                            .font(.subheadline)
+                                            .foregroundStyle(Brand.ink.opacity(0.85))
+                                            .fixedSize(horizontal: false, vertical: true)
                                     }
                                 }
-                                if let gameTitle = review.gameTitle {
-                                    Text(gameTitle)
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(Brand.mutedText)
-                                }
-                                if let comment = review.comment, !comment.isEmpty {
-                                    Text(comment)
-                                        .font(.subheadline)
-                                        .foregroundStyle(Brand.ink.opacity(0.85))
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
+                                Spacer(minLength: 0)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 2)
+                            if review.id != displayed.last?.id {
+                                Divider()
+                                    .overlay(Color(hex: "E5E5E5"))
+                                    .padding(.top, 10)
                             }
                         }
                     }
@@ -550,6 +639,7 @@ struct ClubDetailView: View {
                 Text(safeDescription)
                     .font(.subheadline)
                     .foregroundStyle(Brand.ink.opacity(0.8))
+                    .lineSpacing(3)
                     .lineLimit(aboutExpanded ? nil : 4)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -583,7 +673,7 @@ struct ClubDetailView: View {
     // MARK: - Contact Section
 
     private var contactSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 18) {
             Text("Contact Information")
                 .font(.title3.weight(.bold))
                 .foregroundStyle(Brand.ink)
@@ -628,6 +718,33 @@ struct ClubDetailView: View {
                 }
             }
 
+            // Phone
+            if let phone = safeContactPhone, !phone.isEmpty {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Phone")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedText)
+                        Text(phone)
+                            .font(.subheadline)
+                            .foregroundStyle(Brand.ink)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button {
+                        let digits = phone.filter { $0.isNumber || $0 == "+" }
+                        if let url = URL(string: "tel:\(digits)") { openURL(url) }
+                    } label: {
+                        Image(systemName: "phone")
+                            .font(.system(size: 17))
+                            .foregroundStyle(Brand.primaryText)
+                            .frame(width: 40, height: 40)
+                            .background(Brand.primaryText.opacity(0.08), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
             // Website
             if let website = safeWebsite, !website.isEmpty {
                 HStack {
@@ -661,21 +778,49 @@ struct ClubDetailView: View {
                         .font(.caption)
                         .foregroundStyle(Brand.mutedText)
                     Text(venue.venueName)
-                        .font(.subheadline.weight(.medium))
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Brand.ink)
                 }
 
                 if let address = LocationService.formattedAddress(for: venue) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Address")
-                            .font(.caption)
-                            .foregroundStyle(Brand.mutedText)
-                        Text(address)
-                            .font(.subheadline)
-                            .foregroundStyle(Brand.ink)
-                            .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        if let url = clubMapURL { openURL(url) }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Address")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedText)
+                            HStack(spacing: 4) {
+                                Text(address)
+                                    .font(.subheadline)
+                                    .foregroundStyle(Brand.pineTeal)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Image(systemName: "map")
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.pineTeal)
+                            }
+                        }
                     }
+                    .buttonStyle(.plain)
                 }
+            }
+
+            // Map preview — shown whenever we have coordinates
+            if let coord = clubMapCoordinate {
+                Button {
+                    if let url = clubMapURL { openURL(url) }
+                } label: {
+                    Map(position: .constant(MapCameraPosition.region(
+                        MKCoordinateRegion(center: coord, latitudinalMeters: 500, longitudinalMeters: 500)
+                    ))) {
+                        Marker("", coordinate: coord)
+                    }
+                    .frame(height: 150)
+                    .allowsHitTesting(false)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: .black.opacity(0.08), radius: 6, x: 0, y: 2)
+                }
+                .buttonStyle(.plain)
             }
         }
         .padding(20)
@@ -714,14 +859,31 @@ struct ClubDetailView: View {
                 .background(Color(.systemBackground))
             )
         }
-        let allMembers = appState.clubDirectoryMembers(for: club)
+        let rawMembers = appState.clubDirectoryMembers(for: club)
+        let allMembers = membersSortByDUPRDescending
+            ? rawMembers.sorted { lhs, rhs in
+                let l = lhs.duprRating ?? -1
+                let r = rhs.duprRating ?? -1
+                if l == r { return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending }
+                return l > r
+            }
+            : rawMembers.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         let previewCount = 4
         let displayed = membersPreviewExpanded ? allMembers : Array(allMembers.prefix(previewCount))
 
         return AnyView(VStack(alignment: .leading, spacing: 14) {
-            Text("Members")
-                .font(.title3.weight(.bold))
-                .foregroundStyle(Brand.ink)
+            HStack(alignment: .firstTextBaseline) {
+                Text("Members")
+                    .font(.title3.weight(.bold))
+                    .foregroundStyle(Brand.ink)
+                if club.memberCount > 0 {
+                    Text("\(club.memberCount)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Brand.mutedText)
+                }
+                Spacer(minLength: 8)
+                membersSortToggle
+            }
 
             if appState.isLoadingClubDirectory(for: club) && allMembers.isEmpty {
                 ProgressView()
@@ -736,13 +898,14 @@ struct ClubDetailView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(displayed) { member in
                         HStack(spacing: 12) {
+                            // Avatar colour is identity data. Do not derive per-view.
                             ZStack {
                                 Circle()
-                                    .fill(Brand.secondarySurface)
+                                    .fill(AvatarGradients.resolveGradient(forKey: member.avatarColorKey))
                                     .frame(width: 34, height: 34)
                                 Text(memberInitials(member.name))
                                     .font(.caption2.weight(.semibold))
-                                    .foregroundStyle(Brand.secondaryText)
+                                    .foregroundStyle(.white)
                             }
                             Text(member.name)
                                 .font(.subheadline)
@@ -750,14 +913,24 @@ struct ClubDetailView: View {
                                 .lineLimit(1)
                             Spacer()
                             if let dupr = member.duprRating {
-                                Text(String(format: "%.3f", dupr))
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(Brand.pineTeal)
+                                HStack(alignment: .firstTextBaseline, spacing: 3) {
+                                    Text(String(format: "%.3f", dupr))
+                                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                                        .foregroundStyle(Brand.pineTeal)
+                                    Text("DUPR")
+                                        .font(.caption2.weight(.regular))
+                                        .foregroundStyle(Brand.mutedText)
+                                }
+                            } else {
+                                Circle()
+                                    .fill(Brand.secondaryText.opacity(0.2))
+                                    .frame(width: 7, height: 7)
                             }
                         }
-                        .padding(.vertical, 9)
+                        .padding(.vertical, 11)
                         if member.id != displayed.last?.id {
                             Divider()
+                                .overlay(Color(hex: "E5E5E5"))
                         }
                     }
                 }
@@ -828,47 +1001,52 @@ struct ClubDetailView: View {
     // MARK: - Floating CTA Bar
 
     private var floatingCTABar: some View {
-        HStack(spacing: 12) {
-            Button {
-                navigateToChat = true
-            } label: {
-                Text("Member Chat")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 15)
-                    .background(Brand.primaryText, in: Capsule())
-                    .foregroundStyle(.white)
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                showBookGame = true
-            } label: {
-                Text("Book Game")
-                    .font(.subheadline.weight(.bold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 15)
-                    .background(
-                        isMemberOrAdmin ? Brand.primaryText : Brand.softOutline,
-                        in: Capsule()
-                    )
-                    .foregroundStyle(.white)
-                    .modifier(ShakeEffect(animatableData: shakeBookGame ? 1 : 0))
-            }
-            .buttonStyle(.plain)
-            .disabled(!isMemberOrAdmin)
-        }
-        .padding(.horizontal, 20)
-        .padding(.bottom, 12)
-        .background(
+        VStack(spacing: 0) {
             LinearGradient(
-                colors: [Color(.systemBackground).opacity(0), Color(.systemBackground)],
+                colors: [Color(.systemBackground).opacity(0), Color(.systemBackground).opacity(0.88)],
                 startPoint: .top, endPoint: .bottom
             )
-            .frame(height: 80)
-            .allowsHitTesting(false),
-            alignment: .top
-        )
+            .frame(height: 18)
+            .allowsHitTesting(false)
+
+            Divider()
+                .overlay(Color(hex: "E5E5E5"))
+
+            HStack(spacing: 12) {
+                Button {
+                    navigateToChat = true
+                } label: {
+                    Text("Chat")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 13)
+                        .background(Brand.primaryText, in: Capsule())
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    showBookGame = true
+                } label: {
+                    Text("Book Game")
+                        .font(.subheadline.weight(.bold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 13)
+                        .background(
+                            isMemberOrAdmin ? Brand.primaryText : Brand.softOutline,
+                            in: Capsule()
+                        )
+                        .foregroundStyle(.white)
+                        .modifier(ShakeEffect(animatableData: shakeBookGame ? 1 : 0))
+                }
+                .buttonStyle(.plain)
+                .disabled(!isMemberOrAdmin)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+            .padding(.bottom, 16)
+            .background(.ultraThinMaterial)
+        }
     }
 
     // MARK: - Membership Feedback
@@ -941,8 +1119,12 @@ struct ClubDetailView: View {
             } else {
                 // Not a member — tap to join (may show conduct sheet first)
                 Button {
-                    if liveClub.codeOfConduct?.isEmpty == false {
+                    let hasConduct = liveClub.codeOfConduct?.isEmpty == false
+                    let hasPolicy  = liveClub.cancellationPolicy?.isEmpty == false
+                    if hasConduct {
                         showConductSheet = true
+                    } else if hasPolicy {
+                        showCancellationPolicySheet = true
                     } else {
                         Task { await appState.requestMembership(for: club) }
                     }
@@ -955,7 +1137,21 @@ struct ClubDetailView: View {
                 .disabled(isBusy)
                 .sheet(isPresented: $showConductSheet) {
                     ConductAcceptanceSheet(club: liveClub) {
-                        Task { await appState.requestMembership(for: club, conductAcceptedAt: Date()) }
+                        let conductDate = Date()
+                        if liveClub.cancellationPolicy?.isEmpty == false {
+                            pendingConductDate = conductDate
+                            showCancellationPolicySheet = true
+                        } else {
+                            Task { await appState.requestMembership(for: club, conductAcceptedAt: conductDate) }
+                        }
+                    }
+                    .environmentObject(appState)
+                }
+                .sheet(isPresented: $showCancellationPolicySheet) {
+                    CancellationPolicyAcceptanceSheet(club: liveClub) {
+                        let conductDate = pendingConductDate
+                        pendingConductDate = nil
+                        Task { await appState.requestMembership(for: club, conductAcceptedAt: conductDate, cancellationPolicyAcceptedAt: Date()) }
                     }
                     .environmentObject(appState)
                 }
@@ -1112,60 +1308,35 @@ struct ClubDetailView: View {
                 Text("No upcoming games scheduled.")
                     .foregroundStyle(Brand.mutedText)
             } else {
-                LazyVStack(alignment: .leading, spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: 16) {
                     ForEach(filteredClubGames) { game in
                         let venues        = appState.clubVenuesByClubID[game.clubID] ?? []
                         let resolvedVenue = LocationService.resolvedVenue(for: game, venues: venues)
-                        VStack(alignment: .leading, spacing: 0) {
-                            NavigationLink {
-                                GameDetailView(game: game)
-                            } label: {
-                                UnifiedGameCard(
-                                    game: game,
-                                    clubName: club.name,
-                                    isBooked: appState.bookingState(for: game) == .confirmed,
-                                    isWaitlisted: {
-                                        if case .waitlisted = appState.bookingState(for: game) { return true }
-                                        return false
-                                    }(),
-                                    resolvedVenue: resolvedVenue
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .opacity(game.isScheduled ? 0.55 : 1)
-
-                            if isClubAdminUser, let pa = game.publishAt, pa > now {
-                                scheduledGameBanner(publishAt: pa)
-                            }
+                        NavigationLink {
+                            GameDetailView(game: game)
+                        } label: {
+                            let bannerCountdown: String? = (isClubAdminUser && game.isScheduled)
+                                ? goesLiveCountdown(game.publishAt!)
+                                : nil
+                            UnifiedGameCard(
+                                game: game,
+                                clubName: club.name,
+                                isBooked: appState.bookingState(for: game) == .confirmed,
+                                isWaitlisted: {
+                                    if case .waitlisted = appState.bookingState(for: game) { return true }
+                                    return false
+                                }(),
+                                resolvedVenue: resolvedVenue,
+                                scheduledBannerCountdown: bannerCountdown
+                            )
                         }
+                        .buttonStyle(.plain)
+                        .opacity(game.isScheduled ? 0.55 : 1)
+                        .shadow(color: .black.opacity(0.05), radius: 4, x: 0, y: 2)
                     }
                 }
             }
         }
-    }
-
-    // MARK: - Scheduled Game Banner (admin only)
-
-    private func scheduledGameBanner(publishAt: Date) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: "eye.slash")
-                .font(.caption2.weight(.semibold))
-            Text("Not visible to the public")
-                .font(.caption.weight(.semibold))
-            Spacer(minLength: 0)
-            Text("Goes live in \(goesLiveCountdown(publishAt))")
-                .font(.caption.weight(.semibold))
-                .monospacedDigit()
-        }
-        .foregroundStyle(Color.orange)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
-        )
-        .padding(.top, 4)
     }
 
     private func goesLiveCountdown(_ publishAt: Date) -> String {
@@ -1276,212 +1447,9 @@ struct ClubDetailView: View {
             }
         }
     }
+    // MARK: - Owner Sheet Router
 
-    // MARK: - Admin Owner Panel
-
-    private var ownerToolsPanel: some View {
-        let pendingCount = appState.ownerJoinRequests(for: club).count
-
-        return VStack(alignment: .leading, spacing: 10) {
-            ViewThatFits(in: .horizontal) {
-                HStack {
-                    adminToolsHeaderLabel
-                    Spacer(minLength: 8)
-                    adminToolsRolePill
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    adminToolsHeaderLabel
-                    adminToolsRolePill
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            Text("Manage your club with quick tools for admins and owners.")
-                .font(.footnote)
-                .foregroundStyle(Brand.secondaryText)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            ownerOnboardingChecklist
-
-            if let info = appState.ownerToolsInfoMessage, !info.isEmpty {
-                Text(verbatim: softWrappedDisplayText(info))
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(Brand.secondaryText)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            if let error = appState.ownerToolsErrorMessage, !error.isEmpty {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.circle")
-                        Text(verbatim: softWrappedDisplayText(AppCopy.friendlyError(error)))
-                            .lineLimit(2)
-                        Spacer(minLength: 0)
-                    }
-                    .font(.footnote)
-                    .foregroundStyle(Brand.errorRed)
-                    .appErrorCardStyle(cornerRadius: 12)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "exclamationmark.circle")
-                            Text(verbatim: softWrappedDisplayText(AppCopy.friendlyError(error)))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .font(.footnote)
-                    .foregroundStyle(Brand.errorRed)
-                    .appErrorCardStyle(cornerRadius: 12)
-                }
-            }
-
-            VStack(spacing: 6) {
-                Button {
-                    ownerToolSheet = .manageGames
-                } label: {
-                    ownerToolRow(
-                        title: "View/Edit Games",
-                        subtitle: "View, edit, duplicate, or delete upcoming and past games.",
-                        icon: "calendar.badge.clock"
-                    )
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    ownerToolSheet = .createGame
-                } label: {
-                    ownerToolRow(
-                        title: "Create Game",
-                        subtitle: "Publish a new session with time, capacity, fee, and notes.",
-                        icon: "calendar.badge.plus"
-                    )
-                }
-                .buttonStyle(.plain)
-
-                Divider()
-                    .padding(.vertical, 2)
-
-                Button {
-                    ownerToolSheet = .editClub
-                } label: {
-                    ownerToolRow(
-                        title: "Club Settings",
-                        subtitle: "Update contact info, join approval settings, and club details.",
-                        icon: "slider.horizontal.3"
-                    )
-                }
-                .buttonStyle(.plain)
-
-                Divider()
-                    .padding(.vertical, 2)
-
-                Button {
-                    ownerToolSheet = .joinRequests
-                } label: {
-                    ownerToolRow(
-                        title: "Join Requests",
-                        subtitle: pendingCount == 0 ? "Review pending membership requests and approvals." : "\(pendingCount) pending request\(pendingCount == 1 ? "" : "s") ready for review.",
-                        icon: "person.badge.plus",
-                        hasBadge: pendingCount > 0
-                    )
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    ownerToolSheet = .members
-                } label: {
-                    ownerToolRow(
-                        title: "Manage Members",
-                        subtitle: "View approved members and manage admin access.",
-                        icon: "person.3.sequence.fill"
-                    )
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .glassCard(cornerRadius: 20, tint: Brand.frostedSurfaceSoft)
-    }
-
-    private var ownerOnboardingChecklist: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Club launch checklist")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Brand.primaryText)
-
-            ownerChecklistRow(
-                title: "Set club profile picture",
-                isComplete: ClubProfileImagePresets.presetID(from: club.imageURL) != nil
-            )
-            ownerChecklistRow(
-                title: "Publish first game",
-                isComplete: !appState.games(for: club).isEmpty
-            )
-            ownerChecklistRow(
-                title: "Post first Club Chat update",
-                isComplete: !appState.clubNewsPosts(for: club).isEmpty
-            )
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Brand.softOutline, lineWidth: 1)
-        )
-    }
-
-    private func ownerChecklistRow(title: String, isComplete: Bool) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: isComplete ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(isComplete ? Brand.accentGreen : Brand.softOutline)
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(Brand.primaryText)
-            Spacer(minLength: 0)
-        }
-    }
-
-    private var adminToolsHeaderLabel: some View {
-        Label("Admin Tools", systemImage: "crown.fill")
-            .font(.headline.weight(.semibold))
-            .foregroundStyle(Brand.primaryText)
-            .lineLimit(1)
-            .minimumScaleFactor(0.85)
-    }
-
-    private var adminToolsRolePill: some View {
-        Text("Admins")
-            .font(.caption2.weight(.bold))
-            .foregroundStyle(Brand.primaryText)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Brand.secondarySurface, in: Capsule())
-    }
-
-    // MARK: - Owner Game Quick Actions
-
-    private func ownerGameQuickActions(_ game: Game) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 10) {
-                editGameButton(game)
-                duplicateGameButton(game)
-                deleteGameButton(game)
-            }
-
-            VStack(spacing: 8) {
-                HStack(spacing: 10) {
-                    editGameButton(game)
-                    duplicateGameButton(game)
-                }
-                deleteGameButton(game)
-            }
-        }
-    }
+    // MARK: - Game Helpers
 
     private func nextWeekDraft(from game: Game) -> ClubOwnerGameDraft {
         var draft = ClubOwnerGameDraft(game: game)
@@ -1489,154 +1457,6 @@ struct ClubDetailView: View {
         draft.repeatWeekly = false
         draft.repeatCount = 1
         return draft
-    }
-
-    private func editGameButton(_ game: Game) -> some View {
-        Button {
-            editingOwnerGame = game
-        } label: {
-            HStack(spacing: 6) {
-                if appState.isOwnerSavingGame(game) {
-                    ProgressView().tint(Brand.pineTeal)
-                } else {
-                    Image(systemName: "square.and.pencil")
-                }
-                Text("Edit Game")
-                    .font(.subheadline.weight(.semibold))
-            }
-            .foregroundStyle(Brand.pineTeal)
-            .frame(maxWidth: .infinity)
-            .frame(height: 42)
-            .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .disabled(appState.isOwnerDeletingGame(game))
-        .actionBorder(cornerRadius: 12, color: Brand.softOutline)
-    }
-
-    private func duplicateGameButton(_ game: Game) -> some View {
-        Button {
-            duplicatingGame = game
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "doc.on.doc")
-                Text("Duplicate")
-                    .font(.subheadline.weight(.semibold))
-            }
-            .foregroundStyle(Brand.slateBlue)
-            .frame(maxWidth: .infinity)
-            .frame(height: 42)
-            .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .disabled(appState.isOwnerSavingGame(game) || appState.isOwnerDeletingGame(game))
-        .actionBorder(cornerRadius: 12, color: Brand.softOutline)
-    }
-
-    private func deleteGameButton(_ game: Game) -> some View {
-        Button {
-            ownerDeleteGameCandidate = game
-        } label: {
-            HStack(spacing: 6) {
-                if appState.isOwnerDeletingGame(game) {
-                    ProgressView().tint(.white)
-                } else {
-                    Image(systemName: "trash")
-                }
-                Text(appState.isOwnerDeletingGame(game) ? "Deleting..." : "Delete")
-                    .font(.subheadline.weight(.semibold))
-            }
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity)
-            .frame(height: 42)
-            .background(Brand.coralBlaze, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .disabled(appState.isOwnerSavingGame(game))
-        .actionBorder(cornerRadius: 12, color: Brand.softOutline)
-    }
-
-    // MARK: - Owner Tool Row
-
-    private func ownerToolRow(title: String, subtitle: String, icon: String, hasBadge: Bool = false) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 10) {
-                ownerToolIcon(icon, hasBadge: hasBadge)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.headline.weight(.semibold))
-                        .foregroundStyle(Brand.primaryText)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(softWrappedDisplayText(subtitle))
-                        .font(.caption)
-                        .foregroundStyle(Brand.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                ownerToolChevron
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Brand.softOutline, lineWidth: 1)
-            )
-
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .center, spacing: 10) {
-                    ownerToolIcon(icon, hasBadge: hasBadge)
-                    Text(title)
-                        .font(.headline.weight(.semibold))
-                        .foregroundStyle(Brand.primaryText)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    ownerToolChevron
-                }
-                Text(softWrappedDisplayText(subtitle))
-                    .font(.caption)
-                    .foregroundStyle(Brand.secondaryText)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 44)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Brand.softOutline, lineWidth: 1)
-            )
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func ownerToolIcon(_ icon: String, hasBadge: Bool = false) -> some View {
-        ZStack(alignment: .topTrailing) {
-            Image(systemName: icon)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Brand.primaryText)
-                .frame(width: 34, height: 34)
-                .background(Brand.dividerColor, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-            if hasBadge {
-                Circle()
-                    .fill(Brand.errorRed)
-                    .frame(width: 9, height: 9)
-                    .offset(x: 3, y: -3)
-            }
-        }
-    }
-
-    private var ownerToolChevron: some View {
-        Image(systemName: "chevron.right")
-            .font(.caption.weight(.bold))
-            .foregroundStyle(Brand.softOutline)
-            .padding(.top, 2)
-            .fixedSize()
     }
 
     // MARK: - Helper Views
@@ -1731,8 +1551,7 @@ struct ClubDetailView: View {
     }
 
     private func prettify(_ raw: String) -> String {
-        if raw.caseInsensitiveCompare("ladder") == .orderedSame ||
-            raw.caseInsensitiveCompare("king_of_court") == .orderedSame {
+        if raw.caseInsensitiveCompare("king_of_court") == .orderedSame {
             return "King of the Court"
         }
         return raw.replacingOccurrences(of: "_", with: " ").capitalized
@@ -1742,9 +1561,7 @@ struct ClubDetailView: View {
 
     private var heroArtwork: some View {
         ZStack {
-            if let preset = ClubProfileImagePresets.preset(for: club.imageURL) {
-                ProfileAvatarArtwork(preset: preset, variant: .club)
-            } else if let url = club.imageURL, isRemoteImageURL(url) {
+            if let url = club.imageURL, isRemoteImageURL(url) {
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
                     .fill(Brand.pineTeal.opacity(0.95))
                 AsyncImage(url: url) { phase in

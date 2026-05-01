@@ -1,0 +1,212 @@
+# platform_adaptation.me
+# Purpose: iOS vs Android differences and required functional equivalents. Defines
+#          where platform-native implementations are acceptable and where exact
+#          parity is required. This file does NOT redefine product behaviour —
+#          see system_contracts.me and ux_parity.me for that.
+# Scope: iOS (SwiftUI/UIKit), Android (Jetpack Compose / native Android APIs)
+
+---
+
+## 1. PRINCIPLE
+
+Platform-native implementation is expected and encouraged where it produces a better
+user experience. What must not vary is the product outcome: same data, same business
+logic trigger points, same user-facing messaging.
+
+---
+
+## 2. PAYMENTS — STRIPE
+
+### iOS
+- `StripePaymentSheet` (native iOS Stripe SDK)
+- Apple Pay configured with `merchantId: "merchant.com.bookadink"`, `merchantCountryCode: "AU"`
+- `StripeAPI.defaultPublishableKey` set at app init from `SupabaseConfig.stripePublishableKey`
+- PaymentSheet result: `.completed`, `.canceled`, `.failed`
+
+### Android Equivalent Required
+- `PaymentSheet` from Stripe Android SDK (`com.stripe:stripe-android`)
+- Google Pay configured as a payment method (equivalent to Apple Pay)
+- Same merchant country: `AU`
+- Same publishable key (from `SupabaseConfig`)
+- PaymentSheet result must map to: completed, canceled, failed — with identical downstream logic
+
+### Non-negotiable for both platforms
+- PaymentIntent is created by `create-payment-intent` Edge Function — not locally
+- `application_fee_amount` is computed by the Edge Function — not by the client
+- Booking row is inserted ONLY on `.completed` result — never on `.canceled` or `.failed`
+- Both platforms pass `{ gameID, userID, creditsToApply, currency }` to the Edge Function
+
+---
+
+## 3. PUSH NOTIFICATIONS — APNs vs FCM
+
+### iOS
+- APNs (Apple Push Notification service)
+- Token registered at app launch, stored server-side per user
+- Notification tap routing handled in `NotificationsView` via `navigationDestination`
+
+### Android Equivalent Required
+- FCM (Firebase Cloud Messaging)
+- Token registered at app launch, stored server-side per user
+- Supabase Edge Functions must be updated to send to both APNs and FCM tokens
+- `club-chat-push`, `booking-confirmed`, `game-cancelled-notify`, `waitlist-promoted`, `send-review-prompts` Edge Functions all need Android FCM support
+- Notification tap routing must match iOS: clubs navigate inline, games open as modal
+
+### Payload structure (same on both platforms)
+```json
+{
+  "title": "...",
+  "body": "...",
+  "data": {
+    "type": "booking_confirmed | game_cancelled | waitlist_promoted | club_announcement | club_chat_mention | club_chat_reply | game_review_request",
+    "gameID": "uuid | null",
+    "clubID": "uuid | null"
+  }
+}
+```
+
+### UUID normalisation in Edge Functions
+- All UUIDs in notification payloads sent from Edge Functions must be lowercased
+- iOS bug fix (April 2026): notification delivery was broken because UUID case mismatch prevented routing — apply same lowercasing on Android targets
+
+---
+
+## 4. DEEP LINKING
+
+### iOS
+- Custom URL scheme: `bookadink://`
+- Registered in `Info.plist` and handled in `BookADinkApp`
+- Handled cases: `club/{id}`, `game/{id}`, `booking/{id}`, `review/{gameID}`
+- `DeepLink.review(gameID:)` — handled as no-op (review prompts come via notifications only)
+
+### Android Equivalent Required
+- Intent filter for `bookadink://` scheme in `AndroidManifest.xml`
+- Same path patterns: `club/{id}`, `game/{id}`, `booking/{id}`, `review/{gameID}`
+- App Links (HTTPS deep links) for share URLs — same host/path as iOS
+- `review/{gameID}` — no-op on Android as well (notification-only flow)
+
+---
+
+## 5. LOCATION SERVICES
+
+### iOS
+- `LocationService.swift` / `CLLocationManager`
+- Used for: NearbyGamesView, NearbyDiscoveryView
+- Permission: "when in use" only
+
+### Android Equivalent Required
+- `FusedLocationProviderClient` (Google Play Services)
+- Same permission level: `ACCESS_FINE_LOCATION` with runtime request
+- Same use cases: nearby games, nearby clubs
+- Location not sent to server — used client-side for sorting/filtering only
+
+---
+
+## 6. IN-APP BROWSER
+
+### iOS
+- `SafariView` (wraps `SFSafariViewController`)
+- Used for: Stripe Connect onboarding, pickleball news articles
+
+### Android Equivalent Required
+- Chrome Custom Tabs (`androidx.browser:browser`)
+- Same use cases: Stripe Connect onboarding URL, news article URLs
+- Do NOT open in system browser (no back navigation) — use in-app browser only
+
+---
+
+## 7. LOCAL NOTIFICATIONS
+
+### iOS
+- `LocalNotificationManager.swift` using `UNUserNotificationCenter`
+- Used for: waitlist hold countdown reminder ("30 minutes to complete your booking")
+
+### Android Equivalent Required
+- `NotificationManager` + `AlarmManager` or `WorkManager` for scheduled local notifications
+- Same trigger: when player is promoted to `pending_payment`, schedule a reminder at `holdExpiresAt - 5 minutes`
+- Cancel scheduled local notification when hold is confirmed or expires
+
+---
+
+## 8. STORAGE — USERDEFAULTS vs SharedPreferences
+
+### iOS
+- `UserDefaults` keyed by `StorageKeys.*`
+- `StorageKeys.duprRatingsByUserID` → `[userIDString: {d: Double, s: Double}]` (JSON)
+
+### Android Equivalent Required
+- `SharedPreferences` or `DataStore<Preferences>` (prefer DataStore for new Android code)
+- Same key namespace: `duprRatingsByUserID`
+- Same structure: map of userID (lowercased string) to `{doubles: Double, singles: Double}`
+- Sync from Supabase `profiles.dupr_rating` after every profile fetch (same as iOS)
+
+---
+
+## 9. IMAGE LOADING AND UPLOAD
+
+### iOS
+- `AsyncImage` for remote URLs
+- Upload via Supabase Storage SDK to `club-images` bucket
+- Paths: `club-avatars/{clubID}/{uuid}.jpg`, `club-banners/{clubID}/{uuid}.jpg`
+
+### Android Equivalent Required
+- Coil or Glide for remote image loading
+- Upload via Supabase Storage REST API (multipart/form-data POST)
+- Same bucket name: `club-images`
+- Same path structure: `club-avatars/{clubID}/{uuid}.jpg`, `club-banners/{clubID}/{uuid}.jpg`
+- Same dimension hints: avatar 400×400 px, banner 1500×500 px (3:1 ratio)
+- Validate upload URL against allowed Supabase host before rendering
+
+---
+
+## 10. SUBSCRIPTION MANAGEMENT (Club Owner)
+
+### iOS
+- Stripe PaymentSheet for subscription activation
+- `create-club-subscription` Edge Function → returns `client_secret`
+- Status displayed in Club Settings sheet
+
+### Android Equivalent Required
+- Same Stripe PaymentSheet flow (Stripe Android SDK)
+- Same Edge Function (`create-club-subscription`) — no Android-specific backend changes
+- Same status states: `incomplete`, `active`, `past_due`, `canceled`
+- Google Play Billing is NOT used — Stripe handles all subscription billing on both platforms
+
+---
+
+## 11. FONT AND ICON SYSTEMS
+
+### iOS
+- SF Symbols for icons
+- System font (San Francisco)
+
+### Android Equivalent
+- Material Symbols or Material Icons for Android-equivalent icons
+- Roboto or system font
+- Icon semantic meaning must match: same icon for same action across platforms
+- Named mappings (iOS SF Symbol → Android Material equivalent):
+  - `person.fill` → `account_circle`
+  - `calendar` → `calendar_today`
+  - `mappin` → `location_on`
+  - `bell.fill` → `notifications`
+  - `creditcard` → `credit_card`
+  - `star.fill` → `star`
+
+---
+
+## 12. FEATURES NOT YET ON ANDROID (DO NOT IMPLEMENT IN V1)
+
+These features exist on iOS but are not in scope for Android v1:
+- DUPR rating history chart (`DUPRHistoryCard`)
+- Apple Pay (Android has Google Pay — implement via Stripe Android SDK)
+- Splash screen video (`splash.mp4`) — use static splash on Android
+- "Win Rate" stat in profile — no data backing; blocked on both platforms
+
+---
+
+## VIOLATION IMPACT
+- Booking row inserted before PaymentSheet `.completed` on Android → same production issue as iOS.
+- Using global credit balance instead of club-scoped → cross-club credit spending.
+- Sending Android push via APNs (wrong service) → 100% delivery failure on Android.
+- Opening Stripe Connect URL in system browser → no back navigation; user abandons onboarding.
+- Not lowercasing UUIDs in notification payloads → notification tap routing fails silently.

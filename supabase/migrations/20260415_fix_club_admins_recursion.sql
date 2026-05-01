@@ -1,0 +1,41 @@
+-- Fix: remove infinite-recursion policy on club_admins
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PROBLEM:
+--   "Club admins can read sibling admins" (added in 20260415_rls_hardening.sql)
+--   queries the club_admins table from within a club_admins SELECT policy:
+--
+--     CREATE POLICY "Club admins can read sibling admins" ON club_admins
+--       FOR SELECT USING (
+--         EXISTS (SELECT 1 FROM club_admins ca  -- ← self-reference!
+--                 WHERE ca.club_id = club_admins.club_id AND ca.user_id = auth.uid())
+--       );
+--
+--   PostgreSQL detects this and aborts with:
+--     "infinite recursion detected in policy for relation club_admins"
+--
+-- CASCADE EFFECT:
+--   Every other table whose RLS policy contains an EXISTS subquery against
+--   club_admins is also broken, because evaluating that subquery triggers
+--   the recursive club_admins policy. Broken tables include:
+--     clubs (UPDATE), games (INSERT/UPDATE/DELETE), bookings (INSERT/UPDATE),
+--     game_attendance (all), feed_posts/comments/reactions (all),
+--     club_messages (all), club_stripe_accounts (SELECT),
+--     club_subscriptions (SELECT), club_entitlements (SELECT),
+--     club_venues (INSERT/UPDATE/DELETE — from 20260413_club_venues_rls.sql)
+--
+-- FIX:
+--   Drop the self-referential policy. The two remaining policies are sufficient:
+--
+--   "Users can read own admin status"  USING (auth.uid() = user_id)
+--     → covers fetchClubAdminRole, fetchAllAdminRoles (both filter by user_id = self)
+--     → covers all EXISTS subqueries in other tables' policies that filter by
+--       user_id = auth.uid() — the USING condition matches, rows are returned
+--
+--   "Club owner can read club admins"  (EXISTS on clubs.created_by)
+--     → covers fetchClubAdminUserIDs when called by the club owner
+--       (non-owner admins will only see their own row via the own-status policy,
+--       which is acceptable — all critical write paths are owner-initiated)
+--
+-- SAFE TO RE-RUN: DROP POLICY IF EXISTS is idempotent.
+
+DROP POLICY IF EXISTS "Club admins can read sibling admins" ON club_admins;

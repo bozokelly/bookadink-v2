@@ -1,0 +1,203 @@
+# ux_parity.me
+# Purpose: UI/UX consistency rules across iOS and Android. Both platforms must
+#          present the same information hierarchy, messaging, and feature behaviour.
+#          Platform-native styling is allowed. Product behaviour is not.
+# Scope: iOS (SwiftUI) and Android (Jetpack Compose or equivalent)
+
+---
+
+## 1. PRINCIPLE
+
+Both apps are the same product. Visual styling may follow platform conventions.
+Information hierarchy, action labels, status labels, error messages, and business
+logic triggers must be identical across platforms.
+
+---
+
+## 2. GAME CARDS (Discovery, Club Games, Nearby)
+
+### Must show on every game card:
+- Game title
+- Date and time (formatted for user locale)
+- Venue name
+- Skill level badge
+- Spots remaining (e.g. "3 spots left") or "Full" badge
+- Fee badge: "$12 AUD" or "Free"
+- "Waitlist" label when game is full and waitlist is available
+
+### Scheduled (unpublished) games — admin/owner view only:
+- Dimmed at ~55% opacity
+- Orange "Not visible to the public · Goes live in Xd Yh Zm" banner
+- Countdown refreshed every 60 seconds (not on every render)
+- Hidden entirely from player/public view
+
+### Full game behaviour:
+- Show "Join Waitlist" CTA when game is full
+- Do NOT show a "Book" CTA when no spots remain
+- Waitlist position shown after joining: "You are #X on the waitlist"
+
+---
+
+## 3. BOOKING STATES — CTA AND LABELS
+
+Both platforms must use the same CTA labels and visual hierarchy per booking state:
+
+| State | CTA Label | Visual |
+|---|---|---|
+| Can book (free) | "Book Now" | Primary action |
+| Can book (paid, no credits) | "Book · $X.XX" | Primary action |
+| Can book (paid, partial credits) | "Book · $X.XX" (net price) | Primary action; credit line below |
+| Can book (full credit cover) | "Book with Credits" | Primary action |
+| Confirmed | "Booked" (disabled) | Success state |
+| Waitlisted | "On Waitlist · #X" (disabled) | Neutral state |
+| pending_payment (active hold) | "Complete Booking · $X.XX" | Orange/urgent; countdown below |
+| pending_payment (expired hold) | "Spot hold expired" (passive) | Grey; Refresh button nearby |
+| Cannot book (past game) | No CTA | Informational only |
+
+Credit toggle row:
+- Shown when: `fee > 0 AND creditBalance(for: clubID) > 0 AND canBook`
+- Label: "Apply Credits ($X.XX available)"
+- Net price reflected immediately in CTA label when toggled on
+
+---
+
+## 4. PAYMENT BADGES (Admin/Owner View)
+
+Shown in the attendee list. Visible to club admin and owner only — not players.
+
+| Payment Method | Label | Colour |
+|---|---|---|
+| `"stripe"` | "Card" | Blue |
+| `"admin"` | "Comp" | Grey |
+| NULL (free game) | "Free" | Light grey |
+| NULL (paid game, not paid) | "Unpaid" | Orange |
+
+---
+
+## 5. CANCELLATION FEEDBACK
+
+After a player cancels:
+- If credit was issued: show a half-sheet or modal with:
+  - "Credit issued: $X.XX"
+  - "New balance: $X.XX"
+  - Dismiss button
+- If no credit (within 6h window): show brief confirmation ("Booking cancelled") with no credit mention
+- The 6-hour window message must be shown BEFORE the player cancels, not after
+
+Pre-cancel warning copy (when within 6h window):
+> "Cancelling within 6 hours of the game start — no credit will be issued."
+
+Pre-cancel confirmation copy (when outside 6h window and credit eligible):
+> "You will receive a $X.XX credit for this booking."
+
+---
+
+## 6. WAITLIST HOLD FEEDBACK
+
+When a player is promoted from the waitlist:
+- Push notification copy: "A spot opened — complete your booking"
+- On game detail, show countdown: "X m Ys remaining to complete your booking"
+- Countdown updates every second
+- On expiry: replace countdown with "Spot hold expired" and a Refresh button
+- Do NOT auto-navigate or auto-present PaymentSheet on push notification tap — player must tap the CTA
+
+---
+
+## 7. CREDIT DISPLAY
+
+### On game detail:
+- Credit balance line shown below price: "You have $X.XX in credits for this club"
+- Credit toggle appears when eligible (see §3)
+
+### On club detail:
+- Credit banner shown between membership section and club info
+- Refreshed on appear and pull-to-refresh
+- Format: "You have $X.XX in credits at this club"
+- Hidden when balance = 0
+
+### On bookings list:
+- One pill per club with positive balance
+- Format: "$X.XX at [Club Name]"
+- All balances refreshed concurrently on view load
+
+---
+
+## 8. NOTIFICATIONS TAB
+
+- Separate navigation stack for the Notifications tab
+- Club destinations navigate inline (Back returns to Notifications)
+- Game destinations open as modal/bottom sheet (dismiss returns to Notifications)
+- "Clear All" button available
+- Chevron/arrow shown on notification rows only when a destination exists
+- Review notifications are always tappable (no in-memory game required)
+
+---
+
+## 9. CLUB OWNER TOOLS MENU
+
+Order is standardised. Both platforms must use this exact order:
+1. View / Edit Games
+2. Create Game
+3. [Separator]
+4. Club Settings
+5. [Separator]
+6. Join Requests
+7. Manage Members
+
+---
+
+## 10. REVIEWS SECTION (Club Detail)
+
+- Show star average + review count above individual reviews
+- Show at most 2 reviews initially; "Show more" to expand
+- Each review shows: star rating, reviewer initials, game title context, comment, date
+- Section hidden until at least one review exists
+- Review prompt appears as a notification 24h after game ends
+- Review sheet header = game title; review is about the club (not the game)
+- On duplicate submit: "You have already left a review for this session." (not a generic error)
+
+---
+
+## 11. CLUB CHAT
+
+- Post button label changes contextually:
+  - Default mode: "Post" (or send icon)
+  - Announcement mode active: "Announce" (or announcement icon)
+- Announcement toggle becomes icon-only when active (compact UI)
+- Comment draft is per-card, not per-feed (no cross-card state sharing)
+- Optimistic UI: likes and comment counts update immediately
+
+---
+
+## 12. GAME RESULT POSTS
+
+- Game results are structured JSON payloads — NOT image-based posts
+- Result card rendered natively (not as an image)
+- Result card shows: game title, date, teams, scores, winner
+- Sharing exports as an image (for social) but the in-app post is always a native card
+- Structured post detected via `post.type == "session_result"`
+
+---
+
+## 13. ERROR STATES
+
+Consistent error messaging across platforms:
+
+| Scenario | Message |
+|---|---|
+| Stripe payment failed | "Payment failed. Please try again." |
+| Network unavailable | "No internet connection. Please check your connection." |
+| Booking full on submit | "This game is now full. You've been added to the waitlist." |
+| Hold expired | "Your spot hold expired. Please refresh to rejoin the waitlist." |
+| Duplicate review | "You have already left a review for this session." |
+| Credit deduction failed | "Could not apply credits. Please try again." |
+| Generic error | "Something went wrong. Please try again." |
+
+---
+
+## VIOLATION IMPACT
+- Inconsistent CTA labels → players confused about booking state; support volume increases.
+- Showing credit balance cross-club → player attempts to use credits at wrong club; booking fails silently.
+- Hiding admin payment badges from admins → admins can't track unpaid players.
+- Different cancellation window messages → legal/financial disputes about when credits are owed.
+- Missing hold countdown → player doesn't know they have a time limit; hold expires unnoticed.

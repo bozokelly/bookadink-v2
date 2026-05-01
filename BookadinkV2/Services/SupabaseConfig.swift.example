@@ -3,16 +3,41 @@
 // SETUP: Copy this file to SupabaseConfig.swift (same directory) and fill in your values.
 // SupabaseConfig.swift is git-ignored and must never be committed.
 //
-// Find these values in your Supabase project dashboard → Settings → API.
+// Find Supabase values in your project dashboard → Settings → API.
+// Find Stripe values in your Stripe Dashboard.
 
 import Foundation
 
 enum SupabaseConfig {
+    // Supabase project URL and anon key — both are client-safe (public).
+    // Never use the Supabase service role / secret key in the iOS app.
     static let urlString = "https://YOUR_PROJECT_REF.supabase.co"
     static let anonKey   = "YOUR_SUPABASE_ANON_KEY"
 
+    // Storage buckets (must exist and be public in Supabase Dashboard → Storage)
     static let clubNewsImageBucket = "feed-images"
-    static let clubChatPushHookFunctionName = ""
+    static let clubImageBucket     = "club-images"
+
+    // Edge Function names — must match the deployed function names in supabase/functions/
+    static let clubChatPushHookFunctionName        = "club-chat-push"
+    static let bookingConfirmedPushFunctionName    = "booking-confirmed"
+    static let gameUpdatedNotifyFunctionName       = "game-updated-notify"
+    static let createPaymentIntentFunctionName     = "create-payment-intent"
+    static let connectOnboardingFunctionName       = "connect-onboarding"
+    static let stripeAccountStatusFunctionName    = "stripe-account-status"
+    static let createClubSubscriptionFunctionName  = "create-club-subscription"
+    static let cancelClubSubscriptionFunctionName  = "cancel-club-subscription"
+
+    // Stripe publishable key — client-safe (public by design).
+    // Never put the Stripe secret key (sk_...) in the iOS app.
+    static let stripePublishableKey = "pk_test_YOUR_STRIPE_PUBLISHABLE_KEY"
+
+    // Platform fee in basis points (1000 = 10%). Must match Edge Function DEFAULT_PLATFORM_FEE_BPS.
+    static let defaultPlatformFeeBps = 1000
+
+    // Subscription plan pricing (price IDs and display prices) is server-authoritative.
+    // Seed the subscription_plans table via migration 20260428_subscription_plans.sql.
+    // Clients read get_subscription_plans() RPC at bootstrap — never hardcode price IDs here.
 
     static var isConfigured: Bool {
         URL(string: urlString) != nil && !anonKey.isEmpty

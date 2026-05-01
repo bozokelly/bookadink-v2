@@ -1,0 +1,611 @@
+# Payments System — Book A Dink
+# Created: 2026-03-31
+
+---
+
+## PHASE 4 PART 1 — SUBSCRIPTION FOUNDATION — COMPLETE (2026-04-02)
+
+### DB migrations required (run in Supabase SQL Editor)
+```sql
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT NULL;
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS subscription_tier TEXT NOT NULL DEFAULT 'free';
+
+CREATE TABLE IF NOT EXISTS club_subscriptions (
+  id                      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  club_id                 UUID        NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  stripe_subscription_id  TEXT        NOT NULL,
+  plan_type               TEXT        NOT NULL,
+  status                  TEXT        NOT NULL DEFAULT 'incomplete',
+  current_period_end      TIMESTAMPTZ NULL,
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(club_id),
+  UNIQUE(stripe_subscription_id)
+);
+ALTER TABLE club_subscriptions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Club owner can read own subscription" ON club_subscriptions
+  FOR SELECT USING (
+    EXISTS (SELECT 1 FROM clubs WHERE clubs.id = club_subscriptions.club_id AND clubs.created_by = auth.uid())
+  );
+
+CREATE INDEX IF NOT EXISTS idx_club_subs_stripe_id ON club_subscriptions(stripe_subscription_id);
+CREATE INDEX IF NOT EXISTS idx_profiles_stripe_customer ON profiles(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL;
+```
+
+### Stripe setup (manual — Stripe Dashboard, platform account)
+- Create Products: "Book A Dink — Starter", "Book A Dink — Pro"
+- Create Prices (monthly + annual) for each product
+- Add metadata `plan_type: "starter"` or `plan_type: "pro"` on each Price
+- Record Price IDs → store as Supabase secrets or config
+- Register webhook endpoint: `https://<ref>.supabase.co/functions/v1/stripe-webhook`
+  - Events: `customer.subscription.created`, `customer.subscription.updated`,
+    `customer.subscription.deleted`, `invoice.payment_failed`, `invoice.payment_succeeded`
+- Copy webhook signing secret → `supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...`
+
+### Edge Functions deployed
+- `create-club-subscription` — resolves club owner → gets/creates Stripe Customer on `profiles.stripe_customer_id` → creates Subscription with `payment_behavior=default_incomplete` → upserts `club_subscriptions` → returns `{ subscription_id, status, client_secret }`
+- `stripe-webhook` — verifies Stripe HMAC signature manually (no SDK); handles subscription lifecycle; all writes idempotent via upsert on `stripe_subscription_id`; denormalises `clubs.subscription_tier`
+
+### Design decisions
+- **Platform account, not Connect accounts** — subscriptions bill club owners for platform access; Connect accounts exist to route player payments to clubs. These are separate concerns on separate Stripe entities.
+- **One Stripe Customer per owner, not per club** — a club owner with multiple clubs reuses the same Customer. `stripe_customer_id` lives on `profiles`, not `clubs`.
+- **`payment_behavior=default_incomplete`** — Subscription is created in `incomplete` state; the returned `client_secret` activates it via iOS PaymentSheet. Subscription only becomes `active` after first payment — no free trial risk.
+- **`plan_type` from Price metadata** — avoids hardcoding Price IDs in Edge Function code; set once in Stripe Dashboard per Price.
+- **Idempotent webhook writes** — upsert on `stripe_subscription_id` means Stripe can deliver the same event multiple times without duplicating rows or incorrect tier downgrades.
+- **Signature verification** — manual HMAC-SHA256 (no Stripe SDK); mirrors the raw `fetch` pattern used by existing Edge Functions.
+
+### `status` values
+| Stripe value | Meaning |
+|---|---|
+| `incomplete` | Created, awaiting first payment |
+| `active` | Paid and current |
+| `past_due` | Payment failed; in dunning |
+| `canceled` | Subscription ended; club reverts to `free` |
+
+### No-ops in this phase
+- No iOS UI
+- No feature gating (nothing checks `subscription_tier` in app code yet)
+- No upgrade/downgrade logic
+- No proration
+
+---
+
+## PHASE 3 — WAITLIST PAYMENT HOLD — COMPLETE (2026-04-02)
+
+### DB migrations required (run in Supabase SQL Editor)
+```sql
+-- 1. Hold expiry column on bookings
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS hold_expires_at TIMESTAMPTZ NULL;
+
+-- 2. Server-authoritative promotion RPC (row-level locking, prevents races)
+CREATE OR REPLACE FUNCTION promote_waitlist_player(
+  p_game_id UUID,
+  p_booking_id UUID,
+  p_hold_minutes INT DEFAULT 30
+)
+RETURNS BOOL LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_game_max_spots INT;
+  v_confirmed_count INT;
+  v_booking_status TEXT;
+BEGIN
+  -- Lock game row to prevent concurrent promotions
+  SELECT max_spots INTO v_game_max_spots FROM games WHERE id = p_game_id FOR UPDATE;
+  IF NOT FOUND THEN RETURN FALSE; END IF;
+
+  -- Check game is not already full
+  SELECT COUNT(*) INTO v_confirmed_count FROM bookings
+  WHERE game_id = p_game_id AND status = 'confirmed';
+  IF v_confirmed_count >= v_game_max_spots THEN RETURN FALSE; END IF;
+
+  -- Lock booking row and verify it is still waitlisted
+  SELECT status INTO v_booking_status FROM bookings WHERE id = p_booking_id FOR UPDATE;
+  IF NOT FOUND OR v_booking_status != 'waitlisted' THEN RETURN FALSE; END IF;
+
+  -- Prevent double-hold: reject if another pending_payment hold is still active
+  IF EXISTS (
+    SELECT 1 FROM bookings
+    WHERE game_id = p_game_id
+      AND status = 'pending_payment'
+      AND hold_expires_at > now()
+  ) THEN
+    RETURN FALSE;
+  END IF;
+
+  -- Promote: set pending_payment + hold window
+  UPDATE bookings
+  SET status = 'pending_payment',
+      hold_expires_at = now() + (p_hold_minutes || ' minutes')::INTERVAL,
+      waitlist_position = NULL
+  WHERE id = p_booking_id;
+
+  RETURN TRUE;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION promote_waitlist_player(UUID, UUID, INT) TO authenticated;
+
+-- 3. Expiry cleanup function (called by pg_cron every 5 minutes)
+CREATE OR REPLACE FUNCTION expire_waitlist_holds()
+RETURNS INT LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE v_count INT;
+BEGIN
+  WITH expired AS (
+    UPDATE bookings
+    SET status = 'waitlisted',
+        hold_expires_at = NULL,
+        waitlist_position = 1
+    WHERE status = 'pending_payment'
+      AND hold_expires_at IS NOT NULL
+      AND hold_expires_at < now()
+    RETURNING id
+  )
+  SELECT COUNT(*) INTO v_count FROM expired;
+  RETURN v_count;
+END;
+$$;
+
+-- 4. Schedule expiry cleanup every 5 minutes via pg_cron
+SELECT cron.schedule(
+  'expire-waitlist-holds',
+  '*/5 * * * *',
+  $$ SELECT expire_waitlist_holds() $$
+);
+```
+
+### What was implemented
+
+**Database:**
+- `bookings.hold_expires_at TIMESTAMPTZ NULL` — non-null when a promoted waitlist player has an active payment hold
+- `promote_waitlist_player(p_game_id, p_booking_id, p_hold_minutes)` RPC — atomically transitions one `waitlisted` booking to `pending_payment` with an expiry timestamp; rejects if the game is full, the booking is no longer waitlisted, or another active hold already exists
+- `expire_waitlist_holds()` — reverts expired `pending_payment` rows back to `waitlisted` at `waitlist_position = 1`; scheduled every 5 min via pg_cron
+
+**iOS — Models (`Models.swift`):**
+- `BookingRecord.holdExpiresAt: Date?` — decoded from `hold_expires_at` via `SupabaseDateParser.parse`
+- `BookingRecord.hasActiveHold: Bool` — computed var; true when `holdExpiresAt > Date()`
+- All booking SELECT strings include `hold_expires_at`
+
+**iOS — Service (`SupabaseService.swift`):**
+- `promoteWaitlistPlayer(gameID:bookingID:holdMinutes:) async throws -> Bool` — new protocol method + implementation; calls `rpc/promote_waitlist_player`, decodes Bool result
+
+**iOS — AppState (`AppState.swift`):**
+- `private let waitlistHoldMinutes = 30`
+- `autoPromoteWaitlistIfPossible` split by game type: free games keep existing multi-promote path; paid games promote one player at a time via `promoteWaitlistPlayerForPaidGame`
+- `promoteWaitlistPlayerForPaidGame(game:attendee:)` — calls `promoteWaitlistPlayer` RPC; on success sends push notification ("Spot available — complete your booking") with 30-min reminder follow-up; updates `gameOwnerInfoByID` status string
+- `confirmPendingBooking` — now also deducts credits (non-blocking `Task`) when `creditsAppliedCents > 0`; calls `refreshBookings(silent: true)` after confirm
+
+**iOS — GameDetailView (`GameDetailView.swift`):**
+- `@State private var isPendingPaymentCompletion: Bool = false` — routes PaymentSheet completion to `confirmPendingBooking` instead of `requestBooking`
+- `@State private var pendingBookingIDForConfirm: UUID? = nil`
+- `@State private var holdCountdown: String = ""` — live countdown string ("4m 32s remaining")
+- `updateHoldCountdown()` — computes countdown from `holdExpiresAt`; called every second via `.onReceive(Timer.publish(every: 1, ...))`
+- `pendingPayment` CTA branch:
+  - Active hold: credit toggle (if balance > 0 and paid game), orange "Complete Booking" button showing net price, countdown text
+  - Expired hold: "Spot hold expired" passive row + Refresh button
+- `preparePaymentSheet` — checks `isPendingPaymentCompletion` before the full-credit early-return (to route correctly for deferred bookings); refreshes credit balance at the top
+- PaymentSheet `.completed` handler — routes to `confirmPendingBooking` if `isPendingPaymentCompletion`, otherwise `requestBooking`; clears both state flags on `.canceled` and `.failed`
+
+### Design decisions
+- **One active hold per game at a time** — `promote_waitlist_player` rejects if any `pending_payment` hold is still active. This prevents multiple players simultaneously thinking they have a spot.
+- **Hold reverts to `waitlist_position = 1`** — `expire_waitlist_holds` puts the player back at position 1 so they are first in line for the next promotion cycle (fair: they were already offered the spot once).
+- **Deferred PaymentIntent** — no PaymentIntent is created at promotion time. The hold is purely a DB state change. The iOS client creates the PaymentIntent when the player taps "Complete Booking", ensuring `creditBalanceCents` is refreshed at that moment.
+- **Free vs paid game split** — free games still multi-promote all waitlisted players in one pass (no hold needed). Paid games promote one player and wait for payment before promoting the next.
+
+---
+
+## PHASE 2 — CREDIT SYSTEM — COMPLETE (2026-04-01)
+
+### DB migrations required (run in Supabase SQL Editor)
+```sql
+CREATE TABLE IF NOT EXISTS player_credits (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  amount_cents INT NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'aud',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(user_id, currency)
+);
+ALTER TABLE player_credits ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Users can read own credits" ON player_credits
+  FOR SELECT USING (auth.uid() = user_id);
+
+CREATE TABLE IF NOT EXISTS credit_transactions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  booking_id UUID REFERENCES bookings(id) ON DELETE SET NULL,
+  amount_cents INT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE credit_transactions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Users can read own credit transactions" ON credit_transactions
+  FOR SELECT USING (auth.uid() = user_id);
+
+CREATE OR REPLACE FUNCTION use_credits(p_user_id UUID, p_booking_id UUID, p_amount_cents INT)
+RETURNS BOOL LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  UPDATE player_credits SET amount_cents = amount_cents - p_amount_cents, updated_at = now()
+  WHERE user_id = p_user_id AND currency = 'aud' AND amount_cents >= p_amount_cents;
+  IF NOT FOUND THEN RETURN FALSE; END IF;
+  INSERT INTO credit_transactions (user_id, booking_id, amount_cents, reason)
+  VALUES (p_user_id, p_booking_id, -p_amount_cents, 'booking_applied');
+  RETURN TRUE;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION use_credits(UUID, UUID, INT) TO authenticated;
+
+-- Prevent duplicate refunds on retry (add after credit_transactions is created)
+ALTER TABLE credit_transactions
+  ADD CONSTRAINT uq_credit_tx_booking_reason
+  UNIQUE (user_id, booking_id, reason);
+
+CREATE OR REPLACE FUNCTION issue_cancellation_credit(p_user_id UUID, p_booking_id UUID, p_amount_cents INT)
+RETURNS VOID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  -- Idempotent: if a refund was already issued for this booking, do nothing
+  IF EXISTS (
+    SELECT 1 FROM credit_transactions
+    WHERE booking_id = p_booking_id AND reason = 'cancellation_refund'
+  ) THEN
+    RETURN;
+  END IF;
+  INSERT INTO player_credits (user_id, amount_cents, currency)
+  VALUES (p_user_id, p_amount_cents, 'aud')
+  ON CONFLICT (user_id, currency) DO UPDATE
+  SET amount_cents = player_credits.amount_cents + p_amount_cents, updated_at = now();
+  INSERT INTO credit_transactions (user_id, booking_id, amount_cents, reason)
+  VALUES (p_user_id, p_booking_id, p_amount_cents, 'cancellation_refund')
+  ON CONFLICT DO NOTHING;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION issue_cancellation_credit(UUID, UUID, INT) TO authenticated;
+```
+
+### What was implemented
+- **`player_credits` table** — one row per user/currency, holds current balance in cents. Atomic updates only via RPC.
+- **`credit_transactions` table** — append-only ledger with `reason` (`booking_applied` / `cancellation_refund`).
+- **`use_credits` RPC** — atomically deducts `p_amount_cents`; returns FALSE if balance insufficient (prevents negative balance / double-spend race conditions).
+- **`issue_cancellation_credit` RPC** — upserts into `player_credits` and logs transaction.
+- **`ClubDataProviding` protocol** — 3 new methods: `fetchCreditBalance`, `applyCredits`, `issueCancellationCredit`.
+- **`SupabaseService`** — concrete implementations of all 3 methods.
+- **`AppState.creditBalanceCents: @Published Int`** — live balance, updated after booking and cancellation.
+- **`AppState.refreshCreditBalance()`** — fetches from DB, updates `creditBalanceCents`.
+- **`AppState.creditOffset(for:applyCredits:Bool=true)`** — uses cached `creditBalanceCents` (no extra DB call).
+- **`AppState.cancelBooking`** — issues credit when `hoursUntilGame > 24` AND (`feePaid == true` OR `creditsAppliedCents > 0`) AND refund amount > 0. For Stripe-paid bookings, refund = `platformFeeCents + clubPayoutCents`. For credit-only bookings, refund = `creditsAppliedCents`. Non-blocking `Task`.
+- **`AppState.requestBooking`** — deducts credits non-blockingly via `applyCredits` RPC after booking is inserted; logs warning on failure.
+- **`GameDetailView`** — `useCredits: @State Bool = true` toggle; `creditToggleRow` UI shown when balance > 0 and game has fee; price label reflects net cost; credit balance loaded on `.task`.
+
+### Cancellation refund logic
+- Eligible when: `game.dateTime > now + 24h` AND `booking.feePaid == true` AND `(platformFeeCents + clubPayoutCents) > 0`
+- Refund amount: full Stripe charge (platform fee + club payout) — does not include previously applied credits
+- Credit issuance is non-blocking; balance refreshed on success
+
+---
+
+## PHASE 1 REFINEMENT — COMPLETE (2026-04-01)
+
+### Additional DB migration required
+```sql
+-- Credits applied at checkout (populated once Phase 2 credit deduction is live)
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS credits_applied_cents INT NULL;
+
+-- pending_payment status support (add to bookings.status check constraint if one exists)
+-- Existing rows with status='confirmed' are unaffected — backward compatible.
+-- Example: ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_status_check;
+-- ALTER TABLE bookings ADD CONSTRAINT bookings_status_check
+--   CHECK (status IN ('confirmed', 'waitlisted', 'cancelled', 'pending_payment'));
+```
+
+### What was refined
+- **Credit offset calculated before PaymentIntent creation** — `GameDetailView.preparePaymentSheet` now calls `AppState.creditOffset(for:)` first. If credits fully cover the price, Stripe is skipped entirely. If partial, the PaymentIntent is created for the remaining amount only. Phase 2 will wire in a real balance; today `availableCreditBalance()` returns 0.
+- **`BookingState.pendingPayment`** — new enum case with `actionTitle = "Complete Payment"`, `requiresPaymentCompletion` computed var, and `canBook = false` / `canCancel = false` guards. `BookingStateMapper` handles `"pending_payment"` raw value from DB.
+- **`BookingRecord.creditsAppliedCents: Int?`** — persisted on booking insert, surfaced for receipt display and Phase 2 deduction logic.
+- **`confirmPendingBooking()`** — new protocol method + implementation. PATCHes `status → confirmed`, writes `fee_paid, stripe_payment_intent_id, payment_method, platform_fee_cents, club_payout_cents, credits_applied_cents` in one operation. Called after successful Stripe payment for a pre-created pending booking.
+- **`createDeferredPaymentIntent(for:)`** — on-demand PaymentIntent creation for Phase 3 waitlist promotion. Calculates credit offset, creates intent for remaining amount. Does NOT insert a booking — caller handles that after PaymentSheet completion.
+- **`availableCreditBalance()` / `creditOffset(for:)`** — Phase 2 stubs in AppState. Return 0 today; Phase 2 replaces with DB fetch from `player_credits`.
+
+## PHASE 1 STATUS — COMPLETE (2026-04-01)
+
+### What was implemented
+
+**Database (run these migrations once in Supabase SQL Editor):**
+```sql
+-- Stripe Connect account registry
+CREATE TABLE IF NOT EXISTS club_stripe_accounts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  club_id UUID NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+  stripe_account_id TEXT NOT NULL,
+  onboarding_complete BOOL DEFAULT false,
+  payouts_enabled BOOL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(club_id)
+);
+ALTER TABLE club_stripe_accounts ENABLE ROW LEVEL SECURITY;
+-- Allow club owners/admins to read their own connect account
+CREATE POLICY "Club owner can read own stripe account" ON club_stripe_accounts
+  FOR SELECT USING (
+    EXISTS (SELECT 1 FROM clubs WHERE clubs.id = club_id AND clubs.created_by = auth.uid())
+    OR EXISTS (SELECT 1 FROM club_admins WHERE club_admins.club_id = club_stripe_accounts.club_id AND club_admins.user_id = auth.uid())
+  );
+
+-- Fee tracking on bookings
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS platform_fee_cents INT NULL;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS club_payout_cents INT NULL;
+
+-- Denormalised connect ID on clubs (updated by connect-onboarding Edge Function)
+ALTER TABLE clubs ADD COLUMN IF NOT EXISTS stripe_connect_id TEXT NULL;
+```
+
+**Stripe webhook (set up in Stripe Dashboard → Webhooks):**
+- Endpoint: `https://<ref>.supabase.co/functions/v1/stripe-webhook` (Phase 2 — not yet deployed)
+- Events to listen for: `account.updated` — to flip `onboarding_complete` and `payouts_enabled` once Stripe verifies the account
+- Until the webhook is wired, club owners can re-tap "Connect Stripe Account" to retry onboarding; status updates are pulled on Settings sheet re-appear
+
+**Edge Functions deployed:**
+- `create-payment-intent` — updated to support Stripe Connect destination charges + application_fee_amount; falls back to plain charge for clubs without a connected account
+- `connect-onboarding` — new; creates a Stripe Express account and returns an onboarding Account Link URL
+
+**iOS changes:**
+- `Models.swift`: `Club.stripeConnectID`, `BookingRecord.platformFeeCents`/`clubPayoutCents`, new `ClubStripeAccount` and `PaymentIntentResult` structs
+- `SupabaseConfig.swift`: `connectOnboardingFunctionName`, `defaultPlatformFeeBps`
+- `SupabaseService.swift`: all club SELECT strings include `stripe_connect_id`; all booking SELECT strings include `platform_fee_cents,club_payout_cents`; new `fetchClubStripeAccount()` and `createConnectOnboarding()` methods; `createPaymentIntent` updated to accept `clubID` and return `PaymentIntentResult`; `createBooking` updated to accept fee breakdown
+- `AppState.swift`: updated `createPaymentIntent` wrapper; updated `requestBooking` to forward fee breakdown; new `fetchClubStripeAccount(for:)` and `createConnectOnboarding(for:)` wrappers; `isCreatingConnectOnboarding` and `connectOnboardingError` @Published state
+- `GameDetailView.swift`: `preparePaymentSheet` passes `clubID`, captures `PaymentIntentResult`, stores fee breakdown in state; completion handler forwards fee breakdown into `requestBooking`
+- `ClubOwnerSheets.swift`: "Accept Payments" section in Club Settings (edit mode); shows Connect status (not connected / in progress / active); "Connect Stripe Account" button opens Stripe onboarding in Safari sheet; status re-checked on sheet re-appear
+
+### Known TODOs before Phase 1 is fully live
+1. Run the DB migrations above
+2. Deploy both Edge Functions: `supabase functions deploy create-payment-intent` and `supabase functions deploy connect-onboarding`
+3. Wire `account.updated` Stripe webhook to flip `payouts_enabled = true` in `club_stripe_accounts` (can be a simple Edge Function `stripe-webhook`)
+4. Until webhook is wired: manually flip `payouts_enabled = true` in the DB after a club completes onboarding
+
+---
+
+## 1. SYSTEM OVERVIEW
+
+Players pay at the time of booking a game. The platform takes a percentage fee, and the remainder is paid out to the club via Stripe Connect. Cancellations do not trigger refunds — instead, the player receives an internal credit that can be applied to future bookings. Clubs access the platform through a subscription tier that determines their feature limits.
+
+Flow summary:
+  Player books game → Stripe charges player → Platform retains fee → Remaining funds held in connected account → Club receives payout on schedule
+
+---
+
+## 2. ARCHITECTURE
+
+### Stripe Connect Setup
+- Platform account: BookADink Stripe account (standard platform)
+- Each club that accepts paid games onboards as a Stripe Connect Express account
+- Payouts flow via Stripe's "destination charges" model — platform creates charge on behalf of connected account
+- Platform fee deducted via `application_fee_amount` on each charge
+- Club receives net amount in their Express account, withdraws on their own schedule
+
+### Payment Flow (player → platform → club)
+1. Player taps "Book" on a paid game
+2. iOS calls `create-payment-intent` Edge Function
+   - Params: `gameID`, `amount`, `currency`, `clubStripeAccountID`
+   - Edge Function creates PaymentIntent with `application_fee_amount` and `transfer_data.destination`
+3. StripePaymentSheet presented to player (Apple Pay / card)
+4. On `.completed`:
+   - `bookings` row inserted with `fee_paid=true`, `payment_method="stripe"`, `stripe_payment_intent_id`
+   - `platform_fee_cents` and `club_payout_cents` written to booking row
+5. Stripe asynchronously settles funds to club's Express account
+
+### Credit System Design
+- Credits are stored in `player_credits` table (per user, per currency)
+- Credits have no monetary refund path — they can only be applied to future bookings
+- When a player cancels a paid booking inside the cancellation window, a credit record is created for the booking's `club_payout_cents` amount (platform fee is forfeited)
+- Credits are scoped to the platform (usable at any club), not club-specific
+- Credit application: at checkout, iOS checks available balance and can apply credits to reduce the PaymentIntent amount (or cover it entirely — free checkout path)
+- Credits never expire (v1); expiry policy deferred to future phase
+
+### Subscription Model
+- Clubs subscribe to a tier: `free`, `starter`, `pro`, `enterprise`
+- Tier controls: max active games, max members, analytics access, custom branding, Stripe Connect payouts
+- Free tier: no paid games, no Stripe Connect requirement
+- Paid tiers: Stripe Subscription product billed monthly/annually to club owner
+- Subscription state stored in `club_subscriptions` table and cached on `clubs.subscription_tier`
+- Downgrade: club retains existing data but new paid games blocked until tier restored
+
+---
+
+## 3. DATABASE CHANGES
+
+### New Tables
+
+#### `club_stripe_accounts`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| club_id | UUID FK → clubs | UNIQUE |
+| stripe_account_id | TEXT | Stripe Connect Express account ID (acct_xxx) |
+| onboarding_complete | BOOL DEFAULT false | Set true after Stripe returns account.updated with charges_enabled |
+| payouts_enabled | BOOL DEFAULT false | |
+| created_at | TIMESTAMPTZ | |
+
+#### `player_credits`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| user_id | UUID FK → auth.users | |
+| amount_cents | INT NOT NULL | Current balance |
+| currency | TEXT DEFAULT 'aud' | |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+#### `credit_transactions`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| user_id | UUID FK → auth.users | |
+| booking_id | UUID FK → bookings NULL | Source booking (cancellation) |
+| amount_cents | INT | Positive = credit added, negative = credit applied |
+| reason | TEXT | 'cancellation_refund', 'booking_applied', 'admin_adjustment' |
+| created_at | TIMESTAMPTZ | |
+
+#### `club_subscriptions`
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID PK | |
+| club_id | UUID FK → clubs | UNIQUE |
+| tier | TEXT | 'free', 'starter', 'pro', 'enterprise' |
+| stripe_subscription_id | TEXT NULL | Stripe Subscription ID |
+| stripe_customer_id | TEXT NULL | Stripe Customer ID for club owner |
+| billing_interval | TEXT NULL | 'month', 'year' |
+| current_period_end | TIMESTAMPTZ NULL | |
+| cancel_at_period_end | BOOL DEFAULT false | |
+| created_at | TIMESTAMPTZ | |
+| updated_at | TIMESTAMPTZ | |
+
+### Fields to Add to Existing Tables
+
+#### `bookings`
+- `platform_fee_cents INT NULL` — fee retained by platform on this booking
+- `club_payout_cents INT NULL` — amount transferred to club (after fee)
+- `credits_applied_cents INT NULL` — credits used by player at checkout
+- `cancelled_at TIMESTAMPTZ NULL` — set on player cancellation
+- `cancellation_reason TEXT NULL` — 'player_cancelled', 'admin_cancelled', 'game_cancelled'
+
+#### `games`
+- `price_cents INT NULL` — 0 or NULL = free, >0 = paid
+- `currency TEXT DEFAULT 'aud'`
+- `platform_fee_bps INT DEFAULT 1000` — basis points (1000 = 10%); overridable per game for promos
+- `cancellation_window_hours INT DEFAULT 24` — hours before start within which cancellation earns credit
+
+#### `clubs`
+- `subscription_tier TEXT DEFAULT 'free'` — denormalised from club_subscriptions for fast reads
+- `stripe_connect_id TEXT NULL` — denormalised from club_stripe_accounts for fast checkout
+
+### Relationships
+- `club_stripe_accounts.club_id` → `clubs.id`
+- `club_subscriptions.club_id` → `clubs.id`
+- `player_credits.user_id` → `auth.users.id`
+- `credit_transactions.booking_id` → `bookings.id` (nullable — admin adjustments have no booking)
+
+---
+
+## 4. PAYMENT FLOW LOGIC
+
+### Booking → Payment → Confirmation
+1. Player opens game detail; price badge shown if `game.priceCents > 0`
+2. iOS fetches available credit balance for user
+3. If credits >= price: free checkout path (no Stripe PaymentSheet) — credit deducted directly
+4. If credits < price: reduced PaymentIntent for `(price - credits)` created; remaining credits applied post-completion
+5. Edge Function `create-payment-intent` receives `{ gameID, userID, creditsToApply, currency }`
+   - Validates game price and club has Stripe Connect account
+   - Creates PaymentIntent with `application_fee_amount = floor(amount * fee_bps / 10000)`
+   - Returns `{ clientSecret, platformFeeCents, clubPayoutCents }`
+6. On Stripe `.completed`:
+   - Insert booking row (fee_paid, payment_method, stripe_payment_intent_id, platform_fee_cents, club_payout_cents, credits_applied_cents)
+   - If credits were applied: insert negative `credit_transactions` row + decrement `player_credits.amount_cents`
+7. Booking confirmation shown to player
+
+### Cancellation → Credit Logic
+1. Player cancels booking via app
+2. Server checks: `game.startDate - now() > cancellation_window_hours`
+   - Inside window (too late): no credit, booking deleted/cancelled
+   - Outside window: eligible for credit
+3. Credit amount = `booking.club_payout_cents` (platform fee NOT returned — it's the cost of the cancellation guarantee)
+4. Insert `credit_transactions` row with `reason='cancellation_refund'`, `amount_cents=club_payout_cents`
+5. Increment `player_credits.amount_cents`
+6. Set `bookings.cancelled_at`, `bookings.cancellation_reason='player_cancelled'`
+7. Notify club admin of cancellation + whether credit was issued
+
+### Waitlist → Payment Flow
+1. Player joins waitlist on a full paid game — no payment taken at this point
+2. When a spot opens (player cancels or admin removes), first waitlisted player is promoted
+3. Server-side Edge Function `promote-from-waitlist`:
+   - Creates a PaymentIntent for the promoted player
+   - Sends push notification: "A spot opened — complete your booking" with a deep link
+4. Deep link opens `GameDetailView` in "confirm payment" state — PaymentSheet pre-loaded
+5. Player has a time window (e.g. 30 min) to complete payment; otherwise next waitlist player is offered
+6. If player declines or window expires: credit back to them if they were originally charged (not applicable v1 — no charge yet), move to next player
+
+---
+
+## 5. IMPLEMENTATION PHASES
+
+### Phase 1 — Stripe Connect + Basic Paid Games
+Goal: A club owner can onboard to Stripe Connect, set a price on a game, and players can pay at booking.
+
+- DB: Add `price_cents`, `currency`, `platform_fee_bps`, `cancellation_window_hours` to `games`
+- DB: Add `platform_fee_cents`, `club_payout_cents`, `credits_applied_cents` to `bookings`
+- DB: Create `club_stripe_accounts` table
+- DB: Add `stripe_connect_id` to `clubs`
+- Edge Function: update `create-payment-intent` to support destination charges + application fee
+- Edge Function: `connect-onboarding` — generates Stripe Connect onboarding link for club owner
+- iOS: Price badge on game cards and detail view
+- iOS: PaymentSheet updated for destination charge flow
+- iOS: Club Settings — "Accept Payments" section with Connect onboarding button + status
+
+### Phase 2 — Credit System
+Goal: Cancellations issue credits; credits can be applied at checkout.
+
+- DB: Create `player_credits` and `credit_transactions` tables
+- Edge Function: `cancel-booking` — handles cancellation window logic, issues credit
+- Edge Function: `apply-credits` — atomic debit of credits + reduced PaymentIntent creation
+- iOS: Credit balance displayed on profile and checkout screen
+- iOS: Credit transaction history in profile
+- iOS: Checkout shows "Apply credits" toggle when balance > 0
+
+### Phase 3 — Waitlist Payment Handling — COMPLETE (2026-04-02)
+Goal: Promoted waitlist players are prompted to pay before a spot is confirmed.
+
+- DB: `bookings.hold_expires_at TIMESTAMPTZ NULL` — hold window for promoted players
+- DB: `promote_waitlist_player` RPC — server-authoritative, row-locking, rejects races
+- DB: `expire_waitlist_holds()` function + pg_cron schedule (every 5 min)
+- iOS: `BookingRecord.holdExpiresAt` / `hasActiveHold` — model-level hold tracking
+- iOS: `promoteWaitlistPlayer` service method + `promoteWaitlistPlayerForPaidGame` in AppState
+- iOS: `autoPromoteWaitlistIfPossible` split: free games multi-promote; paid games promote one at a time
+- iOS: `GameDetailView` "Complete Booking" CTA with live countdown; expired hold passive state
+- iOS: `isPendingPaymentCompletion` + `pendingBookingIDForConfirm` flags for deferred PaymentSheet routing
+- iOS: `confirmPendingBooking` handles credit deduction for promoted players
+
+### Phase 4 Part 1 — Club Subscription Foundation — COMPLETE (2026-04-02)
+Goal: Backend infrastructure for recurring billing; no feature gating yet.
+
+- DB: `club_subscriptions` table; `subscription_tier` on `clubs`; `stripe_customer_id` on `profiles`
+- Stripe: Products + Prices created manually in Dashboard (starter/pro, monthly/annual)
+- Edge Function: `create-club-subscription` — get/create Stripe Customer → create Subscription → return client_secret
+- Edge Function: `stripe-webhook` — handles subscription lifecycle; idempotent; denormalises tier to clubs
+
+### Phase 4 Part 2 — Subscription UI + Feature Gating (pending)
+Goal: Club owners can subscribe; app enforces tier limits.
+
+- iOS: Subscription management screen in Club Settings
+- iOS: Paywall gates for premium features (paid games blocked on free tier, etc.)
+- iOS: Upgrade prompts at feature limits
+- Logic: upgrade/downgrade as cancel+resubscribe (no proration in v1)
+
+---
+
+## 6. RISKS / EDGE CASES
+
+### Failed Payments
+- PaymentIntent created but player closes app before completing: intent expires after 1 hour (Stripe default); booking never inserted; spot not held
+- Stripe `.failed` result: show error, do not insert booking, do not decrement credits
+- Network loss mid-payment: StripePaymentSheet handles retry internally; only call booking insert on `.completed`
+
+### Partial States
+- Booking inserted but credit deduction fails: wrap in a server-side transaction or RPC; rollback booking if credit write fails
+- Stripe charge succeeds but booking DB insert fails: idempotency key on PaymentIntent (use `gameID+userID`); retry insert on app relaunch by checking existing payment intents
+- Club loses Stripe Connect access mid-game: validate `payouts_enabled` before allowing new paid game creation; existing bookings unaffected
+
+### Credit Misuse
+- Race condition on credit application (double-spend): use Postgres `UPDATE player_credits SET amount_cents = amount_cents - $1 WHERE user_id = $2 AND amount_cents >= $1` — returns 0 rows if insufficient; reject atomically
+- Admin-adjusted credits: all credit transactions logged with `reason`; audit trail available
+- Credit balance going negative: enforced by the atomic update guard above
+
+### Subscription Limits
+- Club exceeds game/member limit after downgrade: existing data preserved; block new creation with clear upgrade prompt
+- Subscription payment fails (Stripe dunning): webhook sets tier to `free` after grace period; notify club owner via push + email
+- Club owner deletes account while subscribed: cancel Stripe subscription in `delete-club` flow; pro-rate refund policy TBD
+
+---
+
+## PENDING DECISIONS (resolve before each phase)
+- Platform fee percentage: 10% default (`platform_fee_bps = 1000`)? Confirm with business.
+- Currency support: AUD only (v1)? Multi-currency deferred.
+- Credit expiry: none (v1)? 12-month rolling expiry in v2?
+- Subscription pricing: starter / pro / enterprise price points TBD.
+- Cancellation window default: 24h? Make it configurable per club or per game?
+- Waitlist payment window: 30 min? Configurable?

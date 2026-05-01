@@ -1,0 +1,15 @@
+{
+  "originHash" : "f8a0db239c6de4472428fbeb321c7ff5b436762d439ad53f723aadd3e23e5cb2",
+  "pins" : [
+    {
+      "identity" : "stripe-ios",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/stripe/stripe-ios",
+      "state" : {
+        "revision" : "f0523633778c8d69166d72570253a4a3b3d3c346",
+        "version" : "25.8.0"
+      }
+    }
+  ],
+  "version" : 3
+}
