@@ -13,6 +13,14 @@ struct CancellationCreditResult: Equatable {
     let newBalanceCents: Int
 }
 
+/// Routes that may be pushed onto the Clubs-tab `NavigationStack`.
+/// Identity is the model UUID — never the resolved value — so duplicate pushes
+/// of the same Game / Club collapse via `AppState.navigate(to:)` idempotency.
+enum AppRoute: Hashable {
+    case club(UUID)
+    case game(UUID)
+}
+
 @MainActor
 final class AppState: ObservableObject {
     private enum StorageKeys {
@@ -34,6 +42,13 @@ final class AppState: ObservableObject {
     let scheduleStore = GameScheduleStore()
 
     @Published var pendingDeepLink: DeepLink? = nil
+    /// Currently selected tab. Lifted from `MainTabView` so `navigate(to:)`
+    /// can switch tabs from any context (e.g. tapping a club chip from
+    /// `GameDetailView` while presented inside the Bookings tab stack).
+    @Published var selectedTab: AppTab = .home
+    /// Single source of truth for the Clubs-tab `NavigationStack` path.
+    /// Mutated only via `navigate(to:)` so push de-duplication is centralised.
+    @Published var clubsNavPath: [AppRoute] = []
     @Published var authState: AuthState = .signedOut
     @Published var authUserID: UUID? = nil
     @Published var authEmail: String? = nil
@@ -55,6 +70,8 @@ final class AppState: ObservableObject {
     @Published var clubNewsPostsByClubID: [UUID: [ClubNewsPost]] = [:]
     @Published var clubNewsReportsByClubID: [UUID: [ClubNewsModerationReport]] = [:]
     @Published var clubAdminRoleByClubID: [UUID: ClubAdminRole] = [:]
+    @Published var roleHistoryByClubID: [UUID: [ClubRoleAuditEntry]] = [:]
+    @Published var loadingRoleHistoryClubIDs: Set<UUID> = []
     @Published var requestingMembershipClubIDs: Set<UUID> = []
     @Published var removingMembershipClubIDs: Set<UUID> = []
     @Published var loadingOwnerJoinRequestClubIDs: Set<UUID> = []
@@ -273,6 +290,8 @@ final class AppState: ObservableObject {
         clubNewsPostsByClubID = [:]
         clubNewsReportsByClubID = [:]
         clubAdminRoleByClubID = [:]
+        roleHistoryByClubID = [:]
+        loadingRoleHistoryClubIDs = []
         clubNewsPrimedClubIDs = []
         seenClubNewsPostIDsByClubID = [:]
         seenClubNewsCommentIDsByClubID = [:]
@@ -1295,6 +1314,82 @@ final class AppState: ObservableObject {
         pendingDeepLink = link
     }
 
+    /// Idempotent push onto the Clubs-tab navigation stack.
+    ///
+    /// - Tapping the current top route is a no-op.
+    /// - Tapping a route already in the stack pops back to it (instead of
+    ///   pushing a duplicate). This prevents Game ↔ Club ping-pong loops.
+    /// - Otherwise the route is appended.
+    ///
+    /// Always switches to the Clubs tab so callers from other tabs (e.g. a
+    /// club chip tapped inside a Bookings-tab `GameDetailView`) land where
+    /// the path actually lives.
+    func navigate(to route: AppRoute) {
+        if selectedTab != .clubs {
+            selectedTab = .clubs
+        }
+        if clubsNavPath.last == route {
+            return
+        }
+        if let existingIndex = clubsNavPath.firstIndex(of: route) {
+            let removeCount = clubsNavPath.count - existingIndex - 1
+            if removeCount > 0 {
+                clubsNavPath.removeLast(removeCount)
+            }
+            return
+        }
+        clubsNavPath.append(route)
+    }
+
+    /// Composes the structured booking-confirmed notification body used by both
+    /// the in-app row and the push (the Edge Function builds an identical
+    /// version on the server — these need to stay in sync).
+    ///
+    ///     {Game Title}
+    ///     {Day}, {D MMM} · {h:mm a} ({Duration})
+    ///     📍 {Venue Name}
+    ///
+    /// `static` so it can be reused without an instance and unit-tested in
+    /// isolation. AU locale matches the rest of the app.
+    static func buildBookingConfirmedBody(
+        gameTitle: String,
+        dateTime: Date,
+        durationMinutes: Int,
+        venue: String
+    ) -> String {
+        let dayFmt = DateFormatter()
+        dayFmt.locale = Locale(identifier: "en_AU")
+        dayFmt.dateFormat = "EEEE"
+        let day = dayFmt.string(from: dateTime)
+
+        let dateFmt = DateFormatter()
+        dateFmt.locale = Locale(identifier: "en_AU")
+        dateFmt.dateFormat = "d MMM"
+        let date = dateFmt.string(from: dateTime)
+
+        let timeFmt = DateFormatter()
+        timeFmt.locale = Locale(identifier: "en_AU")
+        timeFmt.dateFormat = "h:mm a"
+        let time = timeFmt.string(from: dateTime).lowercased()
+
+        let duration: String
+        if durationMinutes < 60 {
+            duration = "\(durationMinutes)m"
+        } else {
+            let h = durationMinutes / 60
+            let m = durationMinutes % 60
+            duration = m == 0 ? "\(h)h" : "\(h)h \(m)m"
+        }
+
+        var lines: [String] = [gameTitle]
+        lines.append("\(day), \(date) · \(time) (\(duration))")
+        let trimmedVenue = venue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedVenue.isEmpty {
+            lines.append("📍 \(trimmedVenue)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     func refreshAttendees(for game: Game) async {
         guard authState == .signedIn else { return }
 
@@ -1508,51 +1603,98 @@ final class AppState: ObservableObject {
                 try await self.dataProvider.setClubAdminAccess(clubID: club.id, userID: member.userID, makeAdmin: makeAdmin)
             }
 
-            var current = ownerMembers(for: club)
-            if let index = current.firstIndex(where: { $0.userID == member.userID }) {
-                current[index] = ClubOwnerMember(
-                    membershipRecordID: member.membershipRecordID,
-                    userID: member.userID,
-                    clubID: member.clubID,
-                    membershipStatus: member.membershipStatus,
-                    memberName: member.memberName,
-                    memberEmail: member.memberEmail,
-                    memberPhone: member.memberPhone,
-                    emergencyContactName: member.emergencyContactName,
-                    emergencyContactPhone: member.emergencyContactPhone,
-                    isAdmin: makeAdmin,
-                    isOwner: member.isOwner,
-                    adminRole: makeAdmin ? ClubAdminRole.admin : nil,
-                    conductAcceptedAt: member.conductAcceptedAt,
-                    cancellationPolicyAcceptedAt: member.cancellationPolicyAcceptedAt,
-                    duprRating: member.duprRating,
-                    duprUpdatedAt: member.duprUpdatedAt,
-                    duprUpdatedByName: member.duprUpdatedByName,
-                    avatarColorKey: member.avatarColorKey
-                )
-            }
-            ownerMembersByClubID[club.id] = current.sorted { lhs, rhs in
-                if lhs.isOwner != rhs.isOwner { return lhs.isOwner && !rhs.isOwner }
-                if lhs.isAdmin != rhs.isAdmin { return lhs.isAdmin && !rhs.isAdmin }
-                return lhs.memberName.localizedCaseInsensitiveCompare(rhs.memberName) == .orderedAscending
-            }
-            ownerToolsInfoMessage = makeAdmin ? "\(member.memberName) is now an admin." : "Admin access removed."
+            // Re-fetch from server. The mutation may have changed the demoted/promoted user's
+            // own role cache (clubAdminRoleByClubID) on this device, and the member list snapshot
+            // (ownerMembersByClubID) needs the authoritative server state — never trust an
+            // optimistic rewrite for role changes since stale cache silently lies in 15+ UI sites.
+            await refreshClubAdminRole(for: club)
+            await refreshOwnerMembers(for: club)
 
-            if makeAdmin {
-                Task {
-                    try? await self.dataProvider.triggerNotify(
-                        userID: member.userID,
-                        title: "You're now an admin",
-                        body: "You have been made an admin of \(club.name). You can now manage members and create games.",
-                        type: "admin_promoted",
-                        referenceID: club.id,
-                        sendPush: true
-                    )
-                }
-            }
+            ownerToolsInfoMessage = makeAdmin ? "\(member.memberName) is now an admin." : "Admin access removed."
+            // Push + in-app notification for the affected user is fanned out
+            // server-side by the trg_enqueue_role_change_push trigger on
+            // club_role_audit (migration 20260504030000). Do NOT add a
+            // client-side triggerNotify here — it would duplicate the push.
         } catch {
             ownerToolsErrorMessage = error.localizedDescription
         }
+    }
+
+    /// Atomically transfers club ownership to another approved member via the
+    /// transfer_club_ownership RPC. Server validates caller=current owner,
+    /// updates clubs.created_by, upserts new owner club_admins row, and demotes
+    /// the old owner to `oldOwnerNewRole` ("admin" or "member"), all under a
+    /// clubs row lock. After success: refreshes club list (so the local
+    /// isClubOwner check flips on this device) and reloads admin role + member
+    /// list to bust stale caches.
+    func transferClubOwnership(in club: Club, newOwnerID: UUID, oldOwnerNewRole: String) async {
+        ownerToolsErrorMessage = nil
+        ownerToolsInfoMessage = nil
+
+        guard isClubOwner(for: club) else {
+            ownerToolsErrorMessage = "Only the club owner can transfer ownership."
+            return
+        }
+        guard let callerID = authUserID, newOwnerID != callerID else {
+            ownerToolsErrorMessage = "Pick a different member to transfer to."
+            return
+        }
+        guard oldOwnerNewRole == "admin" || oldOwnerNewRole == "member" else {
+            ownerToolsErrorMessage = "Invalid role for the outgoing owner."
+            return
+        }
+
+        ownerAdminUpdatingUserIDs.insert(newOwnerID)
+        defer { ownerAdminUpdatingUserIDs.remove(newOwnerID) }
+
+        do {
+            try await withAuthRetry {
+                try await self.dataProvider.transferClubOwnership(
+                    clubID: club.id,
+                    newOwnerID: newOwnerID,
+                    oldOwnerNewRole: oldOwnerNewRole
+                )
+            }
+
+            await refreshClubs()
+            await refreshClubAdminRole(for: club)
+            await refreshOwnerMembers(for: club)
+
+            ownerToolsInfoMessage = "Club ownership transferred."
+            // Push + in-app notification for both the new owner ('transferred_in')
+            // and the outgoing owner ('transferred_out_to_admin'/'_member') is
+            // fanned out server-side by trg_enqueue_role_change_push on
+            // club_role_audit (migration 20260504030000). Do NOT add a
+            // client-side triggerNotify here.
+        } catch {
+            ownerToolsErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Fetches recent role-change audit rows for the club via the
+    /// get_club_role_history RPC. Owner/admin only (server-enforced).
+    /// Result is stored in `roleHistoryByClubID[club.id]` and surfaced via
+    /// `roleHistory(for:)`. Failures populate `ownerToolsErrorMessage`.
+    func refreshClubRoleHistory(for club: Club, limit: Int = 100) async {
+        loadingRoleHistoryClubIDs.insert(club.id)
+        defer { loadingRoleHistoryClubIDs.remove(club.id) }
+
+        do {
+            let entries = try await withAuthRetry {
+                try await self.dataProvider.fetchClubRoleHistory(clubID: club.id, limit: limit)
+            }
+            roleHistoryByClubID[club.id] = entries
+        } catch {
+            ownerToolsErrorMessage = error.localizedDescription
+        }
+    }
+
+    func roleHistory(for club: Club) -> [ClubRoleAuditEntry] {
+        roleHistoryByClubID[club.id] ?? []
+    }
+
+    func isLoadingRoleHistory(for club: Club) -> Bool {
+        loadingRoleHistoryClubIDs.contains(club.id)
     }
 
     func removeOwnerMember(_ member: ClubOwnerMember, in club: Club) async {
@@ -2011,6 +2153,25 @@ final class AppState: ObservableObject {
                 checkedInBookingIDs.remove(attendee.booking.id)
                 noShowBookingIDs.remove(attendee.booking.id)
                 persistCheckedInBookingIDs()
+
+                // Notify the cancelled player so their device refreshes immediately
+                // (the trigger-based waitlist push only reaches the *promoted* user).
+                // Skip when an admin cancels their own booking — they already updated locally.
+                let cancelledUserID = attendee.booking.userID
+                if cancelledUserID != authUserID {
+                    let gameTitle = game.title
+                    let gameID = game.id
+                    Task {
+                        try? await self.dataProvider.triggerNotify(
+                            userID: cancelledUserID,
+                            title: "Booking Cancelled",
+                            body: "An admin removed you from \(gameTitle).",
+                            type: "booking_cancelled",
+                            referenceID: gameID,
+                            sendPush: true
+                        )
+                    }
+                }
             }
 
             switch targetState {
@@ -2036,8 +2197,13 @@ final class AppState: ObservableObject {
             }
             await refreshAttendees(for: game)
             if freedConfirmedSpot {
+                // Server is authoritative on waitlist promotion: the
+                // promote_top_waitlisted DB trigger fires on confirmed→cancelled
+                // and promotes one waitlister atomically (paid → pending_payment
+                // with a hold; free → confirmed). Push goes out via the
+                // promote-top-waitlisted-push Edge Function. The client never
+                // promotes — see CLAUDE.md "Waitlist & Hold System".
                 await notifyWaitlistPromoted(for: game, previouslyWaitlisted: preWaitlistedIDs)
-                await autoPromoteWaitlistIfPossible(for: game)
             }
             await refreshBookings(silent: true)
         } catch {
@@ -3087,10 +3253,16 @@ final class AppState: ObservableObject {
                         bookingID: created.id,
                         userID: userID
                     )
-                    // In-app notification row (sendPush: false avoids double push)
+                    // In-app notification row (sendPush: false avoids double push).
+                    // Body matches the structured push template so the in-app
+                    // list, push lock-screen, and email body all read the same.
                     let venue = game.venueName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    let locationSuffix = venue.isEmpty ? "" : " · \(venue)"
-                    let confirmedBody = "You're booked for \(game.title) · \(game.dateTime.formatted(date: .abbreviated, time: .shortened))\(locationSuffix)"
+                    let confirmedBody = Self.buildBookingConfirmedBody(
+                        gameTitle: game.title,
+                        dateTime: game.dateTime,
+                        durationMinutes: game.durationMinutes,
+                        venue: venue
+                    )
                     try? await self.dataProvider.triggerNotify(
                         userID: userID,
                         title: "Booking confirmed",
@@ -3226,8 +3398,10 @@ final class AppState: ObservableObject {
                 await refreshGames(for: club)
             }
             await refreshAttendees(for: game)
+            // Server-authoritative promotion: promote_top_waitlisted trigger
+            // fires on this confirmed→cancelled transition and handles the
+            // waitlist queue atomically. See CLAUDE.md "Waitlist & Hold System".
             await notifyWaitlistPromoted(for: game, previouslyWaitlisted: preWaitlistedIDs)
-            await autoPromoteWaitlistIfPossible(for: game)
         } catch let serviceError as SupabaseServiceError {
             switch serviceError {
             case .authenticationRequired:
@@ -3306,115 +3480,14 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func autoPromoteWaitlistIfPossible(for game: Game) async {
-        guard let club = clubs.first(where: { $0.id == game.clubID }) else { return }
-        guard isClubAdmin(for: club) else { return }
-
-        let attendees = gameAttendees(for: game)
-        let confirmedCount = attendees.reduce(into: 0) { count, attendee in
-            if bookingStateIsConfirmed(attendee.booking.state) { count += 1 }
-        }
-        let openSlots = max(game.maxSpots - confirmedCount, 0)
-        guard openSlots > 0 else { return }
-
-        let waitlisted = attendees
-            .filter { bookingStateIsWaitlisted($0.booking.state) }
-            .sorted { lhs, rhs in
-                let l = lhs.booking.waitlistPosition ?? Int.max
-                let r = rhs.booking.waitlistPosition ?? Int.max
-                if l == r {
-                    return lhs.booking.createdAt ?? .distantFuture < rhs.booking.createdAt ?? .distantFuture
-                }
-                return l < r
-            }
-
-        guard !waitlisted.isEmpty else { return }
-
-        let isPaidGame = (game.feeAmount ?? 0) > 0
-
-        if isPaidGame {
-            // Phase 3: paid games — promote one player to pending_payment with a timed hold.
-            // The DB RPC is idempotent: won't create a second hold while one is still active.
-            if let first = waitlisted.first {
-                await promoteWaitlistPlayerForPaidGame(game: game, attendee: first)
-            }
-        } else {
-            // Free games: keep existing direct-confirm behavior, promote up to openSlots.
-            var promotedNames: [String] = []
-            for attendee in waitlisted.prefix(openSlots) {
-                do {
-                    let updated = try await withAuthRetry {
-                        try await self.dataProvider.ownerUpdateBooking(
-                            bookingID: attendee.booking.id,
-                            status: "confirmed",
-                            waitlistPosition: nil
-                        )
-                    }
-                    promotedNames.append(attendee.userName)
-                    if let bookingIndex = bookings.firstIndex(where: { $0.booking.id == attendee.booking.id }) {
-                        bookings[bookingIndex] = BookingWithGame(booking: updated, game: bookings[bookingIndex].game)
-                    }
-                    let promotedUserID = attendee.booking.userID
-                    Task {
-                        try? await self.dataProvider.triggerNotify(
-                            userID: promotedUserID,
-                            title: "You're In!",
-                            body: "A spot opened up — you've been moved from the waitlist to confirmed for \(game.title).",
-                            type: "waitlist_promoted",
-                            referenceID: game.id,
-                            sendPush: true
-                        )
-                    }
-                } catch {
-                    gameOwnerErrorByID[game.id] = error.localizedDescription
-                    break
-                }
-            }
-            guard !promotedNames.isEmpty else { return }
-            if promotedNames.count == 1 {
-                gameOwnerInfoByID[game.id] = "\(promotedNames[0]) was auto-promoted from the waitlist."
-            } else {
-                gameOwnerInfoByID[game.id] = "Auto-promoted \(promotedNames.count) players from the waitlist."
-            }
-        }
-
-        await refreshAttendees(for: game)
-        await refreshGames(for: club)
-        await refreshBookings(silent: true)
-    }
-
-    // Hold window in minutes — must match v_hold_minutes in DB trigger.
-    private let waitlistHoldMinutes = 30
-
-    private func promoteWaitlistPlayerForPaidGame(game: Game, attendee: GameAttendee) async {
-        do {
-            let success = try await withAuthRetry {
-                try await self.dataProvider.promoteWaitlistPlayer(
-                    gameID: game.id,
-                    bookingID: attendee.booking.id,
-                    holdMinutes: self.waitlistHoldMinutes
-                )
-            }
-            guard success else {
-                // Slot is full, booking no longer waitlisted, or an active hold already exists.
-                return
-            }
-            gameOwnerInfoByID[game.id] = "\(attendee.userName) offered the spot — awaiting payment (\(waitlistHoldMinutes) min hold)."
-            let promotedUserID = attendee.booking.userID
-            Task {
-                try? await self.dataProvider.triggerNotify(
-                    userID: promotedUserID,
-                    title: "⚠️ Action required: complete your booking",
-                    body: "A spot opened in \(game.title). Pay now to confirm your place — your hold expires in \(waitlistHoldMinutes) minutes.",
-                    type: "waitlist_promoted",
-                    referenceID: game.id,
-                    sendPush: true
-                )
-            }
-        } catch {
-            gameOwnerErrorByID[game.id] = error.localizedDescription
-        }
-    }
+    // Client-side waitlist auto-promotion was removed on 2026-05-02 after a
+    // 5/4 over-booking incident. The DB trigger promote_top_waitlisted handles
+    // confirmed→cancelled transitions atomically (counts confirmed +
+    // pending_payment under a games row lock, promotes one waitlister, sends
+    // push via promote-top-waitlisted-push). The cron revert_expired_holds_and_repromote
+    // handles hold expiry. The client must never decide promotion order or
+    // flip status from waitlisted → pending_payment. See CLAUDE.md
+    // "Waitlist & Hold System → Do not reintroduce".
 
     private func bookingStateIsConfirmed(_ state: BookingState) -> Bool {
         if case .confirmed = state { return true }
@@ -4028,7 +4101,7 @@ final class AppState: ObservableObject {
             // 403 is a permission/eligibility error — a refreshed token cannot fix it.
             // Only 401 (genuine auth expiry) should trigger a session refresh.
             return code == 401
-        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired:
+        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notAuthorized, .invalidPayload, .rateLimited:
             return false
         }
     }
@@ -4079,7 +4152,7 @@ final class AppState: ObservableObject {
             return true
         case let .httpStatus(code, _):
             return code == 400 || code == 401 || code == 403
-        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired:
+        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notAuthorized, .invalidPayload, .rateLimited:
             return false
         }
     }

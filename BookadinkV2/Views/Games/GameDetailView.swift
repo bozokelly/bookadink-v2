@@ -17,7 +17,6 @@ struct GameDetailView: View {
     @State private var duprSheetErrorMessage: String? = nil
     @State private var isPlayersExpanded = false
     @State private var showCancelGameConfirmation = false
-    @State private var clubSheetTarget: Club? = nil
 
     // Stripe PaymentSheet
     @State private var paymentSheet: PaymentSheet = PaymentSheet(paymentIntentClientSecret: "", configuration: .init())
@@ -309,11 +308,6 @@ struct GameDetailView: View {
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
             updateHoldCountdown()
         }
-        .sheet(item: $clubSheetTarget) { club in
-            NavigationStack {
-                ClubDetailView(club: club).environmentObject(appState)
-            }
-        }
         .sheet(isPresented: $showDUPRBookingSheet) { duprBookingSheet }
         .sheet(isPresented: $isEditingGame) {
             if let club = clubForGame {
@@ -444,9 +438,13 @@ struct GameDetailView: View {
 
                 Spacer(minLength: 12)
 
-                // Club chip — tappable link to club page
+                // Club chip — tappable link to club page.
+                // Routes through `appState.navigate(to:)` so the path is
+                // idempotent: tapping back to a club already in the stack
+                // pops to it instead of pushing a duplicate (eliminates the
+                // Game ↔ Club ping-pong loop).
                 Button {
-                    clubSheetTarget = clubForGame
+                    appState.navigate(to: .club(currentGame.clubID))
                 } label: {
                     HStack(spacing: 4) {
                         Text(heroChipText)

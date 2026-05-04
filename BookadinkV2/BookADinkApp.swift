@@ -16,6 +16,9 @@ extension Notification.Name {
     static let bookADinkMembershipStatusChanged = Notification.Name("bookadink.membership.status_changed")
     /// Posted when a waitlist_promoted push arrives. Object is the game UUID string.
     static let bookADinkWaitlistPromoted = Notification.Name("bookadink.booking.waitlist_promoted")
+    /// Posted when a booking_cancelled push arrives (admin removed the player).
+    /// Object is the game UUID string (from `reference_id`) so the listener can refresh attendees too.
+    static let bookADinkBookingCancelled = Notification.Name("bookadink.booking.cancelled")
 }
 
 final class BookADinkAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -199,6 +202,10 @@ final class BookADinkAppDelegate: NSObject, UIApplicationDelegate, UNUserNotific
             if type == "waitlist_promoted", let gameIDString = userInfo["reference_id"] as? String {
                 NotificationCenter.default.post(name: .bookADinkWaitlistPromoted, object: gameIDString)
             }
+            if type == "booking_cancelled" {
+                let gameIDString = userInfo["reference_id"] as? String
+                NotificationCenter.default.post(name: .bookADinkBookingCancelled, object: gameIDString)
+            }
         }
         completionHandler([.banner, .sound])
     }
@@ -241,12 +248,32 @@ struct BookADinkApp: App {
                     // regardless of which screen the user is on.
                     Task { await appState.refreshBookings(silent: true) }
                 }
+                .onReceive(NotificationCenter.default.publisher(for: .bookADinkBookingCancelled)) { note in
+                    // Admin removed the player from a game. Refresh bookings so the CTA
+                    // flips back to "Book"; if we can locate the game, refresh attendees too.
+                    let gameIDString = note.object as? String
+                    Task {
+                        await appState.refreshBookings(silent: true)
+                        if let s = gameIDString, let gameID = UUID(uuidString: s) {
+                            let cachedGame =
+                                appState.bookings.first(where: { $0.booking.gameID == gameID })?.game
+                                ?? appState.allUpcomingGames.first(where: { $0.id == gameID })
+                                ?? appState.gamesByClubID.values.flatMap({ $0 }).first(where: { $0.id == gameID })
+                            if let g = cachedGame {
+                                await appState.refreshAttendees(for: g)
+                            }
+                        }
+                    }
+                }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active {
                         Task {
                             // Refresh notifications on foreground so badge counts and indicators
                             // stay in sync without requiring manual pull-to-refresh.
                             await appState.refreshNotifications()
+                            // Belt-and-braces: catch up on bookings in case a push was missed
+                            // while backgrounded (e.g. silent admin cancellation).
+                            await appState.refreshBookings(silent: true)
                             for clubID in appState.entitlementsByClubID.keys {
                                 await appState.fetchClubEntitlements(for: clubID)
                             }

@@ -416,9 +416,12 @@ struct ClubDetailView: View {
         .onChange(of: appState.clubs) { _, newClubs in
             if !newClubs.contains(where: { $0.id == club.id }) { dismiss() }
         }
-        .navigationDestination(for: Game.self) { game in
-            GameDetailView(game: game)
-        }
+        // Game push destinations are resolved centrally in MainTabView's
+        // `.navigationDestination(for: AppRoute.self)`. Pushing here is done
+        // via `appState.navigate(to: .game(...))`, never via a per-view
+        // navigationDestination — that's how the Game ↔ Club ping-pong loop
+        // used to form (each ClubDetailView added another destination handler
+        // and each push grew the implicit stack).
         .navigationDestination(isPresented: $navigateToChat) {
             ClubNewsView(club: club, isClubModerator: appState.isClubAdmin(for: club))
                 .environmentObject(appState)
@@ -1312,8 +1315,8 @@ struct ClubDetailView: View {
                     ForEach(filteredClubGames) { game in
                         let venues        = appState.clubVenuesByClubID[game.clubID] ?? []
                         let resolvedVenue = LocationService.resolvedVenue(for: game, venues: venues)
-                        NavigationLink {
-                            GameDetailView(game: game)
+                        Button {
+                            appState.navigate(to: .game(game.id))
                         } label: {
                             let bannerCountdown: String? = (isClubAdminUser && game.isScheduled)
                                 ? goesLiveCountdown(game.publishAt!)

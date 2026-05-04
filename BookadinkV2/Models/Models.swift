@@ -152,6 +152,31 @@ struct ClubDirectoryMember: Identifiable, Hashable {
     let avatarColorKey: String?
 }
 
+// MARK: - Club Role Audit
+
+/// One row in the club_role_audit table, with target/actor names already
+/// resolved server-side via the get_club_role_history RPC.
+/// `changeType` is one of the wire values written by the SECURITY DEFINER
+/// RPCs and triggers — see the CHECK constraint on club_role_audit.change_type.
+struct ClubRoleAuditEntry: Identifiable, Hashable {
+    let id: UUID
+    let clubID: UUID
+    let targetUserID: UUID
+    let targetName: String
+    let actorUserID: UUID?
+    let actorName: String
+    let changeType: String
+    let oldRole: String?
+    let newRole: String?
+    let reason: String?
+    let createdAt: Date
+}
+
+struct ClubRoleChangeSummary: Hashable {
+    let changeType: String
+    let count: Int
+}
+
 // MARK: - Club Venue
 
 struct ClubVenue: Identifiable, Hashable {

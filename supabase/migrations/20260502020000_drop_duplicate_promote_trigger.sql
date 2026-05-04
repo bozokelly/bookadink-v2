@@ -1,0 +1,39 @@
+-- Drop duplicate `auto_promote_waitlist` trigger on bookings.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- INCIDENT (2026-05-02):
+--   Capacity invariant violated (5 confirmed bookings on a max=4 game) on both
+--   free and paid games. Investigation showed pg_trigger had TWO triggers
+--   wired to the same promote_top_waitlisted() function on the bookings
+--   table:
+--
+--     auto_promote_waitlist          AFTER UPDATE ON bookings
+--     trg_promote_top_waitlisted     AFTER UPDATE OF status ON bookings
+--
+--   Every confirmed→cancelled UPDATE fired BOTH triggers. The first promoted
+--   waitlister #1 (waitlisted → confirmed for free games / pending_payment for
+--   paid). The second fired immediately after, found waitlister #1 was no
+--   longer waitlisted, picked waitlister #2, and promoted them too. Net
+--   effect: every freed seat promoted two waitlisters.
+--
+--   The `auto_promote_waitlist` trigger was almost certainly created by hand
+--   in the SQL Editor before migration `20260407_promote_top_waitlisted_phase3.sql`
+--   created `trg_promote_top_waitlisted`. The newer migration didn't drop the
+--   older trigger, so they coexisted. The bug was invisible until a game
+--   actually had 2+ players on the waitlist when a confirmed seat opened.
+--
+-- WHAT THIS MIGRATION DOES:
+--   Drops `auto_promote_waitlist` (the legacy duplicate). Keeps
+--   `trg_promote_top_waitlisted` (the canonical migration-managed one).
+--
+-- VERIFY AFTER RUN:
+--   SELECT tgname, pg_get_triggerdef(oid)
+--   FROM   pg_trigger
+--   WHERE  tgrelid = 'bookings'::regclass AND NOT tgisinternal;
+--
+--   Should show ONE promote_top_waitlisted trigger (trg_promote_top_waitlisted),
+--   plus set_bookings_updated_at and trg_compact_waitlist_on_leave.
+--
+-- SAFE TO RE-RUN: IF EXISTS guard.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+DROP TRIGGER IF EXISTS auto_promote_waitlist ON public.bookings;

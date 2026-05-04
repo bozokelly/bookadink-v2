@@ -11,27 +11,24 @@ enum AppTab: Hashable {
 
 struct MainTabView: View {
     @EnvironmentObject private var appState: AppState
-    @State private var selectedTab: AppTab = .home
-    @State private var deepLinkClub: Club? = nil
-    @State private var deepLinkGame: Game? = nil
     /// Captures the game ID of whichever review prompt is currently being presented,
     /// so onDismiss can dismiss the correct game even if pendingReviewPrompt has changed.
     @State private var presentingReviewGameID: UUID? = nil
 
     var body: some View {
-        TabView(selection: $selectedTab) {
+        TabView(selection: $appState.selectedTab) {
             NavigationStack {
-                HomeView(selectedTab: $selectedTab)
+                HomeView(selectedTab: $appState.selectedTab)
             }
             .tabItem {
                 Label("Home", systemImage: "house.fill")
             }
             .tag(AppTab.home)
 
-            NavigationStack {
+            NavigationStack(path: $appState.clubsNavPath) {
                 ClubsListView(clubs: appState.clubs)
-                    .navigationDestination(item: $deepLinkClub) { club in
-                        ClubDetailView(club: club)
+                    .navigationDestination(for: AppRoute.self) { route in
+                        AppRouteDestinationView(route: route)
                     }
             }
             .tabItem {
@@ -69,11 +66,6 @@ struct MainTabView: View {
         // which defaults to a sidebar/top-bar layout when no explicit style is set.
         .tabViewStyle(DefaultTabViewStyle())
         .toolbarBackground(.visible, for: .tabBar)
-        .sheet(item: $deepLinkGame) { game in
-            NavigationStack {
-                GameDetailView(game: game)
-            }
-        }
         .sheet(item: $appState.pendingReviewPrompt, onDismiss: {
             // Use the captured ID rather than appState.pendingReviewPrompt so we dismiss
             // the correct game even if a second pending prompt was queued by submit.
@@ -101,37 +93,22 @@ struct MainTabView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .bookADinkOpenNotificationsTab)) { _ in
-            selectedTab = .notifications
+            appState.selectedTab = .notifications
         }
     }
 
     private func handleDeepLink(_ link: DeepLink) {
         switch link {
         case .club(let id):
-            guard let club = appState.clubs.first(where: { $0.id == id }) else { return }
-            selectedTab = .clubs
-            // Small delay so the tab switch animates before the push
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                deepLinkClub = club
-                appState.pendingDeepLink = nil
-            }
+            guard appState.clubs.contains(where: { $0.id == id }) else { return }
+            // navigate(to:) switches to the Clubs tab and idempotently pushes the route.
+            appState.navigate(to: .club(id))
+            appState.pendingDeepLink = nil
         case .game(let id):
-            let cached = appState.gamesByClubID.values.flatMap({ $0 }).first(where: { $0.id == id })
-                ?? appState.bookings.first(where: { $0.booking.gameID == id })?.game
-            if let game = cached {
-                // Game already in memory — open immediately
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    deepLinkGame = game
-                    appState.pendingDeepLink = nil
-                }
-            } else {
-                // Game not in cache (e.g. new_game notification before club loaded) — fetch then open
-                appState.pendingDeepLink = nil
-                Task {
-                    guard let game = await appState.resolveGame(id: id) else { return }
-                    await MainActor.run { deepLinkGame = game }
-                }
-            }
+            // navigate(to:) switches to the Clubs tab and idempotently pushes
+            // the route. Cache miss is handled inside AppRouteGameLoaderView.
+            appState.navigate(to: .game(id))
+            appState.pendingDeepLink = nil
         case .review:
             // Review prompts are handled inline in NotificationsView — no tab switch needed
             appState.pendingDeepLink = nil
@@ -139,6 +116,66 @@ struct MainTabView: View {
             // Handled in AppState.handleDeepLink — never reaches pendingDeepLink
             appState.pendingDeepLink = nil
         }
+    }
+}
+
+// MARK: - AppRoute destination
+
+/// Resolves an `AppRoute` (UUID-based) into a concrete `ClubDetailView` or
+/// `GameDetailView`. Routes carry only IDs so duplicates collapse via
+/// `AppState.navigate(to:)` idempotency; resolution happens here at render time.
+private struct AppRouteDestinationView: View {
+    @EnvironmentObject private var appState: AppState
+    let route: AppRoute
+
+    var body: some View {
+        switch route {
+        case .club(let id):
+            if let club = appState.clubs.first(where: { $0.id == id }) {
+                ClubDetailView(club: club)
+            } else {
+                AppRouteMissingView(label: "Loading club…")
+            }
+        case .game(let id):
+            AppRouteGameLoaderView(gameID: id)
+        }
+    }
+}
+
+private struct AppRouteGameLoaderView: View {
+    @EnvironmentObject private var appState: AppState
+    let gameID: UUID
+    @State private var resolvedGame: Game? = nil
+
+    private var cachedGame: Game? {
+        appState.gamesByClubID.values.flatMap({ $0 }).first(where: { $0.id == gameID })
+            ?? appState.bookings.first(where: { $0.booking.gameID == gameID })?.game
+    }
+
+    var body: some View {
+        if let game = cachedGame ?? resolvedGame {
+            GameDetailView(game: game)
+        } else {
+            AppRouteMissingView(label: "Loading game…")
+                .task {
+                    if resolvedGame == nil {
+                        resolvedGame = await appState.resolveGame(id: gameID)
+                    }
+                }
+        }
+    }
+}
+
+private struct AppRouteMissingView: View {
+    let label: String
+    var body: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            Text(label)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

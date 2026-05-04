@@ -20,6 +20,8 @@ enum LockedFeature: String, Identifiable {
     case memberLimit
     case recurringGames
     case scheduledPublishing
+    /// Generic "view / change plan" entry — used from Settings → Plan & Billing.
+    case managePlan
 
     var id: String { rawValue }
 
@@ -31,6 +33,7 @@ enum LockedFeature: String, Identifiable {
         case .memberLimit:         return "person.2.fill"
         case .recurringGames:      return "repeat"
         case .scheduledPublishing: return "eye.slash.fill"
+        case .managePlan:          return "sparkles"
         }
     }
 
@@ -42,6 +45,7 @@ enum LockedFeature: String, Identifiable {
         case .memberLimit:         return "Grow Your Club"
         case .recurringGames:      return "Recurring Games"
         case .scheduledPublishing: return "Scheduled Publishing"
+        case .managePlan:          return "Choose Your Plan"
         }
     }
 
@@ -53,6 +57,7 @@ enum LockedFeature: String, Identifiable {
         case .memberLimit:         return "Accept more members and grow your community."
         case .recurringGames:      return "Create a weekly series once and let the calendar fill itself."
         case .scheduledPublishing: return "Control exactly when a game goes live to your members."
+        case .managePlan:          return "Pick the plan that fits how your club runs."
         }
     }
 
@@ -135,6 +140,24 @@ enum LockedFeature: String, Identifiable {
                 PaywallHighlight(icon: "person.fill.checkmark", text: "Build anticipation before doors open"),
                 PaywallHighlight(icon: "repeat",              text: "Recurring weekly series included"),
             ]
+        case .managePlan:
+            var bullets: [PaywallHighlight] = []
+            if let n = limits["pro"]?.maxActiveGames {
+                bullets.append(PaywallHighlight(icon: "infinity", text: n == -1 ? "Unlimited active games on Pro" : "Up to \(n) active games on Pro"))
+            }
+            if limits["pro"]?.canAcceptPayments == true {
+                bullets.append(PaywallHighlight(icon: "creditcard.fill", text: "Accept paid bookings"))
+            }
+            if limits["pro"]?.analyticsAccess == true {
+                bullets.append(PaywallHighlight(icon: "chart.bar.fill", text: "Analytics dashboard"))
+            }
+            if limits["pro"]?.canUseRecurringGames == true {
+                bullets.append(PaywallHighlight(icon: "repeat", text: "Recurring weekly series"))
+            }
+            if limits["pro"]?.canUseDelayedPublishing == true {
+                bullets.append(PaywallHighlight(icon: "eye.slash.fill", text: "Scheduled publishing"))
+            }
+            return bullets
         }
     }
 }

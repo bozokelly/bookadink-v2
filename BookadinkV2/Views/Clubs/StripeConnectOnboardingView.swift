@@ -18,6 +18,7 @@ struct StripeConnectOnboardingView: View {
     @State private var isLaunchingStripe = false
     @State private var errorMessage: String?
     @State private var linkExpired = false
+    @State private var paywallFeature: LockedFeature? = nil
 
     private var entitlements: ClubEntitlements? { appState.entitlementsByClubID[club.id] }
     private var paymentsGate: GateResult {
@@ -59,6 +60,10 @@ struct StripeConnectOnboardingView: View {
         .onChange(of: appState.stripeAccountByClubID[club.id]) { _, cached in
             stripeAccount = cached
             isRefreshing = false
+        }
+        .sheet(item: $paywallFeature) { feature in
+            ClubUpgradePaywallView(club: club, lockedFeature: feature)
+                .environmentObject(appState)
         }
     }
 
@@ -351,7 +356,7 @@ struct StripeConnectOnboardingView: View {
             )
 
             primaryButton(title: "View Plans", icon: "arrow.right", isLoading: false) {
-                dismiss()
+                paywallFeature = .payments
             }
         }
         .padding(.top, 8)

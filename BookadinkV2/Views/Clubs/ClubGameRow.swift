@@ -272,12 +272,14 @@ struct UnifiedGameCard: View {
                             Text(venueName)
                                 .font(.system(size: 12))
                                 .lineLimit(1)
+                                .truncationMode(.tail)
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 9, weight: .semibold))
                         }
                         .foregroundStyle(Brand.pineTeal)
                     }
                     .buttonStyle(.plain)
+                    .padding(.trailing, 84)
                 } else {
                     HStack(spacing: 3) {
                         Image(systemName: "mappin.circle")
@@ -288,7 +290,9 @@ struct UnifiedGameCard: View {
                             .font(.system(size: 12))
                             .foregroundStyle(Brand.mutedText)
                             .lineLimit(1)
+                            .truncationMode(.tail)
                     }
+                    .padding(.trailing, 84)
                 }
             }
 
@@ -335,16 +339,23 @@ struct UnifiedGameCard: View {
             Text(label)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(color)
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
             if !venueName.isEmpty {
                 Text("·")
                     .font(.system(size: 12))
                     .foregroundStyle(Brand.secondaryText)
+                    .fixedSize()
+                    .layoutPriority(1)
                 Text(venueName)
                     .font(.system(size: 12))
                     .foregroundStyle(Brand.secondaryText)
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(0)
             }
         }
+        .padding(.trailing, 84)
     }
 
     // MARK: - Availability Badge

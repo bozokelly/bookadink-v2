@@ -8,6 +8,7 @@ struct ClubsListView: View {
     @State private var selectedFilter: ClubsFilter = .myClubs
     @State private var isShowingCreateClubSheet = false
     @State private var createdClubNavigationTarget: Club? = nil
+    @State private var favouriteSelectedClub: Club? = nil
     @AppStorage("clubs_tip_dismissed") private var tipDismissed = false
 
     // FIX (Performance): Single-pass filter combining membership + search,
@@ -56,6 +57,7 @@ struct ClubsListView: View {
                     FavouriteClubsSection(
                         clubs: clubs,
                         pinnedIDs: appState.pinnedClubIDs,
+                        selectedClub: $favouriteSelectedClub,
                         onTogglePin: { club in appState.togglePinClub(club) },
                         nextGame: { club in nextUpcomingGame(for: club) }
                     )
@@ -79,8 +81,8 @@ struct ClubsListView: View {
                         emptyResultsCard
                     } else {
                         ForEach(filteredClubs) { club in
-                            NavigationLink {
-                                ClubDetailView(club: club)
+                            Button {
+                                appState.navigate(to: .club(club.id))
                             } label: {
                                 ClubRowCard(
                                     club: club,
@@ -131,6 +133,12 @@ struct ClubsListView: View {
         }
         .navigationDestination(item: $createdClubNavigationTarget) { createdClub in
             ClubDetailView(club: createdClub)
+        }
+        // Lifted out of FavouriteClubsSection so the modifier sits outside the
+        // parent LazyVStack — SwiftUI ignores navigationDestination(item:) attached
+        // inside a lazy container.
+        .navigationDestination(item: $favouriteSelectedClub) { club in
+            ClubDetailView(club: club)
         }
     }
 
@@ -956,11 +964,11 @@ struct ClubImageBadge: View {
 private struct FavouriteClubsSection: View {
     let clubs: [Club]
     let pinnedIDs: [UUID]
+    @Binding var selectedClub: Club?
     let onTogglePin: (Club) -> Void
     let nextGame: (Club) -> Game?
 
     @State private var showPickerForSlot: Int? = nil
-    @State private var selectedClub: Club? = nil
 
     private func pinnedClub(at slot: Int) -> Club? {
         guard slot < pinnedIDs.count, let id = pinnedIDs[safe: slot] else { return nil }
@@ -1006,9 +1014,6 @@ private struct FavouriteClubsSection: View {
                     onTap: { if let c = pinnedClub(at: 1) { selectedClub = c } }
                 )
             }
-        }
-        .navigationDestination(item: $selectedClub) { club in
-            ClubDetailView(club: club)
         }
         .sheet(isPresented: Binding(
             get: { showPickerForSlot != nil },

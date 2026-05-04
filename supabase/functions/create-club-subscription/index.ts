@@ -14,8 +14,13 @@
 //   STRIPE_SECRET_KEY         — platform Stripe secret key (sk_test_... / sk_live_...)
 //   SUPABASE_SERVICE_ROLE_KEY — injected automatically by Supabase runtime
 //
-// Stripe Price metadata required:
-//   plan_type: "starter" | "pro"   — set on each Price in the Stripe Dashboard
+// plan_type resolution:
+//   The `subscription_plans` table (price_id → plan_id) is the authoritative source
+//   per CLAUDE.md. Earlier versions of this function read `metadata.plan_type` off the
+//   Stripe Price object and silently fell back to "starter" when missing — that turned
+//   a Stripe Dashboard config gap into a "pro upgrade silently no-ops" bug because
+//   `existingSubRow.plan_type === planType` early-returned. Now we look up plan_id by
+//   stripe_price_id in the DB and reject anything not registered.
 //
 // Deploy: supabase functions deploy create-club-subscription --no-verify-jwt
 
@@ -190,7 +195,39 @@ serve(async (req: Request) => {
       .eq("id", profile.id);
   }
 
-  // Step 4: Resolve plan_type from Price metadata
+  // Step 4: Resolve plan_type from subscription_plans (DB is authoritative).
+  // Looking this up via Stripe Price metadata previously caused a silent
+  // "upgrade no-ops" bug — see file header.
+  const { data: planRow, error: planLookupError } = await supabase
+    .from("subscription_plans")
+    .select("plan_id, active")
+    .eq("stripe_price_id", price_id)
+    .maybeSingle();
+  if (planLookupError) {
+    console.error("[create-club-subscription] subscription_plans lookup error:", planLookupError.message, "price:", price_id);
+    return new Response(
+      JSON.stringify({ error: "Could not validate this subscription plan. Please try again." }),
+      { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+  if (!planRow || !planRow.active) {
+    console.error("[create-club-subscription] price_id not in subscription_plans (or inactive):", price_id);
+    return new Response(
+      JSON.stringify({ error: "This subscription plan is not available." }),
+      { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+  const planType: string = planRow.plan_id;
+  // Defence-in-depth: matches the club_subscriptions.plan_type CHECK constraint.
+  if (planType !== "starter" && planType !== "pro") {
+    console.error("[create-club-subscription] unsupported plan_type from DB:", planType, "price:", price_id);
+    return new Response(
+      JSON.stringify({ error: "Unsupported plan type." }),
+      { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+
+  // Step 4b: Verify the Stripe Price exists and is in AUD before continuing.
   const priceRes = await stripeGet(`prices/${price_id}`, stripeKey);
   const priceData = await priceRes.json();
   if (!priceRes.ok) {
@@ -200,7 +237,6 @@ serve(async (req: Request) => {
       { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
-  // Reject non-AUD prices to prevent USD subscriptions being created accidentally.
   if (priceData.currency && priceData.currency !== "aud") {
     console.error("[create-club-subscription] Rejected non-AUD price currency:", priceData.currency, "price:", price_id);
     return new Response(
@@ -208,8 +244,6 @@ serve(async (req: Request) => {
       { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
-
-  const planType: string = priceData.metadata?.plan_type ?? "starter";
 
   // Step 4b: Check for an existing subscription — upgrade if already active.
   // Creating a second subscription would leave two active subs in Stripe and the

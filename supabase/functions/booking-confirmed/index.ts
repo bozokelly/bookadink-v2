@@ -78,7 +78,7 @@ serve(async (req: Request) => {
   // Fetch push token and game details concurrently
   const [profileResult, gameResult] = await Promise.all([
     supabase.from("profiles").select("push_token").eq("id", user_id).single(),
-    supabase.from("games").select("title, date_time, venue_name, clubs(name, timezone)").eq("id", game_id).single(),
+    supabase.from("games").select("title, date_time, duration_minutes, venue_name, clubs(name, timezone)").eq("id", game_id).single(),
   ]);
 
   if (profileResult.error || !profileResult.data?.push_token) {
@@ -93,23 +93,27 @@ serve(async (req: Request) => {
   const gameTitle = game?.title ?? "your game";
   const clubTZ: string = ((game?.clubs as { timezone?: string } | null)?.timezone) || FALLBACK_TZ;
 
-  // Format time using the club's venue timezone for consistency with in-app display
-  const formattedDatetime = game?.date_time ? formatGameDatetime(game.date_time, clubTZ) : null;
+  // Structured body parts (timezone-aware, locale-formatted)
+  const dt = game?.date_time ? formatGameDatetimeParts(game.date_time, clubTZ) : null;
+  const duration = typeof game?.duration_minutes === "number" ? formatDuration(game.duration_minutes) : null;
 
   // Location rule: venue_name → club name → omit
   const venueName = (game?.venue_name as string | null)?.trim() ?? "";
   const clubName = ((game?.clubs as { name?: string } | null)?.name ?? "").trim();
   const locationDisplay = venueName || clubName;
-  const locationSuffix = locationDisplay ? ` · ${locationDisplay}` : "";
 
-  const pushBody = formattedDatetime
-    ? `${gameTitle} · ${formattedDatetime}${locationSuffix}`
-    : `You're booked for ${gameTitle}${locationSuffix ? " at " + locationSuffix.slice(3) : ""}.`;
+  const dateTimeLine = dt
+    ? duration
+      ? `${dt.day}, ${dt.date} · ${dt.time} (${duration})`
+      : `${dt.day}, ${dt.date} · ${dt.time}`
+    : "";
+
+  const pushBody = buildBookingConfirmedBody(gameTitle, dateTimeLine, locationDisplay);
 
   try {
     await sendAPNS({
       deviceToken: pushToken,
-      title: "You're in!",
+      title: "Booking confirmed",
       body: pushBody,
       data: { game_id, booking_id, type: "booking_confirmed" },
       threadID: `game.${game_id}`,
@@ -141,14 +145,18 @@ serve(async (req: Request) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Formats a UTC ISO timestamp as "Sat, 20 Apr · 9:00 AM" in the given IANA timezone.
+ * Splits a UTC ISO timestamp into day / date / time parts in the given IANA
+ * timezone. Returns: { day: "Tuesday", date: "5 May", time: "2:00 pm" }.
  * Falls back to "Australia/Perth" if tz is invalid.
  */
-function formatGameDatetime(isoString: string, tz: string): string {
+function formatGameDatetimeParts(
+  isoString: string,
+  tz: string,
+): { day: string; date: string; time: string } {
   const d = new Date(isoString);
   try {
     const fmt = new Intl.DateTimeFormat("en-AU", {
-      weekday: "short",
+      weekday: "long",
       day: "numeric",
       month: "short",
       hour: "numeric",
@@ -158,12 +166,42 @@ function formatGameDatetime(isoString: string, tz: string): string {
     });
     const parts = fmt.formatToParts(d);
     const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
-    const period = get("dayPeriod").toUpperCase();
-    return `${get("weekday")}, ${get("day")} ${get("month")} · ${get("hour")}:${get("minute")} ${period}`;
+    const period = get("dayPeriod").toLowerCase();
+    return {
+      day: get("weekday"),
+      date: `${get("day")} ${get("month")}`,
+      time: `${get("hour")}:${get("minute")} ${period}`,
+    };
   } catch {
-    // Invalid timezone — fall back to Perth
-    return formatGameDatetime(isoString, "Australia/Perth");
+    return formatGameDatetimeParts(isoString, "Australia/Perth");
   }
+}
+
+function formatDuration(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
+}
+
+/**
+ * Three-line body. If the assembled string would exceed the soft cap, the
+ * venue is truncated first — game title and date/time line are preserved.
+ */
+function buildBookingConfirmedBody(gameTitle: string, dateTimeLine: string, venue: string): string {
+  const MAX_LEN = 178;
+  const join = (v: string) => {
+    const lines: string[] = [gameTitle];
+    if (dateTimeLine) lines.push(dateTimeLine);
+    if (v) lines.push(`📍 ${v}`);
+    return lines.join("\n");
+  };
+  const full = join(venue);
+  if (full.length <= MAX_LEN || !venue) return full;
+  const overhead = full.length - venue.length;
+  const room = MAX_LEN - overhead - 1; // 1 char for ellipsis
+  const truncated = room > 0 ? venue.slice(0, room) + "…" : "";
+  return join(truncated);
 }
 
 // ---------------------------------------------------------------------------

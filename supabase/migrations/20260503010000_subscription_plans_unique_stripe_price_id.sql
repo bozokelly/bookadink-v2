@@ -1,0 +1,32 @@
+-- subscription_plans.stripe_price_id UNIQUE constraint
+--
+-- create-club-subscription now resolves plan_type by looking up the price_id
+-- in this table:
+--
+--   SELECT plan_id FROM subscription_plans
+--    WHERE stripe_price_id = $1 AND active = true;
+--
+-- The function uses .maybeSingle() — if two rows shared the same stripe_price_id
+-- the lookup would error (PostgREST: "JSON object requested, multiple rows
+-- returned") and the upgrade would fail with a 503. The CHECK constraint and
+-- the seed already guarantee one row per price in practice; adding UNIQUE here
+-- makes the schema enforce what the function assumes.
+--
+-- This is purely additive — no data change. The ALTER will fail loudly if
+-- duplicate stripe_price_id values somehow exist (run the SELECT below first
+-- to verify cleanliness):
+--
+--   SELECT stripe_price_id, COUNT(*)
+--     FROM subscription_plans
+--    GROUP BY stripe_price_id
+--   HAVING COUNT(*) > 1;
+--
+-- Reference incident: 2026-05-03. Pro plan upgrade silently no-op'd because
+-- the Edge Function previously read plan_type from Stripe Price metadata,
+-- which was unset on the Pro price in Stripe Dashboard, defaulting to
+-- "starter" and triggering the early-return-already-on-plan branch. Fix
+-- moved plan_type resolution to this DB table, and this UNIQUE constraint
+-- makes the lookup safe.
+
+ALTER TABLE subscription_plans
+  ADD CONSTRAINT subscription_plans_stripe_price_id_key UNIQUE (stripe_price_id);

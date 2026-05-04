@@ -349,16 +349,23 @@ private struct BookingCompactCard: View {
                             Text(statusLabel)
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(statusColor)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .layoutPriority(1)
                             if let venue = venueName {
                                 Text("·")
                                     .font(.system(size: 12))
                                     .foregroundStyle(Brand.secondaryText)
+                                    .fixedSize()
+                                    .layoutPriority(1)
                                 Text(venue)
                                     .font(.system(size: 12))
                                     .foregroundStyle(Brand.secondaryText)
                                     .lineLimit(1)
+                                    .truncationMode(.tail)
+                                    .layoutPriority(0)
                             }
                         }
+                        .padding(.trailing, 36)
 
                         // Game title
                         Text(game.title)

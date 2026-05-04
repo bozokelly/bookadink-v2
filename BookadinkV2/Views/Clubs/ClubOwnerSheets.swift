@@ -1,7 +1,6 @@
 import SwiftUI
 import os
 import PhotosUI
-import StripePaymentSheet
 
 enum OwnerToolSheet: String, Identifiable {
     case dashboard    // Club Dashboard — tier + metrics + quick-nav
@@ -11,6 +10,7 @@ enum OwnerToolSheet: String, Identifiable {
     case editClub
     case members
     case analytics
+    case roleHistory  // Audit trail of every role change in this club
 
     var id: String { rawValue }
 }
@@ -353,6 +353,10 @@ struct OwnerCreateGameSheet: View {
                 }
             }
             .task {
+                // Refresh entitlements first so feature gates (delayed publishing,
+                // recurring games, payments) reflect a recent upgrade even if the
+                // Stripe webhook landed after the paywall's polling window closed.
+                await appState.fetchClubEntitlements(for: club.id)
                 savedVenues = appState.venues(for: club)
                 if savedVenues.isEmpty {
                     await appState.refreshVenues(for: club)
@@ -423,6 +427,10 @@ struct OwnerEditGameSheet: View {
 
     private var paymentsGate: GateResult {
         FeatureGateService.canAcceptPayments(appState.entitlementsByClubID[club.id])
+    }
+
+    private var delayedPublishingGate: GateResult {
+        FeatureGateService.canUseDelayedPublishing(appState.entitlementsByClubID[club.id])
     }
 
     private let gameTypeOptions: [(value: String, label: String)] = [
@@ -541,29 +549,35 @@ struct OwnerEditGameSheet: View {
                 }
 
                 Section {
-                    Toggle("Delay Publishing", isOn: Binding(
-                        get: { draft.publishAt != nil },
-                        set: { enabled in
-                            if enabled {
-                                draft.publishAt = draft.startDate.addingTimeInterval(-48 * 3600)
-                            } else {
-                                draft.publishAt = nil
-                            }
+                    if case .blocked = delayedPublishingGate {
+                        ProLockedRow(label: "Delay Publishing") {
+                            paywallFeature = .scheduledPublishing
                         }
-                    ))
-                    if let publishAt = draft.publishAt {
-                        DatePicker(
-                            "Publish At",
-                            selection: Binding(
-                                get: { draft.publishAt ?? draft.startDate.addingTimeInterval(-48 * 3600) },
-                                set: { draft.publishAt = $0 }
-                            ),
-                            in: Date()...,
-                            displayedComponents: [.date, .hourAndMinute]
-                        )
-                        Text(editPublishOffsetLabel(publishAt: publishAt, gameStart: draft.startDate))
-                            .font(.caption)
-                            .foregroundStyle(publishAt <= Date() ? Brand.errorRed : .secondary)
+                    } else {
+                        Toggle("Delay Publishing", isOn: Binding(
+                            get: { draft.publishAt != nil },
+                            set: { enabled in
+                                if enabled {
+                                    draft.publishAt = draft.startDate.addingTimeInterval(-48 * 3600)
+                                } else {
+                                    draft.publishAt = nil
+                                }
+                            }
+                        ))
+                        if let publishAt = draft.publishAt {
+                            DatePicker(
+                                "Publish At",
+                                selection: Binding(
+                                    get: { draft.publishAt ?? draft.startDate.addingTimeInterval(-48 * 3600) },
+                                    set: { draft.publishAt = $0 }
+                                ),
+                                in: Date()...,
+                                displayedComponents: [.date, .hourAndMinute]
+                            )
+                            Text(editPublishOffsetLabel(publishAt: publishAt, gameStart: draft.startDate))
+                                .font(.caption)
+                                .foregroundStyle(publishAt <= Date() ? Brand.errorRed : .secondary)
+                        }
                     }
                 } header: {
                     Text("Publishing")
@@ -611,6 +625,10 @@ struct OwnerEditGameSheet: View {
                 }
             }
             .task {
+                // Refresh entitlements first so the delayed publishing gate reflects
+                // a recent upgrade even if the Stripe webhook landed after the
+                // paywall's polling window closed.
+                await appState.fetchClubEntitlements(for: club.id)
                 // Venues may already be seeded from init. Only fetch if missing.
                 if savedVenues.isEmpty {
                     await appState.refreshVenues(for: club)
@@ -885,6 +903,7 @@ struct OwnerMemberDetailSheet: View {
     let member: ClubOwnerMember
     @State private var confirmRemove = false
     @State private var confirmBlock = false
+    @State private var confirmTransfer = false
     @State private var showDUPRUpdateSheet = false
 
     private var liveMember: ClubOwnerMember {
@@ -1088,6 +1107,18 @@ struct OwnerMemberDetailSheet: View {
                         }
                         .disabled(appState.isUpdatingOwnerAdminAccess(for: liveMember.userID) || appState.isModeratingOwnerMember(liveMember.userID))
 
+                        Button { confirmTransfer = true } label: {
+                            HStack {
+                                if appState.isUpdatingOwnerAdminAccess(for: liveMember.userID) {
+                                    ProgressView()
+                                } else {
+                                    Image(systemName: "crown.fill")
+                                }
+                                Text("Transfer Ownership")
+                            }
+                        }
+                        .disabled(appState.isUpdatingOwnerAdminAccess(for: liveMember.userID) || appState.isModeratingOwnerMember(liveMember.userID))
+
                         Button(role: .destructive) { confirmRemove = true } label: {
                             HStack {
                                 Image(systemName: "person.fill.xmark")
@@ -1194,6 +1225,27 @@ struct OwnerMemberDetailSheet: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("This blocks the member from the club and removes access.")
+            }
+            .confirmationDialog(
+                "Transfer ownership to \(liveMember.memberName)?",
+                isPresented: $confirmTransfer,
+                titleVisibility: .visible
+            ) {
+                Button("Transfer — I'll stay as Admin") {
+                    Task {
+                        await appState.transferClubOwnership(in: club, newOwnerID: liveMember.userID, oldOwnerNewRole: "admin")
+                        dismiss()
+                    }
+                }
+                Button("Transfer — I'll become a Member") {
+                    Task {
+                        await appState.transferClubOwnership(in: club, newOwnerID: liveMember.userID, oldOwnerNewRole: "member")
+                        dismiss()
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("They become the club owner. You stop being owner immediately and can no longer transfer ownership back without the new owner's action.")
             }
         }
     }
@@ -1345,9 +1397,9 @@ struct ClubFormBody: View {
 
     // Stripe Connect — managed by StripeConnectStatusSection
     // Subscription state (Phase 4)
-    @State private var subscriptionPaymentError: String? = nil
     @State private var showCancelSubscriptionConfirm = false
     @State private var isCancellingSubscription = false
+    @State private var paywallFeature: LockedFeature? = nil
 
     // Custom image upload state
     @State private var avatarPhotoItem: PhotosPickerItem? = nil
@@ -1918,9 +1970,6 @@ struct ClubFormBody: View {
                                 .foregroundStyle(.red)
                         }
 
-                        if let err = subscriptionPaymentError {
-                            Text(err).font(.caption).foregroundStyle(.red)
-                        }
                         if let err = appState.subscriptionError {
                             Text(err).font(.caption).foregroundStyle(.red)
                         }
@@ -1985,9 +2034,6 @@ struct ClubFormBody: View {
                             .font(.caption)
                             .foregroundStyle(Brand.mutedText)
 
-                        if let err = subscriptionPaymentError {
-                            Text(err).font(.caption).foregroundStyle(.red)
-                        }
                         if let err = appState.subscriptionError {
                             Text(err).font(.caption).foregroundStyle(.red)
                         }
@@ -2010,82 +2056,30 @@ struct ClubFormBody: View {
             } // if let club (Plan & Billing)
 
         }
+        .sheet(item: $paywallFeature) { feature in
+            if let club {
+                ClubUpgradePaywallView(club: club, lockedFeature: feature)
+                    .environmentObject(appState)
+            }
+        }
     }
 
+    /// Routes every plan/upgrade CTA in this billing section to the canonical paywall.
+    /// `priceID` is ignored — `ClubUpgradePaywallView` is the single source of truth for
+    /// plan selection, Stripe presentation, polling, and entitlement refresh.
     @ViewBuilder
     private func subscriptionUpgradeButton(label: String, priceID: String, club: Club) -> some View {
         Button {
-            guard !appState.isCreatingSubscription, !priceID.isEmpty else {
-                if priceID.isEmpty {
-                    subscriptionPaymentError = "Plan pricing hasn't loaded yet. Please try again."
-                }
-                return
-            }
-            Task {
-                guard let result = await appState.createClubSubscription(for: club, priceID: priceID) else { return }
-                if let secret = result.clientSecret {
-                    var config = PaymentSheet.Configuration()
-                    config.merchantDisplayName = "Book A Dink"
-                    config.applePay = .init(merchantId: "merchant.com.bookadink", merchantCountryCode: "AU")
-                    let ps = PaymentSheet(paymentIntentClientSecret: secret, configuration: config)
-                    presentSubscriptionPaymentSheet(ps, for: club)
-                } else if result.status == "active" {
-                    await appState.fetchClubSubscription(for: club.id)
-                    await appState.fetchClubEntitlements(for: club.id)
-                }
-            }
+            paywallFeature = .managePlan
         } label: {
-            HStack {
-                if appState.isCreatingSubscription {
-                    ProgressView().tint(.white)
-                }
-                Text(appState.isCreatingSubscription ? "Please wait…" : label)
-                    .font(.subheadline.weight(.semibold))
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
-            .foregroundStyle(.white)
-            .background(Brand.pineTeal, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            Text(label)
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .foregroundStyle(.white)
+                .background(Brand.pineTeal, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(.plain)
-        .disabled(appState.isCreatingSubscription)
-    }
-
-    /// Present Stripe PaymentSheet from the topmost UIViewController.
-    /// Using the root VC fails when it is already presenting the settings sheet.
-    private func presentSubscriptionPaymentSheet(_ paymentSheet: PaymentSheet, for club: Club) {
-        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
-            subscriptionPaymentError = "Unable to present payment screen."
-            return
-        }
-        // Walk to the topmost presented VC so we don't present over the root.
-        var top: UIViewController = root
-        while let presented = top.presentedViewController {
-            top = presented
-        }
-        paymentSheet.present(from: top) { result in
-            DispatchQueue.main.async {
-                switch result {
-                case .completed:
-                    subscriptionPaymentError = nil
-                    // Poll until the webhook flips status → active (usually < 2s in test mode).
-                    Task {
-                        for delaySecs in [2.0, 3.0, 4.0, 5.0, 7.0, 10.0] {
-                            try? await Task.sleep(nanoseconds: UInt64(delaySecs * 1_000_000_000))
-                            await appState.fetchClubSubscription(for: club.id)
-                            if appState.subscriptionsByClubID[club.id]?.isActive == true { break }
-                        }
-                        // Refresh entitlements so gated UI unlocks immediately.
-                        await appState.fetchClubEntitlements(for: club.id)
-                    }
-                case .canceled:
-                    break
-                case .failed(let error):
-                    subscriptionPaymentError = error.localizedDescription
-                }
-            }
-        }
     }
 
     @MainActor
@@ -3516,9 +3510,9 @@ struct ClubPlanBillingSettingsView: View {
     @EnvironmentObject private var appState: AppState
     let club: Club
 
-    @State private var subscriptionPaymentError: String?
     @State private var showCancelSubscriptionConfirm = false
     @State private var isCancellingSubscription = false
+    @State private var paywallFeature: LockedFeature? = nil
 
     private struct PlanDisplayRow: Identifiable {
         let id: String
@@ -3599,13 +3593,6 @@ struct ClubPlanBillingSettingsView: View {
                             in: RoundedRectangle(cornerRadius: 18, style: .continuous))
 
                 // Error / state messages
-                if let err = subscriptionPaymentError {
-                    Text(err).font(.subheadline).foregroundStyle(Brand.errorRed)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
-                        .background(Brand.errorRed.opacity(0.08),
-                                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                }
                 if let err = appState.subscriptionError {
                     Text(err).font(.subheadline).foregroundStyle(Brand.errorRed)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3698,7 +3685,10 @@ struct ClubPlanBillingSettingsView: View {
         .background(Brand.appBackground)
         .navigationTitle("Plan & Billing")
         .navigationBarTitleDisplayMode(.inline)
-        .task { await appState.fetchClubSubscription(for: club.id) }
+        .task {
+            await appState.fetchClubSubscription(for: club.id)
+            await appState.fetchClubEntitlements(for: club.id)
+        }
         .confirmationDialog("Cancel Subscription?", isPresented: $showCancelSubscriptionConfirm, titleVisibility: .visible) {
             Button("Cancel Subscription", role: .destructive) {
                 isCancellingSubscription = true
@@ -3712,71 +3702,28 @@ struct ClubPlanBillingSettingsView: View {
         } message: {
             Text("Your subscription will remain active until the end of the billing period, then automatically end.")
         }
+        .sheet(item: $paywallFeature) { feature in
+            ClubUpgradePaywallView(club: club, lockedFeature: feature)
+                .environmentObject(appState)
+        }
     }
 
+    /// Routes every plan card CTA in this view to the canonical paywall.
+    /// `priceID` is ignored — `ClubUpgradePaywallView` is the single source of truth for
+    /// plan selection, Stripe presentation, polling, and entitlement refresh.
     @ViewBuilder
     private func subscriptionUpgradeButton(label: String, priceID: String) -> some View {
         Button {
-            guard !appState.isCreatingSubscription, !priceID.isEmpty else {
-                if priceID.isEmpty {
-                    subscriptionPaymentError = "Plan pricing hasn't loaded yet. Please try again."
-                }
-                return
-            }
-            Task {
-                guard let result = await appState.createClubSubscription(for: club, priceID: priceID) else { return }
-                if let secret = result.clientSecret {
-                    var config = PaymentSheet.Configuration()
-                    config.merchantDisplayName = "Book A Dink"
-                    config.applePay = .init(merchantId: "merchant.com.bookadink", merchantCountryCode: "AU")
-                    let ps = PaymentSheet(paymentIntentClientSecret: secret, configuration: config)
-                    presentSubscriptionPaymentSheet(ps)
-                } else if result.status == "active" {
-                    await appState.fetchClubSubscription(for: club.id)
-                    await appState.fetchClubEntitlements(for: club.id)
-                }
-            }
+            paywallFeature = .managePlan
         } label: {
-            HStack {
-                if appState.isCreatingSubscription { ProgressView().tint(.white) }
-                Text(appState.isCreatingSubscription ? "Please wait…" : label)
-                    .font(.system(size: 13.5, weight: .bold))
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
-            .foregroundStyle(.white)
-            .background(Brand.primaryText, in: RoundedRectangle(cornerRadius: 999, style: .continuous))
+            Text(label)
+                .font(.system(size: 13.5, weight: .bold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .foregroundStyle(.white)
+                .background(Brand.primaryText, in: RoundedRectangle(cornerRadius: 999, style: .continuous))
         }
         .buttonStyle(.plain)
-        .disabled(appState.isCreatingSubscription)
-    }
-
-    private func presentSubscriptionPaymentSheet(_ paymentSheet: PaymentSheet) {
-        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
-            subscriptionPaymentError = "Unable to present payment screen."
-            return
-        }
-        var top: UIViewController = root
-        while let presented = top.presentedViewController { top = presented }
-        paymentSheet.present(from: top) { result in
-            DispatchQueue.main.async {
-                switch result {
-                case .completed:
-                    subscriptionPaymentError = nil
-                    Task {
-                        for delaySecs in [2.0, 3.0, 4.0, 5.0, 7.0, 10.0] {
-                            try? await Task.sleep(nanoseconds: UInt64(delaySecs * 1_000_000_000))
-                            await appState.fetchClubSubscription(for: club.id)
-                            if appState.subscriptionsByClubID[club.id]?.isActive == true { break }
-                        }
-                        await appState.fetchClubEntitlements(for: club.id)
-                    }
-                case .canceled: break
-                case .failed(let error): subscriptionPaymentError = error.localizedDescription
-                }
-            }
-        }
     }
 }
 
@@ -5840,5 +5787,156 @@ struct ProLockedRow: View {
             }
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Role History (audit trail)
+
+struct OwnerRoleHistorySheet: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+
+    let club: Club
+
+    private var entries: [ClubRoleAuditEntry] { appState.roleHistory(for: club) }
+    private var isLoading: Bool { appState.isLoadingRoleHistory(for: club) }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if isLoading && entries.isEmpty {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Loading role history…")
+                            .foregroundStyle(.secondary)
+                            .font(.subheadline)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if entries.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 36, weight: .light))
+                            .foregroundStyle(.secondary)
+                        Text("No role changes yet")
+                            .font(.headline)
+                        Text("Promotions, demotions, and ownership transfers will show here.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(entries) { entry in
+                        RoleHistoryRow(entry: entry)
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            }
+            .navigationTitle("Role History")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Close") { dismiss() }
+                }
+            }
+            .refreshable {
+                await appState.refreshClubRoleHistory(for: club)
+            }
+            .task {
+                if entries.isEmpty {
+                    await appState.refreshClubRoleHistory(for: club)
+                }
+            }
+        }
+    }
+}
+
+private struct RoleHistoryRow: View {
+    let entry: ClubRoleAuditEntry
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .abbreviated
+        return f
+    }()
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: iconName)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(iconTint)
+                .frame(width: 28, height: 28)
+                .background(iconTint.opacity(0.12), in: Circle())
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(headline)
+                    .font(.subheadline.weight(.semibold))
+                Text(subline)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Text(Self.relativeFormatter.localizedString(for: entry.createdAt, relativeTo: Date()))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize()
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var headline: String {
+        switch entry.changeType {
+        case "promoted_to_admin":
+            return "\(entry.targetName) became an admin"
+        case "demoted_to_member":
+            return "\(entry.targetName) was demoted to member"
+        case "transferred_in":
+            return "\(entry.targetName) became the owner"
+        case "transferred_out_to_admin":
+            return "\(entry.targetName) stepped down as owner (now admin)"
+        case "transferred_out_to_member":
+            return "\(entry.targetName) stepped down as owner (now member)"
+        case "club_created":
+            return "\(entry.targetName) created the club"
+        case "member_removed_cascade":
+            let role = entry.oldRole ?? "member"
+            return "\(entry.targetName) was removed (was \(role))"
+        case "self_relinquished":
+            return "\(entry.targetName) relinquished admin access"
+        default:
+            return "\(entry.targetName): \(entry.changeType)"
+        }
+    }
+
+    private var subline: String {
+        if let actor = entry.actorUserID, actor == entry.targetUserID {
+            return "by themself"
+        }
+        return "by \(entry.actorName)"
+    }
+
+    private var iconName: String {
+        switch entry.changeType {
+        case "promoted_to_admin":          return "person.badge.plus"
+        case "demoted_to_member":          return "person.badge.minus"
+        case "transferred_in":             return "crown.fill"
+        case "transferred_out_to_admin",
+             "transferred_out_to_member":  return "crown"
+        case "club_created":               return "sparkles"
+        case "member_removed_cascade":     return "person.fill.xmark"
+        case "self_relinquished":          return "arrow.uturn.down"
+        default:                           return "clock.arrow.circlepath"
+        }
+    }
+
+    private var iconTint: Color {
+        switch entry.changeType {
+        case "promoted_to_admin", "transferred_in", "club_created": return Brand.pineTeal
+        case "demoted_to_member", "transferred_out_to_admin",
+             "transferred_out_to_member":                            return Brand.spicyOrange
+        case "member_removed_cascade":                               return Brand.errorRed
+        default:                                                     return Brand.mutedText
+        }
     }
 }

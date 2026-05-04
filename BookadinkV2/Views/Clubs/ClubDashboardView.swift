@@ -276,6 +276,8 @@ struct ClubDashboardView: View {
             OwnerMembersSheet(club: club).environmentObject(appState)
         case .analytics:
             AnalyticsSheet(club: club).environmentObject(appState)
+        case .roleHistory:
+            OwnerRoleHistorySheet(club: club).environmentObject(appState)
         }
     }
 
@@ -716,6 +718,11 @@ struct ClubDashboardView: View {
                     navCard(title: "Club Settings", icon: "slider.horizontal.3",
                             bullets: ["Images, courts, rules & visibility"],
                             locked: false) { childSheet = .editClub }
+                    if appState.isClubOwner(for: club) {
+                        navCard(title: "Role History", icon: "clock.arrow.circlepath",
+                                bullets: ["Audit trail of every role change in this club"],
+                                locked: false) { childSheet = .roleHistory }
+                    }
                 }
             } else {
                 navCard(title: "Games", icon: "calendar",
@@ -730,6 +737,11 @@ struct ClubDashboardView: View {
                 navCard(title: "Club Settings", icon: "slider.horizontal.3",
                         bullets: ["Images, courts, rules & visibility"],
                         locked: false) { childSheet = .editClub }
+                if appState.isClubOwner(for: club) {
+                    navCard(title: "Role History", icon: "clock.arrow.circlepath",
+                            bullets: ["Audit trail of every role change in this club"],
+                            locked: false) { childSheet = .roleHistory }
+                }
             }
         }
     }

@@ -161,6 +161,7 @@ serve(async (req: Request) => {
   // Fetch enrichment data and build type-specific HTML
   // ------------------------------------------------------------------
   let htmlBody: string;
+  let subject: string = notification.title;
 
   if (GAME_TYPES.has(notifType) && refID) {
     const { data: game } = await supabase
@@ -189,6 +190,22 @@ serve(async (req: Request) => {
         body: notification.body,
       });
     } else {
+      // Booking-confirmed gets a richer subject + an inbox preview line.
+      // Other notification types keep the existing copy.
+      let preheader: string | undefined;
+      if (notifType === "booking_confirmed" && game) {
+        const tz = club?.timezone || FALLBACK_TZ;
+        if (game.title) {
+          subject = `Booking confirmed — ${game.title}`;
+        }
+        const venueForPreview = (game.venue_name ?? club?.venue_name ?? "").trim();
+        const previewParts = [
+          formatPreviewDate(game.date_time, tz),
+          formatTime(game.date_time, tz),
+        ];
+        if (venueForPreview) previewParts.push(venueForPreview);
+        preheader = previewParts.filter(Boolean).join(" · ");
+      }
       htmlBody = buildGameEmail({
         firstName,
         title: notification.title,
@@ -196,6 +213,7 @@ serve(async (req: Request) => {
         game: game ?? null,
         club,
         clubTZ: club?.timezone || FALLBACK_TZ,
+        preheader,
       });
     }
   } else if (CLUB_TYPES.has(notifType) && refID) {
@@ -229,7 +247,7 @@ serve(async (req: Request) => {
     body: JSON.stringify({
       from: emailFrom,
       to: [profile.email],
-      subject: notification.title,
+      subject,
       html: htmlBody,
     }),
   });
@@ -270,6 +288,19 @@ function formatTime(iso: string, tz: string): string {
   const d = new Date(iso);
   return d.toLocaleTimeString("en-AU", {
     hour: "numeric", minute: "2-digit", hour12: true,
+    timeZone: tz,
+  });
+}
+
+/**
+ * Compact date for the inbox preview line: "Tuesday, 5 May" (no year).
+ * Distinct from `formatDate`, which is used in the full email body and
+ * includes the year ("Tuesday, 5 May 2026").
+ */
+function formatPreviewDate(iso: string, tz: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString("en-AU", {
+    weekday: "long", day: "numeric", month: "long",
     timeZone: tz,
   });
 }
@@ -337,8 +368,9 @@ function buildGameEmail(opts: {
   game: GameRow | null;
   club: ClubRow | null;
   clubTZ: string;
+  preheader?: string;
 }): string {
-  const { firstName, title, notifType, game, club, clubTZ } = opts;
+  const { firstName, title, notifType, game, club, clubTZ, preheader } = opts;
   const tagline = gameTagline(notifType);
   const supportText = gameSupportingText(notifType);
 
@@ -358,9 +390,7 @@ function buildGameEmail(opts: {
     : `<a href="${mapsURL}" style="font-size:13px;color:#16a34a;text-decoration:none;font-weight:500;">View on Google Maps →</a>`;
 
   return shell(`
-    ${logoRow()}
     ${titleRow(tagline)}
-    ${greetingRow(firstName)}
 
     <!-- Game card -->
     <tr>
@@ -409,9 +439,10 @@ function buildGameEmail(opts: {
       </td>
     </tr>
 
+    ${greetingRow(firstName)}
     ${supportRow(supportText)}
     ${footerRow()}
-  `);
+  `, preheader);
 }
 
 function buildClubEmail(opts: {
@@ -426,7 +457,6 @@ function buildClubEmail(opts: {
   const mapsURL = buildClubMapsURL(club);
 
   return shell(`
-    ${logoRow()}
     ${titleRow(title)}
     ${greetingRow(firstName)}
 
@@ -482,7 +512,6 @@ function buildGenericEmail(opts: {
 }): string {
   const { firstName, title, body } = opts;
   return shell(`
-    ${logoRow()}
     ${titleRow(title)}
     ${greetingRow(firstName)}
     <tr>
@@ -498,7 +527,12 @@ function buildGenericEmail(opts: {
 // Shared layout primitives
 // ---------------------------------------------------------------------------
 
-function shell(inner: string): string {
+function shell(inner: string, preheader?: string): string {
+  // Hidden span that mail clients (Gmail, Outlook, Apple Mail) read as the
+  // inbox preview text. Invisible in the rendered email itself.
+  const preheaderBlock = preheader
+    ? `<div style="display:none;font-size:1px;color:#ffffff;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">${esc(preheader)}</div>`
+    : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -507,6 +541,7 @@ function shell(inner: string): string {
   <title>Bookadink</title>
 </head>
 <body style="margin:0;padding:0;background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+  ${preheaderBlock}
   <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 16px;">
     <tr>
       <td align="center">
@@ -520,14 +555,6 @@ function shell(inner: string): string {
 </html>`;
 }
 
-function logoRow(): string {
-  return `<tr>
-    <td style="padding-bottom:32px;">
-      <p style="margin:0;font-size:17px;font-weight:700;color:#16a34a;letter-spacing:-0.2px;">Bookadink</p>
-    </td>
-  </tr>`;
-}
-
 function titleRow(text: string): string {
   return `<tr>
     <td style="padding-bottom:10px;">
@@ -539,7 +566,7 @@ function titleRow(text: string): string {
 function greetingRow(firstName: string): string {
   return `<tr>
     <td style="padding-bottom:24px;">
-      <p style="margin:0;font-size:14px;color:#6b7280;">Hey ${esc(firstName)}, here are the details.</p>
+      <p style="margin:0;font-size:14px;color:#6b7280;">Hi ${esc(firstName)},</p>
     </td>
   </tr>`;
 }

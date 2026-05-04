@@ -46,6 +46,17 @@ protocol ClubDataProviding {
     func removeMembership(clubID: UUID, userID: UUID) async throws
     func updateClubJoinRequest(requestID: UUID, status: String, respondedBy: UUID?) async throws
     func setClubAdminAccess(clubID: UUID, userID: UUID, makeAdmin: Bool) async throws
+    /// Atomically transfers club ownership via the transfer_club_ownership RPC.
+    /// Server updates clubs.created_by, upserts new owner club_admins row to
+    /// role='owner', and demotes old owner to 'admin' or 'member' per
+    /// oldOwnerNewRole. All under a clubs row lock.
+    func transferClubOwnership(clubID: UUID, newOwnerID: UUID, oldOwnerNewRole: String) async throws
+    /// Reads up to `limit` recent role-change audit entries via the
+    /// get_club_role_history RPC. Caller must be club owner or admin.
+    func fetchClubRoleHistory(clubID: UUID, limit: Int) async throws -> [ClubRoleAuditEntry]
+    /// Aggregated counts of role changes by change_type in the last `days`
+    /// via get_club_role_change_summary. Caller must be owner or admin.
+    func fetchClubRoleChangeSummary(clubID: UUID, days: Int) async throws -> [ClubRoleChangeSummary]
     func adminUpdateMemberDUPR(memberUserID: UUID, rating: Double) async throws
     func createClub(createdBy: UUID, draft: ClubOwnerEditDraft) async throws -> Club
     func createGame(for clubID: UUID, createdBy: UUID, draft: ClubOwnerGameDraft, recurrenceGroupID: UUID?) async throws -> Game
@@ -145,10 +156,6 @@ protocol ClubDataProviding {
     // MARK: - Credits (Phase 2)
     /// Fetches the credit balance for a specific user at a specific club.
     func fetchCreditBalance(userID: UUID, clubID: UUID) async throws -> Int
-    // MARK: - Waitlist Promotion (Phase 3)
-    /// Atomically promotes a waitlisted booking to `pending_payment` with a timed hold.
-    /// Returns `true` if the promotion succeeded.
-    func promoteWaitlistPlayer(gameID: UUID, bookingID: UUID, holdMinutes: Int) async throws -> Bool
     /// Atomically deducts `amountCents` from the user's club-scoped credit balance. Returns `true` on success.
     func applyCredits(userID: UUID, bookingID: UUID, amountCents: Int, clubID: UUID) async throws -> Bool
 
@@ -196,6 +203,9 @@ enum SupabaseServiceError: LocalizedError {
     case membershipRequired
     case duprRequired
     case missingSession
+    case notAuthorized
+    case invalidPayload
+    case rateLimited
     case httpStatus(Int, String)
     case decoding(String)
     case network(String)
@@ -220,6 +230,12 @@ enum SupabaseServiceError: LocalizedError {
             return "A valid DUPR ID is required to book this game."
         case .missingSession:
             return "No authenticated session is available."
+        case .notAuthorized:
+            return "You don't have permission to perform this action."
+        case .invalidPayload:
+            return "The request was rejected as invalid."
+        case .rateLimited:
+            return "Too many role changes in a short time. Please wait a minute and try again."
         case let .httpStatus(code, body):
             return "Supabase request failed (\(code)): \(body)"
         case let .decoding(message):
@@ -1608,37 +1624,198 @@ final class SupabaseService: ClubDataProviding {
             throw SupabaseServiceError.authenticationRequired
         }
 
-        if makeAdmin {
-            let body = ClubAdminUpsertBody(clubID: clubID, userID: userID, role: .admin)
-            let _: [ClubAdminRow] = try await send(
-                path: "club_admins",
-                queryItems: [
-                    .init(name: "select", value: "club_id,user_id,role"),
-                    .init(name: "on_conflict", value: "club_id,user_id")
-                ],
+        struct Params: Encodable {
+            let pClubID: UUID
+            let pUserID: UUID
+            enum CodingKeys: String, CodingKey {
+                case pClubID = "p_club_id"
+                case pUserID = "p_user_id"
+            }
+        }
+        struct EmptyRPCResponse: Decodable {}
+
+        let rpcPath = makeAdmin ? "rpc/promote_club_member_to_admin" : "rpc/demote_club_admin_to_member"
+        do {
+            let _: [EmptyRPCResponse] = try await send(
+                path: rpcPath,
+                queryItems: [],
                 method: "POST",
-                body: try JSONEncoder().encode([body]),
+                body: try JSONEncoder().encode(Params(pClubID: clubID, pUserID: userID)),
                 authBearerToken: authToken,
-                extraHeaders: [
-                    "Prefer": "resolution=merge-duplicates,return=representation",
-                    "Content-Type": "application/json"
-                ]
+                extraHeaders: ["Content-Type": "application/json"]
             )
-        } else {
-            let _: [ClubAdminRow] = try await send(
-                path: "club_admins",
-                queryItems: [
-                    .init(name: "club_id", value: "eq.\(clubID.uuidString)"),
-                    .init(name: "user_id", value: "eq.\(userID.uuidString)"),
-                    .init(name: "select", value: "club_id,user_id,role")
-                ],
-                method: "DELETE",
-                body: nil,
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(_, body) = error {
+                if body.contains("rate_limited") { throw SupabaseServiceError.rateLimited }
+                if body.contains("forbidden_owner_only") { throw SupabaseServiceError.notAuthorized }
+                if body.contains("cannot_modify_self") { throw SupabaseServiceError.invalidPayload }
+                if body.contains("cannot_demote_owner") { throw SupabaseServiceError.invalidPayload }
+                if body.contains("target_not_approved_member") { throw SupabaseServiceError.notFound }
+                if body.contains("club_not_found") { throw SupabaseServiceError.notFound }
+            }
+            throw error
+        }
+    }
+
+    func transferClubOwnership(clubID: UUID, newOwnerID: UUID, oldOwnerNewRole: String) async throws {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        guard oldOwnerNewRole == "admin" || oldOwnerNewRole == "member" else {
+            throw SupabaseServiceError.invalidPayload
+        }
+
+        struct Params: Encodable {
+            let pClubID: UUID
+            let pNewOwnerID: UUID
+            let pOldOwnerNewRole: String
+            enum CodingKeys: String, CodingKey {
+                case pClubID = "p_club_id"
+                case pNewOwnerID = "p_new_owner_id"
+                case pOldOwnerNewRole = "p_old_owner_new_role"
+            }
+        }
+        struct EmptyRPCResponse: Decodable {}
+
+        do {
+            let _: [EmptyRPCResponse] = try await send(
+                path: "rpc/transfer_club_ownership",
+                queryItems: [],
+                method: "POST",
+                body: try JSONEncoder().encode(Params(
+                    pClubID: clubID,
+                    pNewOwnerID: newOwnerID,
+                    pOldOwnerNewRole: oldOwnerNewRole
+                )),
                 authBearerToken: authToken,
-                extraHeaders: [
-                    "Prefer": "return=representation"
-                ]
+                extraHeaders: ["Content-Type": "application/json"]
             )
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(_, body) = error {
+                if body.contains("rate_limited") { throw SupabaseServiceError.rateLimited }
+                if body.contains("forbidden_owner_only") { throw SupabaseServiceError.notAuthorized }
+                if body.contains("invalid_old_owner_role") { throw SupabaseServiceError.invalidPayload }
+                if body.contains("new_owner_not_approved_member") { throw SupabaseServiceError.notFound }
+                if body.contains("club_not_found") { throw SupabaseServiceError.notFound }
+            }
+            throw error
+        }
+    }
+
+    func fetchClubRoleHistory(clubID: UUID, limit: Int) async throws -> [ClubRoleAuditEntry] {
+        guard SupabaseConfig.isConfigured else { return [] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubID: UUID
+            let pLimit: Int
+            enum CodingKeys: String, CodingKey {
+                case pClubID = "p_club_id"
+                case pLimit  = "p_limit"
+            }
+        }
+        struct Row: Decodable {
+            let id: UUID
+            let clubID: UUID
+            let targetUserID: UUID
+            let targetName: String?
+            let actorUserID: UUID?
+            let actorName: String?
+            let changeType: String
+            let oldRole: String?
+            let newRole: String?
+            let reason: String?
+            let createdAtRaw: String?
+            enum CodingKeys: String, CodingKey {
+                case id
+                case clubID         = "club_id"
+                case targetUserID   = "target_user_id"
+                case targetName     = "target_name"
+                case actorUserID    = "actor_user_id"
+                case actorName      = "actor_name"
+                case changeType     = "change_type"
+                case oldRole        = "old_role"
+                case newRole        = "new_role"
+                case reason
+                case createdAtRaw   = "created_at"
+            }
+        }
+
+        do {
+            let rows: [Row] = try await send(
+                path: "rpc/get_club_role_history",
+                queryItems: [],
+                method: "POST",
+                body: try JSONEncoder().encode(Params(pClubID: clubID, pLimit: limit)),
+                authBearerToken: authToken,
+                extraHeaders: ["Content-Type": "application/json"]
+            )
+            return rows.map { row in
+                ClubRoleAuditEntry(
+                    id: row.id,
+                    clubID: row.clubID,
+                    targetUserID: row.targetUserID,
+                    targetName: (row.targetName ?? "").isEmpty ? "(unknown)" : row.targetName!,
+                    actorUserID: row.actorUserID,
+                    actorName: (row.actorName ?? "").isEmpty ? "—" : row.actorName!,
+                    changeType: row.changeType,
+                    oldRole: row.oldRole,
+                    newRole: row.newRole,
+                    reason: row.reason,
+                    createdAt: row.createdAtRaw.flatMap(SupabaseDateParser.parse) ?? Date()
+                )
+            }
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(_, body) = error {
+                if body.contains("forbidden_owner_or_admin_only") { throw SupabaseServiceError.notAuthorized }
+                if body.contains("club_not_found") { throw SupabaseServiceError.notFound }
+            }
+            throw error
+        }
+    }
+
+    func fetchClubRoleChangeSummary(clubID: UUID, days: Int) async throws -> [ClubRoleChangeSummary] {
+        guard SupabaseConfig.isConfigured else { return [] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pClubID: UUID
+            let pDays: Int
+            enum CodingKeys: String, CodingKey {
+                case pClubID = "p_club_id"
+                case pDays   = "p_days"
+            }
+        }
+        struct Row: Decodable {
+            let changeType: String
+            let eventCount: Int
+            enum CodingKeys: String, CodingKey {
+                case changeType = "change_type"
+                case eventCount = "event_count"
+            }
+        }
+
+        do {
+            let rows: [Row] = try await send(
+                path: "rpc/get_club_role_change_summary",
+                queryItems: [],
+                method: "POST",
+                body: try JSONEncoder().encode(Params(pClubID: clubID, pDays: days)),
+                authBearerToken: authToken,
+                extraHeaders: ["Content-Type": "application/json"]
+            )
+            return rows.map { ClubRoleChangeSummary(changeType: $0.changeType, count: $0.eventCount) }
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(_, body) = error {
+                if body.contains("forbidden_owner_or_admin_only") { throw SupabaseServiceError.notAuthorized }
+                if body.contains("club_not_found") { throw SupabaseServiceError.notFound }
+            }
+            throw error
         }
     }
 
@@ -3916,55 +4093,15 @@ final class SupabaseService: ClubDataProviding {
     }
 
 
-    // MARK: - Waitlist Promotion (Phase 3)
-
-    func promoteWaitlistPlayer(gameID: UUID, bookingID: UUID, holdMinutes: Int) async throws -> Bool {
-        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
-        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
-            throw SupabaseServiceError.authenticationRequired
-        }
-
-        // NOTE: The promote_waitlist_player RPC returns PGRST202 — PostgREST's schema cache
-        // does not pick up this function (same pattern as use_credits / issue_cancellation_credit).
-        // Reimplemented as a direct PATCH on bookings, same approach as applyCredits.
-        //
-        // Atomicity: the status=eq.waitlisted filter means the PATCH only applies if the
-        // booking is still waitlisted — if the DB trigger promote_top_waitlisted() already
-        // promoted it (fires on confirmed→cancelled), the PATCH affects 0 rows and we return
-        // false, which the caller treats as a safe no-op.
-
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-        let holdExpiry = iso.string(from: Date().addingTimeInterval(Double(holdMinutes) * 60))
-        let nowStr     = iso.string(from: Date())
-
-        let body = try JSONSerialization.data(withJSONObject: [
-            "status":            "pending_payment",
-            "waitlist_position": NSNull(),
-            "hold_expires_at":   holdExpiry,
-            "promoted_at":       nowStr
-        ])
-
-        let rows: [BookingRow] = try await send(
-            path: "bookings",
-            queryItems: [
-                .init(name: "id",     value: "eq.\(bookingID.uuidString.lowercased())"),
-                .init(name: "status", value: "eq.waitlisted"),
-                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at")
-            ],
-            method: "PATCH",
-            body: body,
-            authBearerToken: authToken,
-            extraHeaders: [
-                "Prefer":       "return=representation",
-                "Content-Type": "application/json"
-            ]
-        )
-
-        // true  = booking was waitlisted and is now promoted to pending_payment
-        // false = booking was no longer waitlisted (trigger already handled it, or it was cancelled)
-        return !rows.isEmpty
-    }
+    // Waitlist promotion is server-authoritative — handled by the
+    // promote_top_waitlisted trigger (confirmed→cancelled) and the
+    // revert_expired_holds_and_repromote cron (hold expiry). The client-side
+    // promoteWaitlistPlayer was removed on 2026-05-02 after a 5/4 over-booking
+    // incident: it did a direct PATCH with no games row lock and no
+    // confirmed+pending_payment count, so a stale-state admin client could
+    // double-promote when the trigger had already promoted the same spot.
+    // The promote_waitlist_player DB RPC remains as a manual admin/SQL safety
+    // net (see migration 20260501_promote_waitlist_player_active_seats.sql).
 
     func fetchClubAdminUserIDs(clubID: UUID) async throws -> [UUID] {
         guard SupabaseConfig.isConfigured else { return [] }
