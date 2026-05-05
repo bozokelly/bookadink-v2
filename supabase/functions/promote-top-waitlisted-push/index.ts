@@ -7,9 +7,19 @@
 //   - Stale token (APNs 410) clears profiles.push_token automatically
 //   - Game date included in push body for context
 //
+// Changes from v2 (2026-05-05):
+//   - Multi-device fan-out: reads every APNs token from push_tokens via the
+//     shared helper, falling back to profiles.push_token only when the table
+//     is empty. Each device receives its own APNs payload; per-token failures
+//     do not abort the others. Stale tokens (410) are deleted from push_tokens
+//     and from profiles.push_token only when they match (so a still-valid
+//     legacy token on the profile row is not collateral damage).
+//   - One notifications row is still inserted per promotion event.
+//
 // Deploy: supabase functions deploy promote-top-waitlisted-push --no-verify-jwt
 
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "../_shared/push-tokens.ts";
 
 const FALLBACK_TZ = "Australia/Perth";
 
@@ -52,11 +62,14 @@ Deno.serve(async (req) => {
       ? ` · ${clubName}`
       : "";
 
-    // Fetch preference and profile (push token) concurrently
-    const [prefResult, profileResult] = await Promise.all([
-      supabase.from("notification_preferences").select("waitlist_push").eq("user_id", user_id).single(),
-      supabase.from("profiles").select("push_token").eq("id", user_id).single(),
-    ]);
+    // Fetch preference (single row). Tokens are resolved lazily below via the
+    // shared helper so the legacy profiles.push_token query only runs when
+    // push_tokens has no rows for this user (back-compat path).
+    const prefResult = await supabase
+      .from("notification_preferences")
+      .select("waitlist_push")
+      .eq("user_id", user_id)
+      .single();
 
     // Format using the club's venue timezone for consistency with in-app display
     const dateStr = rawDateTime ? formatGameDatetime(rawDateTime, clubTZ) : null;
@@ -108,36 +121,59 @@ Deno.serve(async (req) => {
       });
     }
 
-    const profile = profileResult.data;
-    if (!profile?.push_token) {
-      return new Response(JSON.stringify({ notified: true, pushed: false, reason: "no_token" }), {
+    const userShort = String(user_id).slice(0, 8);
+    const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, user_id);
+
+    if (tokens.length === 0) {
+      console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+      return new Response(JSON.stringify({ notified: true, pushed: false, reason: "no_tokens", token_count: 0, fallback_used: fallbackUsed }), {
         headers: { "Content-Type": "application/json" },
       });
     }
 
-    let pushed = false;
-    try {
-      await sendAPNS({
-        deviceToken: profile.push_token,
-        title: pushTitle,
-        body: pushBody,
-        data: { type: notifType, reference_id: game_id },
-        threadID: `game.${game_id}`,
-      });
-      pushed = true;
-    } catch (err) {
-      if (err instanceof StaleTokenError) {
-        await supabase.from("profiles").update({ push_token: null }).eq("id", user_id);
-        return new Response(JSON.stringify({ notified: true, pushed: false, reason: "stale_token_cleared" }), {
-          headers: { "Content-Type": "application/json" },
+    console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+
+    let pushedCount = 0;
+    let staleCount = 0;
+    let errorCount = 0;
+    for (const token of tokens) {
+      try {
+        await sendAPNS({
+          deviceToken: token,
+          title: pushTitle,
+          body: pushBody,
+          data: { type: notifType, reference_id: game_id },
+          threadID: `game.${game_id}`,
         });
+        pushedCount += 1;
+        console.log(`[push] sent target=${userShort} token=${tokenShort(token)} ok=true`);
+      } catch (err) {
+        if (err instanceof StaleTokenError) {
+          staleCount += 1;
+          const cleanup = await clearStaleToken(supabase, user_id, token);
+          console.log(
+            `[push] stale target=${userShort} token=${tokenShort(token)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+          );
+          continue;
+        }
+        errorCount += 1;
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[push] error target=${userShort} token=${tokenShort(token)} err=${message}`);
       }
-      console.error("APNs error:", err);
     }
 
-    return new Response(JSON.stringify({ notified: true, pushed }), {
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        notified: true,
+        pushed: pushedCount > 0,
+        token_count: tokens.length,
+        pushed_count: pushedCount,
+        stale_count: staleCount,
+        error_count: errorCount,
+        fallback_used: fallbackUsed,
+      }),
+      { headers: { "Content-Type": "application/json" } },
+    );
   } catch (error) {
     console.error("Error:", error);
     return new Response(JSON.stringify({ error: error.message }), {

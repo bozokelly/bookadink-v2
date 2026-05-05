@@ -1,0 +1,22 @@
+-- Add 'replacement_credit_issued' to the notification_type enum.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT THIS DOES
+--   Adds a new value to the existing notification_type enum. Used by the
+--   replacement-credit-issued-push Edge Function (called by the
+--   credit_on_replacement_confirmed trigger after issuing deferred credit)
+--   to insert a notifications row letting the original cancelling user know
+--   their cancelled spot was filled and credit has been added to their balance.
+--
+-- WHY A SEPARATE MIGRATION
+--   `ALTER TYPE … ADD VALUE` cannot be referenced in the same transaction
+--   that adds it (Postgres rule). Adding it here, in its own migration that
+--   is ordered BEFORE 20260505060000_credit_on_replacement_confirmed_push.sql,
+--   ensures the value is committed before any function or insert references
+--   it.
+--
+-- BLAST RADIUS
+--   Zero. Adding a new enum value cannot break existing inserts/queries —
+--   no existing code paths produce or compare against the new value yet.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'replacement_credit_issued';

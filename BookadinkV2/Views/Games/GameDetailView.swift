@@ -222,11 +222,18 @@ struct GameDetailView: View {
                     VStack(alignment: .leading, spacing: 20) {
                         tagsRowSection
                         infoGridSection
-                        playersConfirmedSection
 
                         let userInfo = currentGame.description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                         if !userInfo.isEmpty || hasDisplayableFormat {
                             aboutSection
+                        }
+
+                        if canViewAttendees {
+                            adminPlayersSection
+                        }
+
+                        if let policy = clubForGame?.cancellationPolicy, !policy.isEmpty {
+                            clubCancellationPolicyCard(policy: policy)
                         }
 
                         if let fee = currentGame.feeAmount, fee > 0 {
@@ -235,10 +242,6 @@ struct GameDetailView: View {
 
                         if currentGame.requiresDUPR {
                             duprRequirementCard
-                        }
-
-                        if let policy = clubForGame?.cancellationPolicy, !policy.isEmpty {
-                            clubCancellationPolicyCard(policy: policy)
                         }
 
                         // Error/info banners
@@ -250,11 +253,6 @@ struct GameDetailView: View {
                         }
                         if let err = appState.bookingsErrorMessage, !err.isEmpty {
                             inlineBanner(AppCopy.friendlyError(err), color: Brand.errorRed)
-                        }
-
-                        // Admin expanded players list
-                        if canViewAttendees {
-                            adminPlayersSection
                         }
                     }
                     .padding(.horizontal, 16)
@@ -568,9 +566,18 @@ struct GameDetailView: View {
     @ViewBuilder
     private var tagsRowSection: some View {
         let state = currentBookingState
+        let costValue: String = {
+            guard let fee = currentGame.feeAmount, fee > 0 else { return "Free" }
+            if fee == fee.rounded() { return "$\(Int(fee))" }
+            return String(format: "$%.2f", fee)
+        }()
+        let creditCents = appState.creditBalance(for: game.clubID)
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                // Status pill
+                // 1. Cost — neutral, data badge (always first)
+                costBadge(value: costValue)
+
+                // 2. Status — semantic colour. "You're in" is the only solid-filled badge.
                 if currentGame.status == "cancelled" {
                     tagPill("Cancelled", bg: Brand.errorRed.opacity(0.12), fg: Brand.errorRed)
                 } else if case .confirmed = state {
@@ -580,6 +587,8 @@ struct GameDetailView: View {
                     }
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Brand.primaryText)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
                     .background(Brand.accentGreen, in: Capsule())
@@ -588,25 +597,16 @@ struct GameDetailView: View {
                             bg: Brand.spicyOrange.opacity(0.12), fg: Brand.spicyOrange)
                 } else if case .pendingPayment = state {
                     tagPill("Payment due", bg: Brand.spicyOrange.opacity(0.12), fg: Brand.spicyOrange)
-                } else if isGameFull {
-                    tagPill("Full", bg: Brand.secondarySurface, fg: Brand.secondaryText)
-                } else if let left = currentGame.spotsLeft, left <= 3 {
-                    tagPill("\(left) spot\(left == 1 ? "" : "s") left",
-                            bg: Brand.errorRed.opacity(0.1), fg: Brand.errorRed)
-                } else {
-                    tagPill("Available", bg: Brand.secondarySurface, fg: Brand.secondaryText)
                 }
 
-                // Skill pill
-                let skillTag = compactSkillLabel(currentGame.skillLevel)
-                if !skillTag.isEmpty {
-                    tagPill(skillTag, bg: Brand.secondarySurface, fg: Brand.primaryText)
-                }
-
-                // Format pill
-                let fmtTag = compactFormatLabel(currentGame.gameFormat, type: currentGame.gameType)
-                if !fmtTag.isEmpty {
-                    tagPill(fmtTag, bg: Brand.secondarySurface, fg: Brand.primaryText)
+                // 3. Credits — neutral, data badge, lowest emphasis
+                if creditCents > 0 {
+                    let balanceText: String = {
+                        let dollars = Double(creditCents) / 100
+                        if dollars == dollars.rounded() { return "$\(Int(dollars))" }
+                        return String(format: "$%.2f", dollars)
+                    }()
+                    creditsBadge(value: balanceText)
                 }
             }
             .padding(.horizontal, 0)
@@ -619,10 +619,50 @@ struct GameDetailView: View {
         Text(label)
             .font(.system(size: 13, weight: .medium))
             .foregroundStyle(fg)
+            .lineLimit(1)
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
             .background(bg, in: Capsule())
             .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 1))
+    }
+
+    /// Cost · $X / Cost · Free. Neutral data badge — slightly larger than standard chips,
+    /// bold value for emphasis, no semantic colour (colour is reserved for state).
+    private func costBadge(value: String) -> some View {
+        HStack(spacing: 5) {
+            Text("Cost")
+                .fontWeight(.semibold)
+                .foregroundStyle(Brand.secondaryText)
+            Text("·")
+                .foregroundStyle(Brand.secondaryText)
+            Text(value)
+                .fontWeight(.bold)
+                .foregroundStyle(Brand.primaryText)
+        }
+        .font(.system(size: 14))
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(.horizontal, 13)
+        .padding(.vertical, 9)
+        .background(Brand.secondarySurface, in: Capsule())
+        .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 1))
+    }
+
+    /// Credits · $X. Same shape as cost, lower contrast — lowest emphasis.
+    private func creditsBadge(value: String) -> some View {
+        HStack(spacing: 5) {
+            Text("Credits")
+            Text("·")
+            Text(value)
+        }
+        .font(.system(size: 14, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(.horizontal, 13)
+        .padding(.vertical, 9)
+        .background(Brand.secondarySurface, in: Capsule())
+        .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 1))
     }
 
     // MARK: - 2×2 Info Grid
@@ -684,81 +724,6 @@ struct GameDetailView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Brand.softOutline, lineWidth: 1))
-    }
-
-    // MARK: - Players Confirmed Card
-
-    private var playersConfirmedSection: some View {
-        let liveConfirmed = !confirmedAttendees.isEmpty
-            ? confirmedAttendees.count
-            : (currentGame.confirmedCount ?? 0)
-        let maxSpots = currentGame.maxSpots
-        let remaining = max(0, maxSpots - liveConfirmed)
-        let fillFraction = maxSpots > 0 ? min(1, Double(liveConfirmed) / Double(maxSpots)) : 0
-
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Players confirmed")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Brand.primaryText)
-                Spacer()
-                Text("\(liveConfirmed)/\(maxSpots)")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Brand.primaryText)
-            }
-
-            // Progress bar
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Brand.secondarySurface)
-                        .frame(height: 6)
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Brand.accentGreen)
-                        .frame(width: geo.size.width * fillFraction, height: 6)
-                }
-            }
-            .frame(height: 6)
-
-            // Avatar row + spots remaining
-            HStack {
-                // Overlapping avatar circles
-                let preview = Array(confirmedAttendees.prefix(5))
-                ZStack(alignment: .leading) {
-                    ForEach(Array(preview.enumerated()), id: \.element.id) { idx, attendee in
-                        Circle()
-                            .fill(AvatarGradients.resolveGradient(forKey: attendee.avatarColorKey))
-                            .frame(width: 28, height: 28)
-                            .overlay(
-                                Text(initials(attendee.userName))
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .foregroundStyle(.white)
-                            )
-                            .overlay(Circle().stroke(Brand.cardBackground, lineWidth: 1.5))
-                            .offset(x: CGFloat(idx) * 18)
-                    }
-                    if confirmedAttendees.isEmpty {
-                        // Placeholder circles when no attendees loaded yet
-                        ForEach(0..<min(4, liveConfirmed), id: \.self) { idx in
-                            Circle()
-                                .fill(Brand.secondarySurface)
-                                .frame(width: 28, height: 28)
-                                .overlay(Circle().stroke(Brand.cardBackground, lineWidth: 1.5))
-                                .offset(x: CGFloat(idx) * 18)
-                        }
-                    }
-                }
-                .frame(width: CGFloat(min(5, max(liveConfirmed, 1))) * 18 + 10, height: 28)
-
-                Spacer()
-                Text(remaining == 0 ? "Game is full" : "\(remaining) spot\(remaining == 1 ? "" : "s") remaining")
-                    .font(.system(size: 13))
-                    .foregroundStyle(remaining <= 2 ? Brand.errorRed : Brand.secondaryText)
-            }
-        }
-        .padding(16)
-        .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Brand.softOutline, lineWidth: 1))
     }
 
     // MARK: - About Section
@@ -867,16 +832,42 @@ struct GameDetailView: View {
     @ViewBuilder
     private var adminPlayersSection: some View {
         if canViewAttendees {
-            VStack(alignment: .leading, spacing: 0) {
+            let liveConfirmed = !confirmedAttendees.isEmpty
+                ? confirmedAttendees.count
+                : (currentGame.confirmedCount ?? 0)
+            let maxSpots = currentGame.maxSpots
+            let remaining = max(0, maxSpots - liveConfirmed)
+            let fillFraction = maxSpots > 0 ? min(1, Double(liveConfirmed) / Double(maxSpots)) : 0
+            let isFull = liveConfirmed >= maxSpots
+
+            VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("PLAYERS REGISTERED (\(confirmedAttendees.count))")
+                    Text("PLAYERS REGISTERED (\(liveConfirmed))")
                         .font(.system(size: 11, weight: .semibold))
                         .tracking(0.8)
                         .foregroundStyle(Brand.secondaryText)
                     Spacer()
+                    Text("\(liveConfirmed)/\(maxSpots)")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Brand.primaryText)
                 }
-                .padding(.top, 4)
-                .padding(.bottom, 12)
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Brand.secondarySurface)
+                            .frame(height: 6)
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Brand.accentGreen)
+                            .frame(width: geo.size.width * fillFraction, height: 6)
+                    }
+                }
+                .frame(height: 6)
+
+                Text(isFull ? "Game is full" : "\(remaining) spot\(remaining == 1 ? "" : "s") remaining")
+                    .font(.system(size: 13))
+                    .foregroundStyle(isFull || remaining <= 2 ? Brand.errorRed : Brand.secondaryText)
+
                 playersCard
             }
         }
@@ -1663,20 +1654,12 @@ struct GameDetailView: View {
                         largeAvatarRow
                     }
 
-                    // Summary + chevron
+                    // Waitlist summary + chevron (capacity moved to section header above)
                     HStack {
-                        if !isLoading {
-                            Text("\(confirmedAttendees.count) player\(confirmedAttendees.count == 1 ? "" : "s") confirmed")
+                        if !isLoading && isOverCapacity {
+                            Text("\(waitingCount) waiting")
                                 .font(.system(size: 13))
-                                .foregroundStyle(Brand.mutedText.opacity(0.8))
-                            Text("•")
-                                .font(.system(size: 13))
-                                .foregroundStyle(Brand.mutedText.opacity(0.5))
-                            Text(isOverCapacity
-                                 ? "\(waitingCount) waiting"
-                                 : "\(spotsRemaining) spot\(spotsRemaining == 1 ? "" : "s") remaining")
-                                .font(.system(size: 13))
-                                .foregroundStyle(isOverCapacity ? Brand.spicyOrange.opacity(0.85) : Brand.mutedText.opacity(0.8))
+                                .foregroundStyle(Brand.spicyOrange.opacity(0.85))
                         }
                         Spacer()
                         Image(systemName: isPlayersExpanded ? "chevron.up" : "chevron.down")
