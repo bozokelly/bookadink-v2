@@ -277,6 +277,14 @@ struct BookADinkApp: App {
                             for clubID in appState.entitlementsByClubID.keys {
                                 await appState.fetchClubEntitlements(for: clubID)
                             }
+                            // Re-fire APNs registration on every foreground when authenticated +
+                            // already authorized. Idempotent — Apple returns the same token if
+                            // unchanged. This guarantees iPad / second-device tokens land in
+                            // push_tokens after a relaunch even though the per-launch guard in
+                            // prepareClubChatPushNotificationsIfNeeded would otherwise short-circuit.
+                            if appState.authState == .signedIn {
+                                await appState.ensureRemotePushRegistrationIfAuthorized()
+                            }
                         }
                     }
                 }

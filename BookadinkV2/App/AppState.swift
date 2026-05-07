@@ -247,6 +247,11 @@ final class AppState: ObservableObject {
                 await refreshBookings(silent: true)
                 await refreshUpcomingGames()
                 await fetchPendingReviewPrompt()
+                // Session restore (cached auth) skips the sign-in/sign-up bootstrap that
+                // normally triggers APNs registration — re-fire here so iPad / second
+                // devices always have a push_tokens row after a relaunch.
+                await ensureRemotePushRegistrationIfAuthorized()
+                await flushPendingPushTokenIfNeeded()
             }
             isInitialBootstrapComplete = true
         }
@@ -1268,21 +1273,55 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Idempotent re-registration for APNs. Does NOT prompt the user — only fires
+    /// `registerForRemoteNotifications` when authorization is already granted. Safe
+    /// to call from session-restore and every foreground without affecting permission UX.
+    func ensureRemotePushRegistrationIfAuthorized() async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await loadNotificationSettings(center)
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            let idiom: String = await MainActor.run {
+                UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+            }
+            let userIDStr = authUserID?.uuidString ?? "<no-auth>"
+            print("[push] register fire idiom=\(idiom) user=\(userIDStr) status=\(settings.authorizationStatus.rawValue)")
+            await MainActor.run {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+        default:
+            break
+        }
+    }
+
     func handleRemotePushDeviceToken(_ tokenHex: String) {
         remotePushRegistrationErrorMessage = nil
         remotePushTokenHex = tokenHex
 
-        guard let authUserID else { return }
+        let summary = AppState.tokenSummary(tokenHex)
+        let idiom = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+
+        guard let authUserID else {
+            print("[push] token received idiom=\(idiom) token=\(summary) — deferred (no auth yet)")
+            return
+        }
+
+        print("[push] token received idiom=\(idiom) user=\(authUserID.uuidString) token=\(summary)")
 
         Task {
             do {
                 try await withAuthRetry {
                     try await self.dataProvider.updateProfilePushToken(userID: authUserID, pushToken: tokenHex)
                 }
+                print("[push] upload ok idiom=\(idiom) user=\(authUserID.uuidString) token=\(summary)")
             } catch {
                 // 409 = token already stored (push_tokens has no unique constraint yet, upsert
                 // sees a conflict). The token IS registered — not an error worth surfacing.
-                if case let SupabaseServiceError.httpStatus(code, _) = error, code == 409 { return }
+                if case let SupabaseServiceError.httpStatus(code, _) = error, code == 409 {
+                    print("[push] upload 409 idiom=\(idiom) user=\(authUserID.uuidString) token=\(summary) (already stored)")
+                    return
+                }
+                print("[push] upload FAIL idiom=\(idiom) user=\(authUserID.uuidString) token=\(summary) error=\(error)")
                 // Other failures are non-fatal (local notifications still work) but worth showing
                 // so the user knows push alerts may not arrive.
                 await MainActor.run {
@@ -1290,6 +1329,12 @@ final class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    private static func tokenSummary(_ token: String) -> String {
+        guard !token.isEmpty else { return "<empty>" }
+        if token.count <= 8 { return "\(token.prefix(4))…\(token.suffix(2))" }
+        return "\(token.prefix(6))…\(token.suffix(4))"
     }
 
     func handleRemotePushRegistrationFailure(_ message: String) {

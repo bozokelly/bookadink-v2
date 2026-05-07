@@ -2716,6 +2716,52 @@ final class SupabaseService: ClubDataProviding {
             throw SupabaseServiceError.authenticationRequired
         }
 
+        let summary: String = {
+            guard let t = pushToken, !t.isEmpty else { return "<nil>" }
+            if t.count <= 8 { return "\(t.prefix(4))…\(t.suffix(2))" }
+            return "\(t.prefix(6))…\(t.suffix(4))"
+        }()
+
+        // push_tokens (multi-device source of truth) is written FIRST so a partial
+        // failure in the legacy profiles PATCH below does not block the new pipeline.
+        // The migrated push senders (`promote-top-waitlisted-push` etc.) read this
+        // table via `_shared/push-tokens.ts` and only fall back to profiles.push_token
+        // when there is no matching row.
+        if let pushToken, !pushToken.isEmpty {
+            let pushTokenBody = try JSONSerialization.data(withJSONObject: [
+                "user_id": userID.uuidString,
+                "token": pushToken
+            ])
+
+            struct PushTokenRow: Decodable { let id: UUID }
+
+            do {
+                let _: [PushTokenRow] = try await send(
+                    path: "push_tokens",
+                    queryItems: [
+                        .init(name: "select", value: "id")
+                    ],
+                    method: "POST",
+                    body: pushTokenBody,
+                    authBearerToken: authToken,
+                    extraHeaders: [
+                        "Prefer": "resolution=merge-duplicates,return=representation",
+                        "Content-Type": "application/json"
+                    ]
+                )
+                print("[push] push_tokens upsert ok user=\(userID.uuidString) token=\(summary)")
+            } catch {
+                print("[push] push_tokens upsert FAIL user=\(userID.uuidString) token=\(summary) error=\(error)")
+                throw error
+            }
+        }
+
+        // Legacy single-row column. Kept for senders that have not yet migrated to
+        // `_shared/push-tokens.ts` (booking-confirmed, club-chat-push, game reminders,
+        // etc.). When two devices share an account this column will hold whichever
+        // wrote last — that's a known limitation of the single-row design and is the
+        // exact reason push_tokens exists. Remove this block once every sender uses
+        // the helper.
         var payload: [String: Any] = [:]
         if let pushToken, !pushToken.isEmpty {
             payload["push_token"] = pushToken
@@ -2724,43 +2770,29 @@ final class SupabaseService: ClubDataProviding {
         }
         let body = try JSONSerialization.data(withJSONObject: payload)
 
-        let _: [ProfileRow] = try await send(
-            path: "profiles",
-            queryItems: [
-                .init(name: "id", value: "eq.\(userID.uuidString)"),
-                .init(name: "select", value: "id,email,full_name")
-            ],
-            method: "PATCH",
-            body: body,
-            authBearerToken: authToken,
-            extraHeaders: [
-                "Prefer": "return=representation",
-                "Content-Type": "application/json"
-            ]
-        )
-        if let pushToken, !pushToken.isEmpty {
-            let pushTokenBody = try JSONSerialization.data(withJSONObject: [
-                "user_id": userID.uuidString,
-                "token": pushToken
-            ])
-
-            struct PushTokenRow: Decodable {
-                let id: UUID
-            }
-
-            let _: [PushTokenRow] = try await send(
-                path: "push_tokens",
+        do {
+            let _: [ProfileRow] = try await send(
+                path: "profiles",
                 queryItems: [
-                    .init(name: "select", value: "id")
+                    .init(name: "id", value: "eq.\(userID.uuidString)"),
+                    .init(name: "select", value: "id,email,full_name")
                 ],
-                method: "POST",
-                body: pushTokenBody,
+                method: "PATCH",
+                body: body,
                 authBearerToken: authToken,
                 extraHeaders: [
-                    "Prefer": "resolution=merge-duplicates,return=representation",
+                    "Prefer": "return=representation",
                     "Content-Type": "application/json"
                 ]
             )
+            print("[push] profiles.push_token patch ok user=\(userID.uuidString) token=\(summary)")
+        } catch {
+            // push_tokens is already written above; the legacy patch failing should
+            // not unwind the multi-device upsert. Surface it to callers though so the
+            // existing 409 / friendly-error mapping in handleRemotePushDeviceToken
+            // still runs.
+            print("[push] profiles.push_token patch FAIL user=\(userID.uuidString) token=\(summary) error=\(error)")
+            throw error
         }
     }
 
