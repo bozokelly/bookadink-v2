@@ -7,12 +7,17 @@
 //   APNS_USE_SANDBOX — set "true" for development builds
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY — auto-injected
 //
+// Multi-device fan-out (2026-05-07): when send_push=true, the push fans out
+// to every APNs token registered for the target user (iPhone+iPad+…). The
+// in-app notification row is still inserted exactly once per call.
+//
 // Deploy: supabase functions deploy notify --no-verify-jwt
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isUUID, clampStr, VALID_NOTIFICATION_TYPES } from "../_shared/validate.ts";
 import { getCallerID } from "../_shared/auth.ts";
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "../_shared/push-tokens.ts";
 
 interface RequestBody {
   user_id: string;
@@ -80,48 +85,73 @@ serve(async (req: Request) => {
   }
 
   const notificationID = notifRow?.id ?? null;
-  let pushed = false;
+  let pushedCount = 0;
+  let tokenCount = 0;
+  let staleCount = 0;
+  let errorCount = 0;
+  let fallbackUsed = false;
 
   if (send_push) {
-    // Fetch push token
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("push_token")
-      .eq("id", user_id)
-      .single();
+    const userShort = String(user_id).slice(0, 8);
+    const resolution = await getPushTokensForUser(supabase, user_id);
+    const tokens = resolution.tokens;
+    fallbackUsed = resolution.fallbackUsed;
+    tokenCount = tokens.length;
 
-    if (profile?.push_token) {
-      try {
-        await sendAPNS({ deviceToken: profile.push_token, title, body: notifBody, data: { type, reference_id } });
-        pushed = true;
-        // Log success
-        await supabase.from("push_notification_log").insert({
-          user_id,
-          notification_id: notificationID,
-          device_token: profile.push_token,
-          title,
-          body: notifBody,
-          payload: { type, reference_id },
-          apns_status: 200,
-        });
-      } catch (err) {
-        const errMsg = String(err);
-        console.error(`APNs failed for user ${user_id}:`, errMsg);
-        await supabase.from("push_notification_log").insert({
-          user_id,
-          notification_id: notificationID,
-          device_token: profile.push_token,
-          title,
-          body: notifBody,
-          payload: { type, reference_id },
-          apns_status: 0,
-          apns_error: errMsg,
-        });
+    if (tokens.length === 0) {
+      console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+    } else {
+      console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+      for (const token of tokens) {
+        try {
+          await sendAPNS({ deviceToken: token, title, body: notifBody, data: { type, reference_id } });
+          pushedCount++;
+          console.log(`[push] sent target=${userShort} token=${tokenShort(token)} ok=true`);
+          await supabase.from("push_notification_log").insert({
+            user_id,
+            notification_id: notificationID,
+            device_token: token,
+            title,
+            body: notifBody,
+            payload: { type, reference_id },
+            apns_status: 200,
+          });
+        } catch (err) {
+          if (err instanceof StaleTokenError) {
+            staleCount++;
+            const cleanup = await clearStaleToken(supabase, user_id, token);
+            console.log(
+              `[push] stale target=${userShort} token=${tokenShort(token)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+            );
+            continue;
+          }
+          errorCount++;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[push] error target=${userShort} token=${tokenShort(token)} err=${errMsg}`);
+          await supabase.from("push_notification_log").insert({
+            user_id,
+            notification_id: notificationID,
+            device_token: token,
+            title,
+            body: notifBody,
+            payload: { type, reference_id },
+            apns_status: 0,
+            apns_error: errMsg,
+          });
+        }
       }
     }
   }
 
-  return new Response(JSON.stringify({ notified: true, pushed }), {
+  return new Response(JSON.stringify({
+    notified: true,
+    pushed: pushedCount > 0,
+    token_count: tokenCount,
+    pushed_count: pushedCount,
+    stale_count: staleCount,
+    error_count: errorCount,
+    fallback_used: fallbackUsed,
+  }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
@@ -130,6 +160,10 @@ serve(async (req: Request) => {
 // ---------------------------------------------------------------------------
 // APNs helpers (shared pattern with booking-confirmed and club-chat-push)
 // ---------------------------------------------------------------------------
+
+class StaleTokenError extends Error {
+  constructor() { super("StaleToken"); this.name = "StaleTokenError"; }
+}
 
 async function sendAPNS(opts: {
   deviceToken: string;
@@ -163,6 +197,7 @@ async function sendAPNS(opts: {
     body: JSON.stringify(payload),
   });
 
+  if (resp.status === 410) throw new StaleTokenError();
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`APNs ${resp.status}: ${text}`);

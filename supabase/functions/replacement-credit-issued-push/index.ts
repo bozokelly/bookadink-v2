@@ -25,9 +25,16 @@
 // Notification type written to notifications table:
 //   'replacement_credit_issued'
 //
+// Multi-device fan-out (2026-05-07): tokens are resolved through the shared
+// _shared/push-tokens.ts helper so a user with iPhone+iPad receives the push
+// on every device. Per-token APNs failures do not abort the rest. 410 (Gone)
+// stale tokens are cleared via clearStaleToken (deletes the push_tokens row;
+// only NULLs profiles.push_token when it equals the stale token).
+//
 // Deploy: supabase functions deploy replacement-credit-issued-push --no-verify-jwt
 
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "../_shared/push-tokens.ts";
 
 interface Payload {
   user_id: string;
@@ -106,42 +113,70 @@ Deno.serve(async (req) => {
       return jsonResponse({ notified: true, pushed: false, reason: "user_pref_off" });
     }
 
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("push_token")
-      .eq("id", user_id)
-      .single();
+    const userShort = String(user_id).slice(0, 8);
+    const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, user_id);
 
-    if (!profile?.push_token) {
-      return jsonResponse({ notified: true, pushed: false, reason: "no_token" });
-    }
-
-    let pushed = false;
-    try {
-      await sendAPNS({
-        deviceToken: profile.push_token,
-        title: pushTitle,
-        body: pushBody,
-        data: {
-          type: "replacement_credit_issued",
-          reference_id: club_id,
-          booking_id,
-          game_id,
-          club_id,
-          credit_issued_cents,
-        },
-        threadID: `club.${club_id}`,
+    if (tokens.length === 0) {
+      console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+      return jsonResponse({
+        notified: true,
+        pushed: false,
+        reason: "no_tokens",
+        token_count: 0,
+        pushed_count: 0,
+        stale_count: 0,
+        error_count: 0,
+        fallback_used: fallbackUsed,
       });
-      pushed = true;
-    } catch (err) {
-      if (err instanceof StaleTokenError) {
-        await supabase.from("profiles").update({ push_token: null }).eq("id", user_id);
-        return jsonResponse({ notified: true, pushed: false, reason: "stale_token_cleared" });
-      }
-      console.error("replacement-credit-issued-push: APNs error", err);
     }
 
-    return jsonResponse({ notified: true, pushed });
+    console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+
+    let pushedCount = 0;
+    let staleCount = 0;
+    let errorCount = 0;
+    for (const token of tokens) {
+      try {
+        await sendAPNS({
+          deviceToken: token,
+          title: pushTitle,
+          body: pushBody,
+          data: {
+            type: "replacement_credit_issued",
+            reference_id: club_id,
+            booking_id,
+            game_id,
+            club_id,
+            credit_issued_cents,
+          },
+          threadID: `club.${club_id}`,
+        });
+        pushedCount += 1;
+        console.log(`[push] sent target=${userShort} token=${tokenShort(token)} ok=true`);
+      } catch (err) {
+        if (err instanceof StaleTokenError) {
+          staleCount += 1;
+          const cleanup = await clearStaleToken(supabase, user_id, token);
+          console.log(
+            `[push] stale target=${userShort} token=${tokenShort(token)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+          );
+          continue;
+        }
+        errorCount += 1;
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[push] error target=${userShort} token=${tokenShort(token)} err=${message}`);
+      }
+    }
+
+    return jsonResponse({
+      notified: true,
+      pushed: pushedCount > 0,
+      token_count: tokens.length,
+      pushed_count: pushedCount,
+      stale_count: staleCount,
+      error_count: errorCount,
+      fallback_used: fallbackUsed,
+    });
   } catch (err) {
     console.error("replacement-credit-issued-push: fatal", err);
     return jsonResponse({ error: (err as Error).message }, 400);

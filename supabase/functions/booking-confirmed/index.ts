@@ -8,12 +8,18 @@
 //   APNS_USE_SANDBOX — "true" for dev builds
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY — auto-injected
 //
+// Multi-device fan-out (2026-05-07): every APNs token registered for the user
+// receives the booking-confirmed push (iPhone + iPad + …). Per-token failures
+// are isolated so one stale device cannot block the others. Stale tokens (410)
+// are cleared via the shared helper.
+//
 // Deploy: supabase functions deploy booking-confirmed
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isUUID } from "../_shared/validate.ts";
 import { getCallerID } from "../_shared/auth.ts";
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "../_shared/push-tokens.ts";
 
 const FALLBACK_TZ = "Australia/Perth";
 
@@ -75,20 +81,31 @@ serve(async (req: Request) => {
     });
   }
 
-  // Fetch push token and game details concurrently
-  const [profileResult, gameResult] = await Promise.all([
-    supabase.from("profiles").select("push_token").eq("id", user_id).single(),
+  // Fetch tokens (multi-device) and game details concurrently
+  const [tokensResult, gameResult] = await Promise.all([
+    getPushTokensForUser(supabase, user_id),
     supabase.from("games").select("title, date_time, duration_minutes, venue_name, clubs(name, timezone)").eq("id", game_id).single(),
   ]);
 
-  if (profileResult.error || !profileResult.data?.push_token) {
-    return new Response(JSON.stringify({ sent: false, reason: "no_push_token" }), {
+  const { tokens, fallbackUsed } = tokensResult;
+  const userShort = String(user_id).slice(0, 8);
+
+  if (tokens.length === 0) {
+    console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+    return new Response(JSON.stringify({
+      sent: false,
+      reason: "no_push_token",
+      token_count: 0,
+      pushed_count: 0,
+      stale_count: 0,
+      error_count: 0,
+      fallback_used: fallbackUsed,
+    }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
   }
 
-  const pushToken: string = profileResult.data.push_token;
   const game = gameResult.data;
   const gameTitle = game?.title ?? "your game";
   const clubTZ: string = ((game?.clubs as { timezone?: string } | null)?.timezone) || FALLBACK_TZ;
@@ -110,31 +127,45 @@ serve(async (req: Request) => {
 
   const pushBody = buildBookingConfirmedBody(gameTitle, dateTimeLine, locationDisplay);
 
-  try {
-    await sendAPNS({
-      deviceToken: pushToken,
-      title: "Booking confirmed",
-      body: pushBody,
-      data: { game_id, booking_id, type: "booking_confirmed" },
-      threadID: `game.${game_id}`,
-    });
-  } catch (err) {
-    if (err instanceof StaleTokenError) {
-      // Token is invalid — clear it so we stop attempting delivery
-      await supabase.from("profiles").update({ push_token: null }).eq("id", user_id);
-      return new Response(JSON.stringify({ sent: false, reason: "stale_token_cleared" }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
+  console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+
+  let pushedCount = 0;
+  let staleCount = 0;
+  let errorCount = 0;
+  for (const token of tokens) {
+    try {
+      await sendAPNS({
+        deviceToken: token,
+        title: "Booking confirmed",
+        body: pushBody,
+        data: { game_id, booking_id, type: "booking_confirmed" },
+        threadID: `game.${game_id}`,
       });
+      pushedCount += 1;
+      console.log(`[push] sent target=${userShort} token=${tokenShort(token)} ok=true`);
+    } catch (err) {
+      if (err instanceof StaleTokenError) {
+        staleCount += 1;
+        const cleanup = await clearStaleToken(supabase, user_id, token);
+        console.log(
+          `[push] stale target=${userShort} token=${tokenShort(token)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+        );
+        continue;
+      }
+      errorCount += 1;
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[push] error target=${userShort} token=${tokenShort(token)} err=${message}`);
     }
-    console.error("APNs send failed:", err);
-    return new Response(JSON.stringify({ sent: false, reason: String(err) }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
   }
 
-  return new Response(JSON.stringify({ sent: true }), {
+  return new Response(JSON.stringify({
+    sent: pushedCount > 0,
+    token_count: tokens.length,
+    pushed_count: pushedCount,
+    stale_count: staleCount,
+    error_count: errorCount,
+    fallback_used: fallbackUsed,
+  }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });

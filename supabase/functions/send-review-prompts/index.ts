@@ -14,10 +14,15 @@
 // Required secrets: APNS_KEY_ID, APNS_TEAM_ID, APNS_PRIVATE_KEY, APNS_BUNDLE_ID,
 //                   APNS_USE_SANDBOX, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 //
+// Multi-device fan-out (2026-05-07): tokens resolved through
+// _shared/push-tokens.ts so iPhone+iPad both receive the prompt. Per-token
+// APNs failures are isolated.
+//
 // Deploy: supabase functions deploy send-review-prompts --no-verify-jwt
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "../_shared/push-tokens.ts";
 
 const NOTIFICATION_TYPE = "game_review_request";
 
@@ -60,7 +65,8 @@ serve(async (req: Request) => {
 
   let totalSent = 0;
   let totalPushed = 0;
-  const staleTokenUserIDs: string[] = [];
+  let totalStale = 0;
+  let totalErrors = 0;
 
   for (const game of games) {
     // Fetch all confirmed bookings for this game
@@ -92,17 +98,6 @@ serve(async (req: Request) => {
 
     if (eligibleUserIDs.length === 0) continue;
 
-    // Batch-fetch push tokens for all eligible users in one query
-    const { data: profiles } = await supabase
-      .from("profiles")
-      .select("id, push_token")
-      .in("id", eligibleUserIDs);
-
-    const tokenByUserID: Record<string, string> = {};
-    for (const p of profiles ?? []) {
-      if (p.push_token) tokenByUserID[p.id] = p.push_token;
-    }
-
     const pushTitle = `How was ${game.title}?`;
     const pushBody  = "Tap to leave a quick rating and help your club improve future sessions.";
 
@@ -129,34 +124,48 @@ serve(async (req: Request) => {
 
         totalSent++;
         const notificationID = notifRow?.id ?? null;
-        const deviceToken = tokenByUserID[userID];
+        const userShort = String(userID).slice(0, 8);
+        const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, userID);
 
-        if (!deviceToken) return;
+        if (tokens.length === 0) {
+          console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+          return;
+        }
 
-        try {
-          await sendAPNS({
-            deviceToken,
-            title: pushTitle,
-            body: pushBody,
-            data: { type: NOTIFICATION_TYPE, reference_id: game.id },
-            collapseID: `review.${game.id}`,
-          });
-          totalPushed++;
-          await supabase.from("push_notification_log").insert({
-            user_id: userID,
-            notification_id: notificationID,
-            device_token: deviceToken,
-            title: pushTitle,
-            body: pushBody,
-            payload: { type: NOTIFICATION_TYPE, reference_id: game.id },
-            apns_status: 200,
-          });
-        } catch (err) {
-          if (err instanceof StaleTokenError) {
-            staleTokenUserIDs.push(userID);
-          } else {
-            const errMsg = String(err);
-            console.error(`APNs failed for user ${userID}:`, errMsg);
+        console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+
+        for (const deviceToken of tokens) {
+          try {
+            await sendAPNS({
+              deviceToken,
+              title: pushTitle,
+              body: pushBody,
+              data: { type: NOTIFICATION_TYPE, reference_id: game.id },
+              collapseID: `review.${game.id}`,
+            });
+            totalPushed++;
+            console.log(`[push] sent target=${userShort} token=${tokenShort(deviceToken)} ok=true`);
+            await supabase.from("push_notification_log").insert({
+              user_id: userID,
+              notification_id: notificationID,
+              device_token: deviceToken,
+              title: pushTitle,
+              body: pushBody,
+              payload: { type: NOTIFICATION_TYPE, reference_id: game.id },
+              apns_status: 200,
+            });
+          } catch (err) {
+            if (err instanceof StaleTokenError) {
+              totalStale++;
+              const cleanup = await clearStaleToken(supabase, userID, deviceToken);
+              console.log(
+                `[push] stale target=${userShort} token=${tokenShort(deviceToken)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+              );
+              continue;
+            }
+            totalErrors++;
+            const errMsg = err instanceof Error ? err.message : String(err);
+            console.error(`[push] error target=${userShort} token=${tokenShort(deviceToken)} err=${errMsg}`);
             await supabase.from("push_notification_log").insert({
               user_id: userID,
               notification_id: notificationID,
@@ -173,25 +182,17 @@ serve(async (req: Request) => {
     );
   }
 
-  // Clear stale push tokens so future runs don't attempt dead devices
-  if (staleTokenUserIDs.length > 0) {
-    await Promise.allSettled(
-      [...new Set(staleTokenUserIDs)].map((uid) =>
-        supabase.from("profiles").update({ push_token: null }).eq("id", uid)
-      )
-    );
-  }
-
   console.log(
     `send-review-prompts: sent ${totalSent} prompt(s), pushed ${totalPushed}, ` +
-    `stale tokens cleared: ${staleTokenUserIDs.length}, games: ${games.length}`
+    `stale tokens cleared: ${totalStale}, errors: ${totalErrors}, games: ${games.length}`
   );
 
   return new Response(
     JSON.stringify({
       sent: totalSent,
       pushed: totalPushed,
-      stale_tokens_cleared: staleTokenUserIDs.length,
+      stale_tokens_cleared: totalStale,
+      error_count: totalErrors,
       games: games.length,
     }),
     { status: 200, headers: { "Content-Type": "application/json" } }

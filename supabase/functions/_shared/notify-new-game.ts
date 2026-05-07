@@ -10,6 +10,12 @@
 // is gated by the release_scheduled_games() RPC which atomically claims each
 // game via published_notification_sent_at. Once a payload reaches this module
 // the fan-out behaviour is identical regardless of source.
+//
+// Multi-device fan-out (2026-05-07): tokens resolved through
+// _shared/push-tokens.ts so iPhone+iPad both receive the push. Per-token APNs
+// failures are isolated.
+
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "./push-tokens.ts";
 
 const FALLBACK_TZ = "Australia/Perth";
 
@@ -62,25 +68,21 @@ export async function notifyNewGameMembers(supabase: any, payload: NewGameNotify
   const pushBody = pushBodyParts.join(" · ");
 
   const userIDs = members.map((m: { user_id: string }) => m.user_id);
-  const [profilesResult, prefsResult] = await Promise.all([
-    supabase.from("profiles").select("id,push_token").in("id", userIDs),
-    supabase.from("notification_preferences").select("user_id,new_game_push").in("user_id", userIDs),
-  ]);
-
-  const tokenByUserID: Record<string, string> = {};
-  for (const p of profilesResult.data ?? []) {
-    if (p.push_token) tokenByUserID[p.id] = p.push_token;
-  }
+  const { data: prefsData } = await supabase
+    .from("notification_preferences")
+    .select("user_id,new_game_push")
+    .in("user_id", userIDs);
 
   const pushOptedOut = new Set<string>(
-    (prefsResult.data ?? [])
+    (prefsData ?? [])
       .filter((r: { user_id: string; new_game_push: boolean }) => r.new_game_push === false)
       .map((r: { user_id: string }) => r.user_id)
   );
 
   let notifiedCount = 0;
   let pushedCount = 0;
-  const staleTokenUserIDs: string[] = [];
+  let staleCount = 0;
+  let errorCount = 0;
 
   await Promise.allSettled(
     members.map(async (member: { user_id: string }) => {
@@ -99,9 +101,20 @@ export async function notifyNewGameMembers(supabase: any, payload: NewGameNotify
 
       notifiedCount++;
       const notificationID = notifRow?.id ?? null;
-      const deviceToken = tokenByUserID[member.user_id];
 
-      if (deviceToken && !pushOptedOut.has(member.user_id)) {
+      if (pushOptedOut.has(member.user_id)) return;
+
+      const userShort = String(member.user_id).slice(0, 8);
+      const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, member.user_id);
+
+      if (tokens.length === 0) {
+        console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+        return;
+      }
+
+      console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+
+      for (const deviceToken of tokens) {
         try {
           await sendAPNS({
             deviceToken,
@@ -112,6 +125,7 @@ export async function notifyNewGameMembers(supabase: any, payload: NewGameNotify
             threadID: `club.${payload.clubID}`,
           });
           pushedCount++;
+          console.log(`[push] sent target=${userShort} token=${tokenShort(deviceToken)} ok=true`);
           await supabase.from("push_notification_log").insert({
             user_id: member.user_id,
             notification_id: notificationID,
@@ -123,38 +137,35 @@ export async function notifyNewGameMembers(supabase: any, payload: NewGameNotify
           });
         } catch (err) {
           if (err instanceof StaleTokenError) {
-            staleTokenUserIDs.push(member.user_id);
-          } else {
-            const errMsg = String(err);
-            console.error(`APNs failed for user ${member.user_id}:`, errMsg);
-            await supabase.from("push_notification_log").insert({
-              user_id: member.user_id,
-              notification_id: notificationID,
-              device_token: deviceToken,
-              title: pushTitle,
-              body: pushBody,
-              payload: { game_id: payload.gameID, club_id: payload.clubID, type: "new_game" },
-              apns_status: 0,
-              apns_error: errMsg,
-            });
+            staleCount++;
+            const cleanup = await clearStaleToken(supabase, member.user_id, deviceToken);
+            console.log(
+              `[push] stale target=${userShort} token=${tokenShort(deviceToken)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+            );
+            continue;
           }
+          errorCount++;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[push] error target=${userShort} token=${tokenShort(deviceToken)} err=${errMsg}`);
+          await supabase.from("push_notification_log").insert({
+            user_id: member.user_id,
+            notification_id: notificationID,
+            device_token: deviceToken,
+            title: pushTitle,
+            body: pushBody,
+            payload: { game_id: payload.gameID, club_id: payload.clubID, type: "new_game" },
+            apns_status: 0,
+            apns_error: errMsg,
+          });
         }
       }
     })
   );
 
-  if (staleTokenUserIDs.length > 0) {
-    await Promise.allSettled(
-      staleTokenUserIDs.map((uid) =>
-        supabase.from("profiles").update({ push_token: null }).eq("id", uid)
-      )
-    );
-  }
-
   return {
     notified: notifiedCount,
     pushed: pushedCount,
-    staleTokensCleared: staleTokenUserIDs.length,
+    staleTokensCleared: staleCount,
   };
 }
 

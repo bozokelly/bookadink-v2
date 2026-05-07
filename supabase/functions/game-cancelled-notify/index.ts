@@ -6,12 +6,19 @@
 //   - thread-id: "game.{game_id}" for iOS Notification Center grouping
 //   - Stale token (APNs 410) clears profiles.push_token automatically
 //
+// Changes from v2 (2026-05-07):
+//   - Multi-device fan-out via _shared/push-tokens.ts: each recipient gets the
+//     push on every device they have registered. Per-token APNs failures are
+//     isolated. One notifications row per recipient is preserved; one
+//     push_notification_log row per token sent.
+//
 // Deploy: supabase functions deploy game-cancelled-notify --no-verify-jwt
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isUUID, clampStr } from "../_shared/validate.ts";
-import { getCallerID, isClubAdmin } from "../_shared/auth.ts";
+import { getCallerID, resolveClubAdminRole } from "../_shared/auth.ts";
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "../_shared/push-tokens.ts";
 
 const FALLBACK_TZ = "Australia/Perth";
 
@@ -46,6 +53,11 @@ serve(async (req: Request) => {
 
   // Require an authenticated club admin or owner.
   // Resolve club_id from the DB (not the client payload) to prevent spoofing.
+  // Authorization sources (canonical, see CLAUDE.md → Club Role Lifecycle):
+  //   - clubs.created_by  → owner
+  //   - club_admins(role='admin')  → admin
+  // Approved members without a club_admins row are NOT authorized — their
+  // bookings can be cancelled, but they cannot trigger the fan-out.
   const callerID = await getCallerID(supabase, req);
   if (!callerID) {
     return new Response("Authentication required", { status: 401 });
@@ -55,11 +67,17 @@ serve(async (req: Request) => {
   if (!gameRow?.club_id) {
     return new Response("Game not found", { status: 404 });
   }
-  const adminOK = await isClubAdmin(supabase, callerID, gameRow.club_id);
-  if (!adminOK) {
-    console.warn("[game-cancelled-notify] caller", callerID, "not admin for club", gameRow.club_id);
+  const clubID: string = gameRow.club_id;
+  const role = await resolveClubAdminRole(supabase, callerID, clubID);
+  if (!role.isOwner && !role.isAdmin) {
+    console.warn(
+      `[game-cancelled-notify] denied caller=${callerID} club=${clubID} is_owner=false is_admin=false reason=not_in_club_admins_or_owner`,
+    );
     return new Response("Forbidden: caller is not an admin of this club", { status: 403 });
   }
+  console.log(
+    `[game-cancelled-notify] authorized caller=${callerID} club=${clubID} is_owner=${role.isOwner} is_admin=${role.isAdmin}`,
+  );
 
   // Fetch game details and bookings concurrently
   const [gameResult, bookingsResult] = await Promise.all([
@@ -85,7 +103,6 @@ serve(async (req: Request) => {
 
   // Enrich from DB — authoritative over iOS payload
   const game = gameResult.data;
-  const clubID: string = (game?.club_id as string | null) ?? "";
   const clubName = ((game?.clubs as { name?: string; timezone?: string } | null)?.name ?? "").trim();
   const clubTZ: string =
     ((game?.clubs as { timezone?: string } | null)?.timezone) ||
@@ -106,25 +123,14 @@ serve(async (req: Request) => {
     ? `${game_title} · ${dateStr}${locationSuffix}`
     : `${game_title} has been cancelled.`;
 
-  // Fetch push tokens for affected users
-  const userIDs = bookings.map((b: { user_id: string }) => b.user_id);
-  const { data: profiles } = await supabase
-    .from("profiles")
-    .select("id,push_token")
-    .in("id", userIDs);
-
-  const tokenByUserID: Record<string, string> = {};
-  for (const p of profiles ?? []) {
-    if (p.push_token) tokenByUserID[p.id] = p.push_token;
-  }
-
   let notifiedCount = 0;
   let pushedCount = 0;
-  const staleTokenUserIDs: string[] = [];
+  let staleCount = 0;
+  let errorCount = 0;
 
   await Promise.allSettled(
     bookings.map(async (booking: { id: string; user_id: string }) => {
-      // Insert in-app notification row (triggers email hook)
+      // Insert one in-app notification row per recipient (triggers email hook)
       const { data: notifRow } = await supabase
         .from("notifications")
         .insert({
@@ -140,9 +146,17 @@ serve(async (req: Request) => {
 
       notifiedCount++;
       const notificationID = notifRow?.id ?? null;
-      const deviceToken = tokenByUserID[booking.user_id];
+      const userShort = String(booking.user_id).slice(0, 8);
+      const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, booking.user_id);
 
-      if (deviceToken) {
+      if (tokens.length === 0) {
+        console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+        return;
+      }
+
+      console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+
+      for (const deviceToken of tokens) {
         try {
           await sendAPNS({
             deviceToken,
@@ -152,6 +166,7 @@ serve(async (req: Request) => {
             threadID: `game.${game_id}`,
           });
           pushedCount++;
+          console.log(`[push] sent target=${userShort} token=${tokenShort(deviceToken)} ok=true`);
           await supabase.from("push_notification_log").insert({
             user_id: booking.user_id,
             notification_id: notificationID,
@@ -163,36 +178,37 @@ serve(async (req: Request) => {
           });
         } catch (err) {
           if (err instanceof StaleTokenError) {
-            staleTokenUserIDs.push(booking.user_id);
-          } else {
-            const errMsg = String(err);
-            console.error(`APNs failed for user ${booking.user_id}:`, errMsg);
-            await supabase.from("push_notification_log").insert({
-              user_id: booking.user_id,
-              notification_id: notificationID,
-              device_token: deviceToken,
-              title: pushTitle,
-              body: pushBody,
-              payload: { game_id, club_id: clubID, type: "game_cancelled" },
-              apns_status: 0,
-              apns_error: errMsg,
-            });
+            staleCount++;
+            const cleanup = await clearStaleToken(supabase, booking.user_id, deviceToken);
+            console.log(
+              `[push] stale target=${userShort} token=${tokenShort(deviceToken)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+            );
+            continue;
           }
+          errorCount++;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[push] error target=${userShort} token=${tokenShort(deviceToken)} err=${errMsg}`);
+          await supabase.from("push_notification_log").insert({
+            user_id: booking.user_id,
+            notification_id: notificationID,
+            device_token: deviceToken,
+            title: pushTitle,
+            body: pushBody,
+            payload: { game_id, club_id: clubID, type: "game_cancelled" },
+            apns_status: 0,
+            apns_error: errMsg,
+          });
         }
       }
     })
   );
 
-  // Clear stale tokens
-  if (staleTokenUserIDs.length > 0) {
-    await Promise.allSettled(
-      staleTokenUserIDs.map((uid) =>
-        supabase.from("profiles").update({ push_token: null }).eq("id", uid)
-      )
-    );
-  }
-
-  return new Response(JSON.stringify({ notified: notifiedCount, pushed: pushedCount, stale_tokens_cleared: staleTokenUserIDs.length }), {
+  return new Response(JSON.stringify({
+    notified: notifiedCount,
+    pushed: pushedCount,
+    stale_tokens_cleared: staleCount,
+    error_count: errorCount,
+  }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });

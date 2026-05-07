@@ -7,12 +7,17 @@
 // Required secrets: APNS_KEY_ID, APNS_TEAM_ID, APNS_PRIVATE_KEY, APNS_BUNDLE_ID,
 //                   APNS_USE_SANDBOX, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 //
+// Multi-device fan-out (2026-05-07): tokens resolved through
+// _shared/push-tokens.ts so iPhone+iPad both receive the push. Per-token APNs
+// failures are isolated.
+//
 // Deploy: supabase functions deploy game-updated-notify --no-verify-jwt
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isUUID, clampStr } from "../_shared/validate.ts";
 import { getCallerID, isClubAdmin } from "../_shared/auth.ts";
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "../_shared/push-tokens.ts";
 
 const FALLBACK_TZ = "Australia/Perth";
 
@@ -89,25 +94,14 @@ serve(async (req: Request) => {
     ? `${game_title} · ${changeDescription}`
     : `${game_title}${dateStr ? " · " + dateStr : ""} — details have changed.`;
 
-  // Fetch push tokens for affected users
-  const userIDs = bookings.map((b: { user_id: string }) => b.user_id);
-  const { data: profiles } = await supabase
-    .from("profiles")
-    .select("id,push_token")
-    .in("id", userIDs);
-
-  const tokenByUserID: Record<string, string> = {};
-  for (const p of profiles ?? []) {
-    if (p.push_token) tokenByUserID[p.id] = p.push_token;
-  }
-
   let notifiedCount = 0;
   let pushedCount = 0;
-  const staleTokenUserIDs: string[] = [];
+  let staleCount = 0;
+  let errorCount = 0;
 
   await Promise.allSettled(
     bookings.map(async (booking: { id: string; user_id: string }) => {
-      // Insert in-app notification row (triggers email hook)
+      // Insert one in-app notification row per recipient (triggers email hook)
       const { data: notifRow } = await supabase
         .from("notifications")
         .insert({
@@ -123,9 +117,17 @@ serve(async (req: Request) => {
 
       notifiedCount++;
       const notificationID = notifRow?.id ?? null;
-      const deviceToken = tokenByUserID[booking.user_id];
+      const userShort = String(booking.user_id).slice(0, 8);
+      const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, booking.user_id);
 
-      if (deviceToken) {
+      if (tokens.length === 0) {
+        console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+        return;
+      }
+
+      console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+
+      for (const deviceToken of tokens) {
         try {
           await sendAPNS({
             deviceToken,
@@ -135,6 +137,7 @@ serve(async (req: Request) => {
             threadID: `game.${game_id}`,
           });
           pushedCount++;
+          console.log(`[push] sent target=${userShort} token=${tokenShort(deviceToken)} ok=true`);
           await supabase.from("push_notification_log").insert({
             user_id: booking.user_id,
             notification_id: notificationID,
@@ -146,35 +149,37 @@ serve(async (req: Request) => {
           });
         } catch (err) {
           if (err instanceof StaleTokenError) {
-            staleTokenUserIDs.push(booking.user_id);
-          } else {
-            const errMsg = String(err);
-            console.error(`APNs failed for user ${booking.user_id}:`, errMsg);
-            await supabase.from("push_notification_log").insert({
-              user_id: booking.user_id,
-              notification_id: notificationID,
-              device_token: deviceToken,
-              title: pushTitle,
-              body: pushBody,
-              payload: { game_id, club_id, type: "game_updated", changed_fields },
-              apns_status: 0,
-              apns_error: errMsg,
-            });
+            staleCount++;
+            const cleanup = await clearStaleToken(supabase, booking.user_id, deviceToken);
+            console.log(
+              `[push] stale target=${userShort} token=${tokenShort(deviceToken)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+            );
+            continue;
           }
+          errorCount++;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[push] error target=${userShort} token=${tokenShort(deviceToken)} err=${errMsg}`);
+          await supabase.from("push_notification_log").insert({
+            user_id: booking.user_id,
+            notification_id: notificationID,
+            device_token: deviceToken,
+            title: pushTitle,
+            body: pushBody,
+            payload: { game_id, club_id, type: "game_updated", changed_fields },
+            apns_status: 0,
+            apns_error: errMsg,
+          });
         }
       }
     })
   );
 
-  if (staleTokenUserIDs.length > 0) {
-    await Promise.allSettled(
-      staleTokenUserIDs.map((uid) =>
-        supabase.from("profiles").update({ push_token: null }).eq("id", uid)
-      )
-    );
-  }
-
-  return new Response(JSON.stringify({ notified: notifiedCount, pushed: pushedCount, stale_tokens_cleared: staleTokenUserIDs.length }), {
+  return new Response(JSON.stringify({
+    notified: notifiedCount,
+    pushed: pushedCount,
+    stale_tokens_cleared: staleCount,
+    error_count: errorCount,
+  }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });

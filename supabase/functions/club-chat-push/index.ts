@@ -16,6 +16,13 @@
 // Required secrets: APNS_KEY_ID, APNS_TEAM_ID, APNS_PRIVATE_KEY, APNS_BUNDLE_ID,
 //                   APNS_USE_SANDBOX, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 //
+// Multi-device fan-out (2026-05-07): tokens resolved through
+// _shared/push-tokens.ts so each recipient's iPhone+iPad both receive the push.
+// Per-token APNs failures are isolated. The previous batched profiles fetch
+// (and supplementary lookup for owner/admin profiles outside club_members) is
+// no longer needed — token resolution is per-recipient and reads from the
+// authoritative push_tokens table with profiles.push_token as fallback.
+//
 // Deploy: supabase functions deploy club-chat-push
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -23,6 +30,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isUUID, clampStr } from "../_shared/validate.ts";
 import { isRateLimited } from "../_shared/rateLimit.ts";
 import { getCallerID } from "../_shared/auth.ts";
+import { getPushTokensForUser, tokenShort, clearStaleToken } from "../_shared/push-tokens.ts";
 
 interface RequestBody {
   club_id: string;
@@ -144,7 +152,7 @@ serve(async (req: Request) => {
   const actorFullName = actorResult.data?.full_name ?? "Someone";
 
   // ------------------------------------------------------------------
-  // Announcement path — unchanged from prior implementation
+  // Announcement path
   // ------------------------------------------------------------------
   if (isAnnouncement) {
     const { data: members } = await supabase
@@ -158,45 +166,64 @@ serve(async (req: Request) => {
       return jsonOK({ sent: 0, reason: "no_members" });
     }
 
-    const memberIDs = members.map((m: { user_id: string }) => m.user_id);
-    const { data: profiles } = await supabase
-      .from("profiles")
-      .select("id, push_token")
-      .in("id", memberIDs)
-      .not("push_token", "is", null);
-
-    const pushProfiles = profiles ?? [];
     let sentCount = 0;
-    const staleTokenUIDs: string[] = [];
+    let staleCount = 0;
+    let errorCount = 0;
+    let recipientsWithTokens = 0;
 
     await Promise.allSettled(
-      pushProfiles.map(async (p: { id: string; push_token: string }) => {
-        try {
-          await sendAPNS({
-            deviceToken: p.push_token,
-            title: `📢 ${clubName}`,
-            body: `${actorFullName} posted an announcement`,
-            data: {
-              type: "new_announcement",
-              event: "new_announcement",
-              club_id,
-              reference_id: reference_id ?? null,
-              actor_id: actor_user_id,
-              actor_full_name: actorFullName,
-              notification_reason: "new_announcement",
-            },
-            threadID: `club.${club_id}`,
-            priority: 10,
-          });
-          sentCount++;
-        } catch (err) {
-          if (err instanceof StaleTokenError) staleTokenUIDs.push(p.id);
-          else console.error(`APNs announcement failed for ${p.id}:`, err);
+      (members as Array<{ user_id: string }>).map(async (m) => {
+        const userShort = String(m.user_id).slice(0, 8);
+        const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, m.user_id);
+        if (tokens.length === 0) {
+          console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+          return;
+        }
+        recipientsWithTokens++;
+        console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+        for (const token of tokens) {
+          try {
+            await sendAPNS({
+              deviceToken: token,
+              title: `📢 ${clubName}`,
+              body: `${actorFullName} posted an announcement`,
+              data: {
+                type: "new_announcement",
+                event: "new_announcement",
+                club_id,
+                reference_id: reference_id ?? null,
+                actor_id: actor_user_id,
+                actor_full_name: actorFullName,
+                notification_reason: "new_announcement",
+              },
+              threadID: `club.${club_id}`,
+              priority: 10,
+            });
+            sentCount++;
+            console.log(`[push] sent target=${userShort} token=${tokenShort(token)} ok=true`);
+          } catch (err) {
+            if (err instanceof StaleTokenError) {
+              staleCount++;
+              const cleanup = await clearStaleToken(supabase, m.user_id, token);
+              console.log(
+                `[push] stale target=${userShort} token=${tokenShort(token)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+              );
+              continue;
+            }
+            errorCount++;
+            const errMsg = err instanceof Error ? err.message : String(err);
+            console.error(`[push] error target=${userShort} token=${tokenShort(token)} err=${errMsg}`);
+          }
         }
       })
     );
-    await clearStaleTokens(supabase, staleTokenUIDs);
-    return jsonOK({ sent: sentCount, stale_tokens_cleared: staleTokenUIDs.length });
+
+    return jsonOK({
+      sent: sentCount,
+      recipients: recipientsWithTokens,
+      stale_tokens_cleared: staleCount,
+      error_count: errorCount,
+    });
   }
 
   // ------------------------------------------------------------------
@@ -216,13 +243,15 @@ serve(async (req: Request) => {
 
   const memberIDs = (members as { user_id: string }[]).map((m) => m.user_id);
 
-  // Fetch all member profiles (name + token) — needed for mention resolution and sending
+  // Fetch member profile names (for mention resolution) and chat-push preferences.
+  // Tokens are resolved per-recipient via getPushTokensForUser below — that path
+  // also covers club owners/admins whose profiles aren't in club_members.
   const [profilesResult, prefsResult] = await Promise.all([
-    supabase.from("profiles").select("id, full_name, push_token").in("id", memberIDs),
+    supabase.from("profiles").select("id, full_name").in("id", memberIDs),
     supabase.from("notification_preferences").select("user_id, chat_push").in("user_id", memberIDs),
   ]);
 
-  const allProfiles: Array<{ id: string; full_name: string | null; push_token: string | null }> =
+  const allProfiles: Array<{ id: string; full_name: string | null }> =
     profilesResult.data ?? [];
 
   const chatOptedOut = new Set<string>(
@@ -232,7 +261,7 @@ serve(async (req: Request) => {
   );
 
   // Map for fast lookup: lowercase full_name → profile
-  const nameToProfile = new Map<string, { id: string; full_name: string | null; push_token: string | null }>();
+  const nameToProfile = new Map<string, { id: string; full_name: string | null }>();
   for (const p of allProfiles) {
     if (p.full_name) nameToProfile.set(p.full_name.toLowerCase(), p);
   }
@@ -314,31 +343,11 @@ serve(async (req: Request) => {
   console.log(`recipients: ${recipients.size} unique | breakdown: ${JSON.stringify(reasonCounts)}`);
 
   // ------------------------------------------------------------------
-  // Send APNs to each unique recipient
+  // Send APNs to each unique recipient (multi-device fan-out)
   // ------------------------------------------------------------------
-  const profileTokenMap = new Map<string, string>();
-  for (const p of allProfiles) {
-    if (p.push_token) profileTokenMap.set(p.id, p.push_token);
-  }
-
-  // The club owner (and admins) may not appear in club_members with status=approved,
-  // so their profiles are absent from allProfiles. Do a supplementary lookup for any
-  // recipient whose token wasn't covered by the initial member query.
-  const uncoveredIDs = Array.from(recipients.keys()).filter((id) => !profileTokenMap.has(id));
-  if (uncoveredIDs.length > 0) {
-    const { data: extraProfiles } = await supabase
-      .from("profiles")
-      .select("id, push_token")
-      .in("id", uncoveredIDs)
-      .not("push_token", "is", null);
-    for (const p of (extraProfiles ?? []) as Array<{ id: string; push_token: string }>) {
-      profileTokenMap.set(p.id, p.push_token);
-    }
-    console.log(`supplementary profile lookup: ${uncoveredIDs.length} IDs → ${extraProfiles?.length ?? 0} tokens found`);
-  }
-
   let sentCount = 0;
-  const staleTokenUIDs: string[] = [];
+  let staleCount = 0;
+  let errorCount = 0;
   const skippedOptOut: string[] = [];
   const skippedNoToken: string[] = [];
 
@@ -348,64 +357,70 @@ serve(async (req: Request) => {
         skippedOptOut.push(userID);
         return;
       }
-      const token = profileTokenMap.get(userID);
-      if (!token) {
+      const userShort = String(userID).slice(0, 8);
+      const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, userID);
+      if (tokens.length === 0) {
         skippedNoToken.push(userID);
+        console.log(`[push] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
         return;
       }
-      try {
-        await sendAPNS({
-          deviceToken: token,
-          title: notification.title,
-          body: notification.body,
-          data: {
-            type: notification.reason,
-            event: notification.reason,
-            club_id,
-            reference_id: reference_id ?? null,
-            actor_id: actor_user_id,
-            actor_full_name: actorFullName,
-            target_post_id: isComment ? reference_id ?? null : null,
-            notification_reason: notification.reason,
-            preview_text: preview || null,
-          },
-          threadID: `club.${club_id}`,
-          collapseID: `chat.${club_id}`,
-          priority: 10,
-        });
-        sentCount++;
-      } catch (err) {
-        if (err instanceof StaleTokenError) staleTokenUIDs.push(userID);
-        else console.error(`APNs failed for ${userID}:`, err);
+      console.log(`[push] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+      for (const token of tokens) {
+        try {
+          await sendAPNS({
+            deviceToken: token,
+            title: notification.title,
+            body: notification.body,
+            data: {
+              type: notification.reason,
+              event: notification.reason,
+              club_id,
+              reference_id: reference_id ?? null,
+              actor_id: actor_user_id,
+              actor_full_name: actorFullName,
+              target_post_id: isComment ? reference_id ?? null : null,
+              notification_reason: notification.reason,
+              preview_text: preview || null,
+            },
+            threadID: `club.${club_id}`,
+            collapseID: `chat.${club_id}`,
+            priority: 10,
+          });
+          sentCount++;
+          console.log(`[push] sent target=${userShort} token=${tokenShort(token)} ok=true`);
+        } catch (err) {
+          if (err instanceof StaleTokenError) {
+            staleCount++;
+            const cleanup = await clearStaleToken(supabase, userID, token);
+            console.log(
+              `[push] stale target=${userShort} token=${tokenShort(token)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+            );
+            continue;
+          }
+          errorCount++;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[push] error target=${userShort} token=${tokenShort(token)} err=${errMsg}`);
+        }
       }
     })
   );
 
   console.log(
-    `push summary: sent=${sentCount} opted_out=${skippedOptOut.length} no_token=${skippedNoToken.length} stale=${staleTokenUIDs.length}`
+    `push summary: sent=${sentCount} opted_out=${skippedOptOut.length} no_token=${skippedNoToken.length} stale=${staleCount} errors=${errorCount}`
   );
-
-  await clearStaleTokens(supabase, staleTokenUIDs);
 
   return jsonOK({
     sent: sentCount,
-    stale_tokens_cleared: staleTokenUIDs.length,
+    stale_tokens_cleared: staleCount,
     skipped_opted_out: skippedOptOut.length,
     skipped_no_token: skippedNoToken.length,
+    error_count: errorCount,
   });
 });
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// deno-lint-ignore no-explicit-any
-async function clearStaleTokens(supabase: any, uids: string[]): Promise<void> {
-  if (uids.length === 0) return;
-  await Promise.allSettled(
-    uids.map((uid) => supabase.from("profiles").update({ push_token: null }).eq("id", uid))
-  );
-}
 
 function jsonOK(body: Record<string, unknown>): Response {
   return new Response(JSON.stringify(body), {
