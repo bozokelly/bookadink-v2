@@ -4,7 +4,10 @@
 //
 // Changes from v1:
 //   - thread-id: "club.{club_id}" for iOS Notification Center grouping
-//   - Stale token (APNs 410) clears profiles.push_token automatically
+//   - Multi-device APNs fan-out via _shared/push-tokens.ts: every registered
+//     device for each member receives the push; one notifications row per user.
+//   - Stale token (APNs 410) is cleared via clearStaleToken (drops the
+//     push_tokens row and NULLs profiles.push_token only when it matches).
 //
 // Deploy: supabase functions deploy club-announcement-notify --no-verify-jwt
 
@@ -13,6 +16,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isUUID, clampStr } from "../_shared/validate.ts";
 import { isRateLimited } from "../_shared/rateLimit.ts";
 import { getCallerID } from "../_shared/auth.ts";
+import { getPushTokensForUser, clearStaleToken, tokenShort } from "../_shared/push-tokens.ts";
 
 interface RequestBody {
   club_id: string;
@@ -105,25 +109,19 @@ serve(async (req: Request) => {
   const pushTitle = `📢 ${club_name}`;
   const pushBody = notifBody;
 
-  // Fetch push tokens for all members
-  const userIDs = members.map((m: { user_id: string }) => m.user_id);
-  const { data: profiles } = await supabase
-    .from("profiles")
-    .select("id,push_token")
-    .in("id", userIDs);
-
-  const tokenByUserID: Record<string, string> = {};
-  for (const p of profiles ?? []) {
-    if (p.push_token) tokenByUserID[p.id] = p.push_token;
-  }
-
   let notifiedCount = 0;
   let pushedCount = 0;
-  const staleTokenUserIDs: string[] = [];
+  let tokenCount = 0;
+  let sendCount = 0;
+  let staleCount = 0;
+  let errorCount = 0;
+  let fallbackCount = 0;
 
   await Promise.allSettled(
     members.map(async (member: { user_id: string }) => {
-      // Insert in-app notification row (triggers send-notification-email hook)
+      const userShort = String(member.user_id).slice(0, 8);
+
+      // Insert one in-app notification row per user (regardless of device count).
       const { data: notifRow } = await supabase
         .from("notifications")
         .insert({
@@ -139,22 +137,35 @@ serve(async (req: Request) => {
 
       notifiedCount++;
       const notificationID = notifRow?.id ?? null;
-      const deviceToken = tokenByUserID[member.user_id];
 
-      if (deviceToken) {
+      const { tokens, fallbackUsed } = await getPushTokensForUser(supabase, member.user_id);
+      tokenCount += tokens.length;
+      if (fallbackUsed) fallbackCount++;
+
+      if (tokens.length === 0) {
+        console.log(`[club-announcement-notify] target=${userShort} tokens=0 fallback=${fallbackUsed}`);
+        return;
+      }
+
+      console.log(`[club-announcement-notify] target=${userShort} tokens=${tokens.length} fallback=${fallbackUsed}`);
+
+      let userPushed = false;
+      for (const token of tokens) {
         try {
           await sendAPNS({
-            deviceToken,
+            deviceToken: token,
             title: pushTitle,
             body: pushBody,
             data: { club_id, post_id, type: "club_announcement" },
             threadID: `club.${club_id}`,
           });
-          pushedCount++;
+          sendCount++;
+          userPushed = true;
+          console.log(`[club-announcement-notify] sent target=${userShort} token=${tokenShort(token)} ok=true`);
           await supabase.from("push_notification_log").insert({
             user_id: member.user_id,
             notification_id: notificationID,
-            device_token: deviceToken,
+            device_token: token,
             title: pushTitle,
             body: pushBody,
             payload: { club_id, post_id, type: "club_announcement" },
@@ -162,35 +173,43 @@ serve(async (req: Request) => {
           });
         } catch (err) {
           if (err instanceof StaleTokenError) {
-            staleTokenUserIDs.push(member.user_id);
-          } else {
-            const errMsg = String(err);
-            console.error(`APNs failed for user ${member.user_id}:`, errMsg);
-            await supabase.from("push_notification_log").insert({
-              user_id: member.user_id,
-              notification_id: notificationID,
-              device_token: deviceToken,
-              title: pushTitle,
-              body: pushBody,
-              payload: { club_id, post_id, type: "club_announcement" },
-              apns_status: 0,
-              apns_error: errMsg,
-            });
+            staleCount++;
+            const cleanup = await clearStaleToken(supabase, member.user_id, token);
+            console.log(
+              `[club-announcement-notify] stale target=${userShort} token=${tokenShort(token)} removed_table=${cleanup.removedFromTable} cleared_profile=${cleanup.clearedOnProfile}`,
+            );
+            continue;
           }
+          errorCount++;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[club-announcement-notify] error target=${userShort} token=${tokenShort(token)} err=${errMsg}`);
+          await supabase.from("push_notification_log").insert({
+            user_id: member.user_id,
+            notification_id: notificationID,
+            device_token: token,
+            title: pushTitle,
+            body: pushBody,
+            payload: { club_id, post_id, type: "club_announcement" },
+            apns_status: 0,
+            apns_error: errMsg,
+          });
         }
       }
+
+      if (userPushed) pushedCount++;
     })
   );
 
-  if (staleTokenUserIDs.length > 0) {
-    await Promise.allSettled(
-      staleTokenUserIDs.map((uid) =>
-        supabase.from("profiles").update({ push_token: null }).eq("id", uid)
-      )
-    );
-  }
-
-  return new Response(JSON.stringify({ notified: notifiedCount, pushed: pushedCount, stale_tokens_cleared: staleTokenUserIDs.length }), {
+  return new Response(JSON.stringify({
+    notified: notifiedCount,
+    pushed: pushedCount,
+    stale_tokens_cleared: staleCount,
+    token_count: tokenCount,
+    pushed_count: sendCount,
+    stale_count: staleCount,
+    error_count: errorCount,
+    fallback_used: fallbackCount > 0,
+  }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
