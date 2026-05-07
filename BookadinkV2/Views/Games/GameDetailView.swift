@@ -228,6 +228,10 @@ struct GameDetailView: View {
                             aboutSection
                         }
 
+                        if currentGame.requiresDUPR {
+                            duprRequirementCard
+                        }
+
                         if canViewAttendees {
                             adminPlayersSection
                         }
@@ -238,10 +242,6 @@ struct GameDetailView: View {
 
                         if let fee = currentGame.feeAmount, fee > 0 {
                             priceSummarySection(fee: fee)
-                        }
-
-                        if currentGame.requiresDUPR {
-                            duprRequirementCard
                         }
 
                         // Error/info banners
