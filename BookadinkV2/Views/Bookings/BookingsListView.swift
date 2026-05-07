@@ -282,7 +282,14 @@ private struct BookingCompactCard: View {
         return LinearGradient(colors: [base, deep], startPoint: .top, endPoint: .bottom)
     }
 
+    // Resolved display status. Game cancellation takes absolute priority over booking state —
+    // a confirmed booking on a cancelled game must never read as "Confirmed".
+    private var isGameCancelled: Bool {
+        item.game?.status == "cancelled"
+    }
+
     private var statusColor: Color {
+        if isGameCancelled { return Brand.errorRed }
         switch item.booking.state {
         case .confirmed:      return .green
         case .waitlisted:     return .orange
@@ -293,6 +300,7 @@ private struct BookingCompactCard: View {
     }
 
     private var statusLabel: String {
+        if isGameCancelled { return "Cancelled" }
         switch item.booking.state {
         case .confirmed:              return "Confirmed"
         case .waitlisted(let pos):
