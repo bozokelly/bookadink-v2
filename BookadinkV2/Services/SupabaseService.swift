@@ -2727,31 +2727,31 @@ final class SupabaseService: ClubDataProviding {
         // The migrated push senders (`promote-top-waitlisted-push` etc.) read this
         // table via `_shared/push-tokens.ts` and only fall back to profiles.push_token
         // when there is no matching row.
+        //
+        // We go through the `register_push_token` SECURITY DEFINER RPC instead of a
+        // direct table upsert. When the same physical device signs out of user A
+        // and into user B, the row keyed on this token is owned by A, and the
+        // table's UPDATE RLS policy (`auth.uid() = user_id`) blocks B from
+        // reassigning it. The RPC runs as definer to perform exactly the
+        // `INSERT ... ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id`
+        // shape, with `user_id` pinned to `auth.uid()` server-side — callers
+        // cannot register a token under another account.
         if let pushToken, !pushToken.isEmpty {
-            let pushTokenBody = try JSONSerialization.data(withJSONObject: [
-                "user_id": userID.uuidString,
-                "token": pushToken
-            ])
-
-            struct PushTokenRow: Decodable { let id: UUID }
+            struct RegisterPushTokenBody: Encodable { let p_token: String }
+            let rpcBody = try JSONEncoder().encode(RegisterPushTokenBody(p_token: pushToken))
 
             do {
-                let _: [PushTokenRow] = try await send(
-                    path: "push_tokens",
-                    queryItems: [
-                        .init(name: "select", value: "id")
-                    ],
+                try await sendVoid(
+                    path: "rpc/register_push_token",
+                    queryItems: [],
                     method: "POST",
-                    body: pushTokenBody,
+                    body: rpcBody,
                     authBearerToken: authToken,
-                    extraHeaders: [
-                        "Prefer": "resolution=merge-duplicates,return=representation",
-                        "Content-Type": "application/json"
-                    ]
+                    extraHeaders: ["Content-Type": "application/json"]
                 )
-                print("[push] push_tokens upsert ok user=\(userID.uuidString) token=\(summary)")
+                print("[push] register_push_token rpc ok user=\(userID.uuidString) token=\(summary)")
             } catch {
-                print("[push] push_tokens upsert FAIL user=\(userID.uuidString) token=\(summary) error=\(error)")
+                print("[push] register_push_token rpc FAIL user=\(userID.uuidString) token=\(summary) error=\(error)")
                 throw error
             }
         }
