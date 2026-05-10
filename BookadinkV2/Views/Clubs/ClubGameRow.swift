@@ -107,13 +107,7 @@ struct UnifiedGameCard: View {
         case "advanced":     parts.append("Advanced")
         default: break
         }
-        if let fee = game.feeAmount, fee > 0 {
-            parts.append(fee.truncatingRemainder(dividingBy: 1) == 0
-                ? "$\(Int(fee))"
-                : "$\(String(format: "%.2f", fee))")
-        } else {
-            parts.append("Free")
-        }
+        parts.append(game.priceLabel)
         return parts.joined(separator: " · ")
     }
 
@@ -129,20 +123,6 @@ struct UnifiedGameCard: View {
             let s = game.gameFormat.replacingOccurrences(of: "_", with: " ").capitalized
             return s.isEmpty ? nil : s
         }
-    }
-
-    // Club-hash tonal gradient — matches BookingCompactCard date block
-    private var dateBlockGradient: LinearGradient {
-        let palettes: [(Color, Color)] = [
-            (Brand.tonalNavyBase,     Brand.tonalNavyDeep),
-            (Brand.tonalCharcoalBase, Brand.tonalCharcoalDeep),
-            (Brand.tonalForestBase,   Brand.tonalForestDeep),
-            (Brand.tonalTanBase,      Brand.tonalTanDeep),
-            (Brand.tonalRoseBase,     Brand.tonalRoseDeep),
-            (Brand.tonalSlateBase,    Brand.tonalSlateDeep),
-        ]
-        let (base, deep) = palettes[abs(game.clubID.hashValue) % palettes.count]
-        return LinearGradient(colors: [base, deep], startPoint: .top, endPoint: .bottom)
     }
 
     // MARK: - Body
@@ -211,19 +191,17 @@ struct UnifiedGameCard: View {
 
     private var dateBlock: some View {
         ZStack {
-            dateBlockGradient
-
-            Canvas { ctx, size in
-                var x: CGFloat = -size.height
-                while x < size.width + size.height {
-                    var path = Path()
-                    path.move(to: CGPoint(x: x, y: 0))
-                    path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                    ctx.stroke(path, with: .color(.white.opacity(0.045)), lineWidth: 1)
-                    x += 14
-                }
-            }
-            .allowsHitTesting(false)
+            // Canonical HeroSurface — pinned palette/pattern when the
+            // admin selected them, deterministic auto rotation seeded
+            // from `game.id` otherwise. Recurring games inherit the
+            // template's selection so every instance shares the same
+            // date-block surface.
+            HeroSurface.forGame(
+                game,
+                lighting: .none,
+                vignette: .none,
+                direction: .vertical
+            )
 
             VStack(spacing: 1) {
                 Text(Self.weekdayFmt.string(from: game.dateTime).uppercased())

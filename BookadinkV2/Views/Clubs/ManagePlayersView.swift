@@ -259,7 +259,7 @@ struct ManagePlayersView: View {
 
                 if !currentGame.startsInPast {
                     // Upcoming game controls
-                    if !isWaitlisted, let fee = currentGame.feeAmount, fee > 0 {
+                    if !isWaitlisted, currentGame.isPaidOnline {
                         paymentBadge(attendee)
                     }
                     if !isWaitlisted {

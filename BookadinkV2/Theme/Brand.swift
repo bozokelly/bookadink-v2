@@ -28,6 +28,10 @@ enum Brand {
     static let tonalRoseDeep     = Color(hex: "5E3F44")
     static let tonalSlateBase    = Color(hex: "4A5560")
     static let tonalSlateDeep    = Color(hex: "2A323B")
+    static let tonalPlumBase     = Color(hex: "4A3450")
+    static let tonalPlumDeep     = Color(hex: "241627")
+    static let tonalTealBase     = Color(hex: "1C3F46")
+    static let tonalTealDeep     = Color(hex: "0E2026")
 
     // ── Preserved legacy token names (updated to neutral values) ────────────
     // These keep all existing call sites compiling while shifting the palette.

@@ -130,6 +130,61 @@ struct OwnerJoinRequestsSheet: View {
     }
 }
 
+/// Shared rows for the game pricing section in both Create and Edit sheets.
+/// Layout: locked (or open) price input, then a separate "Free game" toggle below it.
+/// Three resulting states:
+///   • Free          — toggle on, price empty/disabled
+///   • Paid online   — toggle off, price > 0 (only available when payments are enabled)
+///   • Pay on arrival — toggle off, price empty
+private struct GamePricingRows: View {
+    @Binding var draft: ClubOwnerGameDraft
+    let paymentsGate: GateResult
+    let onPaywall: () -> Void
+
+    private var paymentsBlocked: Bool {
+        if case .blocked = paymentsGate { return true }
+        return false
+    }
+
+    var body: some View {
+        if paymentsBlocked {
+            ProLockedRow(label: "Online price") {
+                onPaywall()
+            }
+        } else {
+            HStack {
+                Text("$")
+                    .foregroundStyle(.secondary)
+                TextField("Online price (optional)", text: $draft.feeAmountText)
+                    .keyboardType(.decimalPad)
+                    .disabled(draft.isFree)
+                    .foregroundStyle(draft.isFree ? Color.secondary : Color.primary)
+            }
+        }
+
+        Toggle("Free game", isOn: Binding(
+            get: { draft.isFree },
+            set: { newValue in
+                draft.isFree = newValue
+                if newValue {
+                    draft.feeAmountText = ""
+                }
+            }
+        ))
+    }
+}
+
+/// Caption beneath the pricing section explaining which of the three states
+/// the current draft will produce.
+private func pricingFooterText(isFree: Bool, feeText: String) -> String {
+    if isFree { return "This game is free. No payment is collected." }
+    let trimmed = feeText.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let value = Double(trimmed), value > 0 {
+        return "Players pay online when they book. The club is paid out after payouts clear."
+    }
+    return "Pay on arrival — players book without paying online; the club collects payment at the venue."
+}
+
 struct OwnerCreateGameSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -139,6 +194,10 @@ struct OwnerCreateGameSheet: View {
     @State private var savedVenues: [ClubVenue] = []
     /// Drives the upgrade paywall sheet. Set to the relevant feature before presenting.
     @State private var paywallFeature: LockedFeature? = nil
+    /// Stable per-sheet seed for the "Automatic" appearance preview. The game
+    /// has no `id` until it's saved; this gives the preview a deterministic
+    /// auto surface that doesn't change while the owner is choosing.
+    @State private var appearancePreviewSeed: UUID = UUID()
 
     // MARK: - Gate checks
 
@@ -285,18 +344,21 @@ struct OwnerCreateGameSheet: View {
                     }
                 }
 
-                Section("Capacity & Fee") {
+                Section {
                     PillStepperRow(label: "Duration: \(draft.durationMinutes) mins", value: $draft.durationMinutes, range: 30...240, step: 15)
                     PillStepperRow(label: "Max Spots: \(draft.maxSpots)", value: $draft.maxSpots, range: 2...64, step: 1)
                     PillStepperRow(label: "Courts: \(draft.courtCount)", value: $draft.courtCount, range: 1...20, step: 1)
-                    if case .blocked = paymentsGate {
-                        ProLockedRow(label: "Game Fee") {
-                            paywallFeature = .payments
-                        }
-                    } else {
-                        TextField("Fee (optional, $)", text: $draft.feeAmountText)
-                            .keyboardType(.decimalPad)
-                    }
+                    GamePricingRows(
+                        draft: $draft,
+                        paymentsGate: paymentsGate,
+                        onPaywall: { paywallFeature = .payments }
+                    )
+                } header: {
+                    Text("Capacity & Fee")
+                } footer: {
+                    Text(pricingFooterText(isFree: draft.isFree, feeText: draft.feeAmountText))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -315,6 +377,8 @@ struct OwnerCreateGameSheet: View {
                             .foregroundStyle(Brand.errorRed)
                     }
                 }
+
+                GameAppearanceFormSection(draft: $draft, gameSeed: appearancePreviewSeed)
 
                 if let error = appState.ownerToolsErrorMessage, !error.isEmpty {
                     Section {
@@ -517,18 +581,21 @@ struct OwnerEditGameSheet: View {
                     Toggle("Requires DUPR", isOn: $draft.requiresDUPR)
                 }
 
-                Section("Capacity & Fee") {
+                Section {
                     PillStepperRow(label: "Duration: \(draft.durationMinutes) mins", value: $draft.durationMinutes, range: 30...240, step: 15)
                     PillStepperRow(label: "Max Spots: \(draft.maxSpots)", value: $draft.maxSpots, range: 2...64, step: 1)
                     PillStepperRow(label: "Courts: \(draft.courtCount)", value: $draft.courtCount, range: 1...20, step: 1)
-                    if case .blocked = paymentsGate {
-                        ProLockedRow(label: "Game Fee") {
-                            paywallFeature = .payments
-                        }
-                    } else {
-                        TextField("Fee (optional, $)", text: $draft.feeAmountText)
-                            .keyboardType(.decimalPad)
-                    }
+                    GamePricingRows(
+                        draft: $draft,
+                        paymentsGate: paymentsGate,
+                        onPaywall: { paywallFeature = .payments }
+                    )
+                } header: {
+                    Text("Capacity & Fee")
+                } footer: {
+                    Text(pricingFooterText(isFree: draft.isFree, feeText: draft.feeAmountText))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -588,6 +655,8 @@ struct OwnerEditGameSheet: View {
                             .font(.caption)
                     }
                 }
+
+                GameAppearanceFormSection(draft: $draft, gameSeed: game.id)
 
                 if let error = appState.ownerToolsErrorMessage, !error.isEmpty {
                     Section {
@@ -691,6 +760,281 @@ struct OwnerEditGameSheet: View {
         if hours > 0 { parts.append("\(hours)h") }
         if mins > 0  { parts.append("\(mins)m") }
         return "Game will go live \(parts.joined(separator: " ")) before its start time."
+    }
+}
+
+// MARK: - Game Appearance Form Section
+//
+// Shared section used at the bottom of both `OwnerCreateGameSheet` and
+// `OwnerEditGameSheet`. Lets admins optionally pin a HeroSurface palette
+// and / or pattern to a game so recurring sessions stay visually
+// recognisable. Both axes default to nil (automatic). The section writes
+// only to the in-memory draft — persistence happens via the sheet's
+// existing Create / Save action, no auto-save here.
+
+struct GameAppearanceFormSection: View {
+    @Binding var draft: ClubOwnerGameDraft
+    /// Seed used for the deterministic auto preview. For edits, pass the
+    /// game's `id` so the preview matches what the app will actually render
+    /// at runtime. For new games (no id yet), pass a stable per-sheet UUID.
+    let gameSeed: UUID
+
+    private var previewPalette: HeroPalette? {
+        draft.appearancePaletteKey.flatMap(HeroPalette.init(rawValue:))
+    }
+
+    private var previewPattern: HeroPattern? {
+        draft.appearancePatternKey.flatMap(HeroPattern.init(rawValue:))
+    }
+
+    /// Mirrors `HeroSurface.forGame(_:)` but reads from the draft so the
+    /// preview reflects in-progress selections before save.
+    private var previewSurface: HeroSurface {
+        let auto = HeroSurface.deterministic(
+            seed: gameSeed,
+            lighting: .topRight,
+            vignette: .none,
+            direction: .diagonal
+        )
+        let palette = previewPalette ?? auto.palette
+        let pattern: HeroPattern
+        if let pinned = previewPattern, pinned != .court {
+            pattern = pinned
+        } else {
+            pattern = auto.pattern
+        }
+        return HeroSurface(
+            palette: palette,
+            pattern: pattern,
+            lighting: .topRight,
+            vignette: .bottomStrong,
+            direction: .diagonal
+        )
+    }
+
+    /// Palette family used as the backdrop for texture-picker tiles so the
+    /// owner sees each pattern against their currently-pinned palette
+    /// (or the auto palette if they haven't pinned one).
+    private var texturePreviewPalette: HeroPalette {
+        if let p = previewPalette { return p }
+        let raw = UInt(bitPattern: gameSeed.hashValue)
+        return HeroPalette.allCases[Int(raw % UInt(HeroPalette.allCases.count))]
+    }
+
+    var body: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 14) {
+                previewCard
+                paletteHeader
+                paletteGrid
+                textureHeader
+                textureGrid
+            }
+            .padding(.vertical, 6)
+        } header: {
+            Text("Game Appearance")
+        } footer: {
+            Text("Optional. Use this to make recurring sessions visually recognisable.")
+                .font(.caption)
+        }
+    }
+
+    // MARK: Preview
+
+    private var previewCard: some View {
+        ZStack(alignment: .bottomLeading) {
+            previewSurface
+            VStack(alignment: .leading, spacing: 2) {
+                Text(draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                     ? "Game preview"
+                     : draft.title)
+                    .font(.system(size: 15, weight: .heavy))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Text(previewSubtitle)
+                    .font(.system(size: 9.5, weight: .heavy))
+                    .kerning(0.9)
+                    .foregroundStyle(.white.opacity(0.72))
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 12)
+        }
+        .frame(height: 88)
+        .frame(maxWidth: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var previewSubtitle: String {
+        let palette = previewPalette
+        let pattern = previewPattern
+        if palette == nil && pattern == nil { return "AUTOMATIC SURFACE" }
+        let palLabel = palette.flatMap { p in
+            HeroSurfaceCatalog.palettes.first(where: { $0.palette == p })?.label
+        } ?? "Auto"
+        let patLabel = pattern.flatMap { pat in
+            HeroSurfaceCatalog.patterns.first(where: { $0.pattern == pat })?.label
+        } ?? "Auto"
+        return "\(palLabel.uppercased()) · \(patLabel.uppercased())"
+    }
+
+    // MARK: Palette picker
+
+    private var paletteHeader: some View {
+        HStack {
+            Text("Palette")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            if previewPalette == nil {
+                Text("Automatic")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var paletteGrid: some View {
+        LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3),
+            spacing: 8
+        ) {
+            paletteTile(palette: nil, label: "Auto")
+            ForEach(HeroSurfaceCatalog.palettes, id: \.palette) { entry in
+                paletteTile(palette: entry.palette, label: entry.label)
+            }
+        }
+    }
+
+    private func paletteTile(palette: HeroPalette?, label: String) -> some View {
+        let isSelected: Bool = palette.map { previewPalette == $0 } ?? (previewPalette == nil)
+        return Button {
+            draft.appearancePaletteKey = palette?.rawValue
+        } label: {
+            paletteTileSurface(for: palette)
+                .frame(height: 50)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(isSelected ? Brand.accentGreen : .white.opacity(0.10),
+                                lineWidth: isSelected ? 2 : 1.2)
+                )
+                .overlay(alignment: .center) {
+                    Text(label)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .padding(.horizontal, 4)
+                }
+                .overlay(alignment: .topTrailing) {
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(Brand.accentGreen)
+                            .padding(3)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func paletteTileSurface(for palette: HeroPalette?) -> some View {
+        if let p = palette {
+            HeroSurface(
+                palette: p,
+                pattern: .diagonal,
+                lighting: .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+        } else {
+            HeroSurface.deterministic(
+                seed: gameSeed,
+                lighting: .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+        }
+    }
+
+    // MARK: Texture picker
+
+    private var textureHeader: some View {
+        HStack {
+            Text("Texture")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            if previewPattern == nil {
+                Text("Automatic")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var textureGrid: some View {
+        LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4),
+            spacing: 8
+        ) {
+            textureTile(pattern: nil, label: "Auto")
+            ForEach(HeroSurfaceCatalog.patterns, id: \.pattern) { entry in
+                textureTile(pattern: entry.pattern, label: entry.label)
+            }
+        }
+    }
+
+    private func textureTile(pattern: HeroPattern?, label: String) -> some View {
+        let isSelected: Bool = pattern.map { previewPattern == $0 } ?? (previewPattern == nil)
+        let palette = texturePreviewPalette
+        return Button {
+            draft.appearancePatternKey = pattern?.rawValue
+        } label: {
+            textureTileSurface(for: pattern, palette: palette)
+                .frame(height: 46)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(isSelected ? Brand.accentGreen : .white.opacity(0.10),
+                                lineWidth: isSelected ? 2 : 1.2)
+                )
+                .overlay(alignment: .center) {
+                    Text(label)
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .padding(.horizontal, 4)
+                }
+                .overlay(alignment: .topTrailing) {
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(Brand.accentGreen)
+                            .padding(3)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func textureTileSurface(for pattern: HeroPattern?, palette: HeroPalette) -> some View {
+        if let p = pattern {
+            HeroSurface(
+                palette: palette,
+                pattern: p,
+                lighting: p == .none ? .center : .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+        } else {
+            HeroSurface.deterministic(
+                seed: gameSeed,
+                lighting: .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+        }
     }
 }
 
@@ -1366,14 +1710,6 @@ struct ClubFormBody: View {
     var club: Club?
 
     /// Hero key → asset name mapping. Static so it is never rebuilt during renders.
-    private static let heroImageNames: [String: String] = [
-        "hero_1": "vine_concept",
-        "hero_2": "red_topdown",
-        "hero_3": "blue_collage",
-        "hero_4": "blue_closeup",
-        "hero_5": "red_aerial",
-        "hero_6": "dark_aerial",
-    ]
 
     /// Venues for the current club. Computed once per render and reused throughout
     /// the body instead of calling `appState.venues(for:)` three separate times.
@@ -1760,41 +2096,11 @@ struct ClubFormBody: View {
                     }
                 }
 
-                // Preset grid
-                Text("Or choose a preset:")
+                // No upload? The club uses an automatic curated surface.
+                // Palette and texture can be customised under Appearance.
+                Text("No banner uploaded — your club uses a curated surface. Customise palette and texture under Appearance.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
-                    ForEach(["hero_1", "hero_2", "hero_3", "hero_4", "hero_5", "hero_6"], id: \.self) { key in
-                        let isSelected = draft.uploadedBannerURL == nil && draft.heroImageKey == key
-                        Button {
-                            draft.heroImageKey = (draft.uploadedBannerURL == nil && draft.heroImageKey == key) ? nil : key
-                            draft.uploadedBannerURL = nil
-                        } label: {
-                            Image(Self.heroImageNames[key] ?? key)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 60)
-                                .clipped()
-                                .cornerRadius(8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(isSelected ? Brand.accentGreen : Color.clear, lineWidth: 2.5)
-                                )
-                                .overlay(alignment: .topTrailing) {
-                                    if isSelected {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .font(.caption.weight(.semibold))
-                                            .foregroundStyle(Brand.accentGreen)
-                                            .padding(4)
-                                    }
-                                }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
             }
             .onChange(of: bannerPhotoItem) { _, item in
                 guard let item, club?.id != nil else { return }
@@ -2121,7 +2427,6 @@ struct ClubFormBody: View {
             let previousURL = draft.uploadedBannerURL
             let url = try await appState.uploadClubBannerImage(jpeg, clubID: clubID)
             draft.uploadedBannerURL = url
-            draft.heroImageKey = nil
             // Delete the previous in-session upload — it will never be saved.
             if let old = previousURL {
                 Task { await appState.deleteClubStorageImageIfManaged(old) }
@@ -2310,24 +2615,29 @@ struct AutoSavePill: View {
 
     var body: some View {
         if saving || saved {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
                 if saving {
                     ProgressView()
                         .scaleEffect(0.75)
                         .tint(Brand.primaryText)
                 } else {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Brand.primaryText)
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Brand.accentGreen)
                 }
                 Text(saving ? "Saving…" : "Saved")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 13.5, weight: .semibold))
                     .foregroundStyle(Brand.primaryText)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 9)
-            .background(.ultraThinMaterial, in: Capsule())
-            .shadow(color: .black.opacity(0.10), radius: 10, y: 3)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(
+                Capsule().fill(.regularMaterial)
+            )
+            .overlay(
+                Capsule().stroke(Brand.softOutline, lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
@@ -2345,10 +2655,18 @@ struct OwnerEditClubSheet: View {
     @State private var isSavingAuto = false
     @State private var showSavedPill = false
     @State private var isInitialLoad = true
+    /// Snapshot of the last successfully-persisted draft. Used to decide
+    /// whether `.onDisappear` needs to flush a save. Compared by value
+    /// against the live draft so changes made *during* an in-flight save
+    /// are still detected as dirty (a simple boolean dirty flag would be
+    /// cleared by the in-flight save's success and lose those changes).
+    @State private var lastSavedDraft: ClubOwnerEditDraft
 
     init(club: Club) {
         self.club = club
-        _draft = State(initialValue: ClubOwnerEditDraft(club: club))
+        let initial = ClubOwnerEditDraft(club: club)
+        _draft = State(initialValue: initial)
+        _lastSavedDraft = State(initialValue: initial)
     }
 
     private var venues: [ClubVenue] { appState.venues(for: club) }
@@ -2357,7 +2675,7 @@ struct OwnerEditClubSheet: View {
         ("Name your club", !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
         ("Add a primary venue", venues.contains(where: { $0.isPrimary })),
         ("Set profile picture", draft.uploadedAvatarURL != nil || draft.avatarBackgroundColor != nil),
-        ("Choose a banner", draft.heroImageKey != nil || draft.uploadedBannerURL != nil),
+        ("Choose a banner", draft.uploadedBannerURL != nil),
         ("Add a Code of Conduct", !draft.codeOfConduct.isEmpty),
     ]}
 
@@ -2687,6 +3005,9 @@ struct OwnerEditClubSheet: View {
                 guard !isInitialLoad else { return }
                 scheduleAutoSave()
             }
+            .onDisappear {
+                flushPendingSaveOnDismiss()
+            }
         }
         .tint(Brand.primaryText)
         .overlay(alignment: .bottom) {
@@ -2696,6 +3017,22 @@ struct OwnerEditClubSheet: View {
             }
             .frame(maxWidth: .infinity)
             .animation(.spring(duration: 0.25), value: isSavingAuto || showSavedPill)
+        }
+    }
+
+    /// Force a save before the sheet goes away, but only when the latest
+    /// draft differs from what we last persisted. Captures `appState`,
+    /// `club`, and the draft by value into a detached Task so the work
+    /// survives the view's `@State` being torn down. AppState's main-actor
+    /// isolation serialises the call against any in-flight save.
+    private func flushPendingSaveOnDismiss() {
+        guard draft != lastSavedDraft, canAutoSave else { return }
+        autoSaveTask?.cancel()
+        let pendingDraft = draft
+        let pendingClub = club
+        let pendingAppState = appState
+        Task.detached {
+            _ = await pendingAppState.updateClubOwnerFields(pendingClub, draft: pendingDraft)
         }
     }
 
@@ -2709,14 +3046,28 @@ struct OwnerEditClubSheet: View {
     }
 
     private func performAutoSave() async {
-        guard canAutoSave, !appState.isSavingClubOwnerSettings else { return }
+        guard canAutoSave else { return }
+        // If a save is already in flight, re-queue this attempt so the
+        // latest draft state still gets persisted once the prior save
+        // releases. The previous behaviour (silent return) silently
+        // dropped any selection made while a save was running.
+        if appState.isSavingClubOwnerSettings {
+            scheduleAutoSave()
+            return
+        }
         let oldAvatarURL = club.imageURL
         let oldBannerURL = club.customBannerURL
+        // Snapshot the draft we're about to persist so the dirty check
+        // compares against this exact value. If the user mutates `draft`
+        // during the in-flight network call, the comparison still detects
+        // the post-save mutation as unsaved.
+        let attempted = draft
         await MainActor.run { isSavingAuto = true; showSavedPill = false }
-        let didSave = await appState.updateClubOwnerFields(club, draft: draft)
+        let didSave = await appState.updateClubOwnerFields(club, draft: attempted)
         await MainActor.run {
             isSavingAuto = false
             guard didSave else { return }
+            lastSavedDraft = attempted
             if draft.uploadedAvatarURL != nil {
                 Task { await appState.deleteClubStorageImageIfManaged(oldAvatarURL) }
             }
@@ -2725,7 +3076,7 @@ struct OwnerEditClubSheet: View {
             }
             showSavedPill = true
             Task {
-                try? await Task.sleep(nanoseconds: 1_300_000_000)
+                try? await Task.sleep(nanoseconds: 1_800_000_000)
                 await MainActor.run { showSavedPill = false }
             }
         }
@@ -3013,192 +3364,251 @@ struct ClubAppearanceSettingsView: View {
     @State private var showAvatarCrop = false
     @State private var showBannerCrop = false
 
-    private static let heroImageNames: [String: String] = [
-        "hero_1": "vine_concept", "hero_2": "red_topdown", "hero_3": "blue_collage",
-        "hero_4": "blue_closeup", "hero_5": "red_aerial",  "hero_6": "dark_aerial",
-    ]
     private var avatarSwatchColors: [AvatarGradients.Entry] { AvatarGradients.softLuxury }
+
+    /// Preview palette derived from the current draft. `nil` ⇒ automatic.
+    private var previewPalette: HeroPalette? {
+        draft.appearancePaletteKey.flatMap(HeroPalette.init(rawValue:))
+    }
+
+    /// Preview pattern derived from the current draft. `nil` ⇒ automatic.
+    private var previewPattern: HeroPattern? {
+        draft.appearancePatternKey.flatMap(HeroPattern.init(rawValue:))
+    }
+
+    /// Resolves the surface that the preview should render. Mirrors the
+    /// runtime path in `ClubDetailView.heroBackground`: pinned values when
+    /// the owner has chosen them, deterministic auto rotation otherwise.
+    /// The `.bottomStrong` vignette is baked in to match the runtime — so
+    /// what the owner sees here is what they get on the club page.
+    private var previewSurface: HeroSurface {
+        let auto = HeroSurface.deterministic(
+            seed: club.id,
+            lighting: .topRight,
+            vignette: .none,
+            direction: .diagonal
+        )
+        let palette = previewPalette ?? auto.palette
+        let pattern: HeroPattern
+        if let pinned = previewPattern, pinned != .court {
+            pattern = pinned
+        } else {
+            pattern = auto.pattern
+        }
+        return HeroSurface(
+            palette: palette,
+            pattern: pattern,
+            lighting: .topRight,
+            vignette: .bottomStrong,
+            direction: .diagonal
+        )
+    }
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 20) {
-                // Live preview
-                CSSectionLabel(text: "Preview")
-                ClubImageBadge(club: club)
-                    .frame(width: 72, height: 72)
-                    .clipShape(Circle())
-                    .overlay(Circle().stroke(Brand.accentGreen, lineWidth: 2.5))
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 8)
+            VStack(spacing: 24) {
+                previewHero
+                profilePictureSection
+                bannerSection
+                paletteSection
+                textureSection
+            }
+            .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 40)
+        }
+        .background(Brand.appBackground)
+        .navigationTitle("Appearance")
+        .navigationBarTitleDisplayMode(.inline)
+    }
 
-                // Profile picture
-                CSSectionLabel(text: "Profile Picture")
-                VStack(spacing: 0) {
-                    PhotosPicker(selection: $avatarPhotoItem, matching: .images, photoLibrary: .shared()) {
-                        CSNavRow(
-                            icon: isUploadingAvatar ? "arrow.triangle.2.circlepath" : "photo.badge.plus",
-                            label: isUploadingAvatar ? "Uploading…" : "Upload Custom Photo",
-                            sub: "400×400 px · PNG or JPEG",
-                            divider: draft.uploadedAvatarURL != nil || draft.uploadedAvatarURL == nil
-                        )
-                    }
-                    .disabled(isUploadingAvatar)
-                    .buttonStyle(.plain)
+    // MARK: Preview
 
-                    if let uploadedURL = draft.uploadedAvatarURL {
-                        HStack(spacing: 12) {
-                            AsyncImage(url: uploadedURL) { phase in
-                                if case let .success(img) = phase { img.resizable().scaledToFill() }
-                                else { Color.secondary.opacity(0.2) }
-                            }
-                            .frame(width: 48, height: 48)
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Custom photo uploaded")
-                                    .font(.system(size: 14, weight: .semibold))
-                                Button("Remove") { draft.uploadedAvatarURL = nil }
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(Brand.errorRed)
-                                    .buttonStyle(.plain)
-                            }
-                            Spacer()
-                        }
-                        .padding(.horizontal, 16).padding(.vertical, 12)
-                        .overlay(alignment: .bottom) {
-                            Rectangle().fill(Brand.dividerColor).frame(height: 0.5).padding(.leading, 16)
-                        }
-                    }
-
-                    if let err = avatarUploadError {
-                        Text(err).font(.caption).foregroundStyle(Brand.errorRed)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 16).padding(.bottom, 8)
-                    }
-
-                    if draft.uploadedAvatarURL == nil {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Avatar background colour")
-                                .font(.system(size: 12.5))
-                                .foregroundStyle(Brand.secondaryText)
-                            HStack(spacing: 12) {
-                                ForEach(avatarSwatchColors) { swatch in
-                                    Button {
-                                        draft.avatarBackgroundColor = swatch.key
-                                    } label: {
-                                        Circle()
-                                            .fill(swatch.gradient)
-                                            .frame(width: 40, height: 40)
-                                            .overlay(
-                                                Circle().stroke(
-                                                    draft.avatarBackgroundColor == swatch.key
-                                                        ? Brand.accentGreen : Color.clear,
-                                                    lineWidth: 3
-                                                )
-                                            )
-                                            .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                        .padding(.horizontal, 16).padding(.vertical, 14)
+    private var previewHero: some View {
+        ZStack(alignment: .bottomLeading) {
+            // Background: uploaded banner takes priority and keeps the
+            // heavier scrim treatment (preserved verbatim for parity with
+            // ClubDetailView). HeroSurface fallback uses the lighter
+            // `.bottomStrong` vignette baked into `previewSurface` — no
+            // additional global scrim, matching the runtime.
+            if let uploadedURL = draft.uploadedBannerURL {
+                AsyncImage(url: uploadedURL) { phase in
+                    if case let .success(img) = phase {
+                        img.resizable().scaledToFill()
+                    } else {
+                        previewSurface
                     }
                 }
-                .background(Brand.cardBackground,
-                            in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .onChange(of: avatarPhotoItem) { _, item in
-                    guard let item else { return }
-                    Task {
-                        guard let data = try? await item.loadTransferable(type: Data.self),
-                              let img = UIImage(data: data) else { return }
-                        await MainActor.run { pendingAvatarImage = img; showAvatarCrop = true; avatarPhotoItem = nil }
+                .overlay(Color.black.opacity(0.30))
+                .overlay(
+                    LinearGradient(
+                        colors: [
+                            .black.opacity(0.0),
+                            .black.opacity(0.55),
+                            .black.opacity(0.78),
+                        ],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                )
+            } else {
+                previewSurface
+            }
+
+            // Editorial content block: avatar + name + sample meta.
+            HStack(alignment: .bottom, spacing: 12) {
+                previewAvatar
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(draft.name.isEmpty ? club.name : draft.name)
+                        .font(.system(size: 22, weight: .heavy))
+                        .kerning(-0.4)
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Text("12 SESSIONS THIS WEEK")
+                        .font(.system(size: 10.5, weight: .heavy))
+                        .kerning(1.1)
+                        .foregroundStyle(Color.white.opacity(0.72))
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 14)
+        }
+        .frame(height: 168)
+        .frame(maxWidth: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Brand.softOutline, lineWidth: 0.5)
+        )
+    }
+
+    // MARK: Preview avatar (live-bound to draft)
+    //
+    // Reads draft state directly so swatch picks and avatar uploads are
+    // reflected in the preview before the auto-save round-trip completes.
+    // One rounded corner, one hairline stroke — no stacked outlines.
+
+    private var previewAvatarCornerRadius: CGFloat { 12 }
+    private var previewAvatarSize: CGFloat { 48 }
+
+    @ViewBuilder
+    private var previewAvatar: some View {
+        ZStack {
+            if let uploadedURL = draft.uploadedAvatarURL {
+                AsyncImage(url: uploadedURL) { phase in
+                    if case let .success(img) = phase {
+                        img.resizable().scaledToFill()
+                    } else {
+                        previewAvatarInitials
                     }
                 }
-                .sheet(isPresented: $showAvatarCrop) {
-                    if let img = pendingAvatarImage {
-                        ImageCropSheet(image: img, aspectRatio: 1.0, title: "Crop Profile Picture",
-                            onCancel: { showAvatarCrop = false; pendingAvatarImage = nil }
-                        ) { cropped in
-                            showAvatarCrop = false; pendingAvatarImage = nil
-                            Task { await uploadAvatarImage(cropped, clubID: club.id) }
+            } else if let imgURL = club.imageURL {
+                AsyncImage(url: imgURL) { phase in
+                    if case let .success(img) = phase {
+                        img.resizable().scaledToFill()
+                    } else {
+                        previewAvatarInitials
+                    }
+                }
+            } else {
+                previewAvatarInitials
+            }
+        }
+        .frame(width: previewAvatarSize, height: previewAvatarSize)
+        .clipShape(RoundedRectangle(cornerRadius: previewAvatarCornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: previewAvatarCornerRadius, style: .continuous)
+                .stroke(Color.white.opacity(0.22), lineWidth: 1)
+        )
+    }
+
+    private var previewAvatarInitials: some View {
+        ZStack {
+            AvatarGradients.resolveGradient(forKey: draft.avatarBackgroundColor)
+            Text(previewInitials)
+                .font(.system(size: 17, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+    }
+
+    private var previewInitials: String {
+        let source = draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? club.name
+            : draft.name
+        let words = source.split(separator: " ").prefix(5)
+        return words.compactMap { $0.first.map { String($0).uppercased() } }.joined()
+    }
+
+    // MARK: Profile picture
+
+    @ViewBuilder
+    private var profilePictureSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            CSSectionLabel(text: "Profile Picture")
+            VStack(spacing: 0) {
+                PhotosPicker(selection: $avatarPhotoItem, matching: .images, photoLibrary: .shared()) {
+                    CSNavRow(
+                        icon: isUploadingAvatar ? "arrow.triangle.2.circlepath" : "photo.badge.plus",
+                        label: isUploadingAvatar ? "Uploading…" : "Upload Custom Photo",
+                        sub: "400×400 px · PNG or JPEG",
+                        divider: draft.uploadedAvatarURL != nil || draft.uploadedAvatarURL == nil
+                    )
+                }
+                .disabled(isUploadingAvatar)
+                .buttonStyle(.plain)
+
+                if let uploadedURL = draft.uploadedAvatarURL {
+                    HStack(spacing: 12) {
+                        AsyncImage(url: uploadedURL) { phase in
+                            if case let .success(img) = phase { img.resizable().scaledToFill() }
+                            else { Color.secondary.opacity(0.2) }
                         }
+                        .frame(width: 48, height: 48)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Custom photo uploaded")
+                                .font(.system(size: 14, weight: .semibold))
+                            Button("Remove") { draft.uploadedAvatarURL = nil }
+                                .font(.system(size: 13))
+                                .foregroundStyle(Brand.errorRed)
+                                .buttonStyle(.plain)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, 12)
+                    .overlay(alignment: .bottom) {
+                        Rectangle().fill(Brand.dividerColor).frame(height: 0.5).padding(.leading, 16)
                     }
                 }
 
-                // Banner
-                CSSectionLabel(text: "Banner")
-                VStack(spacing: 0) {
-                    PhotosPicker(selection: $bannerPhotoItem, matching: .images, photoLibrary: .shared()) {
-                        CSNavRow(
-                            icon: isUploadingBanner ? "arrow.triangle.2.circlepath" : "photo.badge.plus",
-                            label: isUploadingBanner ? "Uploading…" : "Upload Custom Banner",
-                            sub: "1500×1000 px · 3:2 ratio"
-                        )
-                    }
-                    .disabled(isUploadingBanner)
-                    .buttonStyle(.plain)
+                if let err = avatarUploadError {
+                    Text(err).font(.caption).foregroundStyle(Brand.errorRed)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16).padding(.bottom, 8)
+                }
 
-                    if let uploadedURL = draft.uploadedBannerURL {
-                        VStack(alignment: .leading, spacing: 4) {
-                            AsyncImage(url: uploadedURL) { phase in
-                                if case let .success(img) = phase { img.resizable().scaledToFill() }
-                                else { Color.secondary.opacity(0.2) }
-                            }
-                            .frame(maxWidth: .infinity).frame(height: 70).clipped()
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            HStack {
-                                Text("Custom banner uploaded")
-                                    .font(.system(size: 13, weight: .semibold))
-                                Spacer()
-                                Button("Remove") { draft.uploadedBannerURL = nil }
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(Brand.errorRed)
-                                    .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.horizontal, 16).padding(.vertical, 12)
-                        .overlay(alignment: .bottom) {
-                            Rectangle().fill(Brand.dividerColor).frame(height: 0.5).padding(.leading, 16)
-                        }
-                    }
-
-                    if let err = bannerUploadError {
-                        Text(err).font(.caption).foregroundStyle(Brand.errorRed)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 16).padding(.bottom, 8)
-                    }
-
+                if draft.uploadedAvatarURL == nil {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Or choose a preset")
+                        Text("Avatar background colour")
                             .font(.system(size: 12.5))
                             .foregroundStyle(Brand.secondaryText)
-                        LazyVGrid(
-                            columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3),
-                            spacing: 8
-                        ) {
-                            ForEach(["hero_1","hero_2","hero_3","hero_4","hero_5","hero_6"], id: \.self) { key in
-                                let isSelected = draft.uploadedBannerURL == nil && draft.heroImageKey == key
+                        HStack(spacing: 12) {
+                            ForEach(avatarSwatchColors) { swatch in
                                 Button {
-                                    draft.heroImageKey = isSelected ? nil : key
-                                    draft.uploadedBannerURL = nil
+                                    draft.avatarBackgroundColor = swatch.key
                                 } label: {
-                                    Image(Self.heroImageNames[key] ?? key)
-                                        .resizable().scaledToFill()
-                                        .frame(maxWidth: .infinity).frame(height: 60).clipped()
-                                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                    Circle()
+                                        .fill(swatch.gradient)
+                                        .frame(width: 40, height: 40)
                                         .overlay(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .stroke(isSelected ? Brand.accentGreen : Color.clear,
-                                                        lineWidth: 2.5)
+                                            Circle().stroke(
+                                                draft.avatarBackgroundColor == swatch.key
+                                                    ? Brand.accentGreen : Color.clear,
+                                                lineWidth: 3
+                                            )
                                         )
-                                        .overlay(alignment: .topTrailing) {
-                                            if isSelected {
-                                                Image(systemName: "checkmark.circle.fill")
-                                                    .font(.caption.weight(.semibold))
-                                                    .foregroundStyle(Brand.accentGreen)
-                                                    .padding(4)
-                                            }
-                                        }
+                                        .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -3206,33 +3616,320 @@ struct ClubAppearanceSettingsView: View {
                     }
                     .padding(.horizontal, 16).padding(.vertical, 14)
                 }
-                .background(Brand.cardBackground,
-                            in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .onChange(of: bannerPhotoItem) { _, item in
-                    guard let item else { return }
-                    Task {
-                        guard let data = try? await item.loadTransferable(type: Data.self),
-                              let img = UIImage(data: data) else { return }
-                        await MainActor.run { pendingBannerImage = img; showBannerCrop = true; bannerPhotoItem = nil }
-                    }
+            }
+            .background(Brand.cardBackground,
+                        in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .onChange(of: avatarPhotoItem) { _, item in
+                guard let item else { return }
+                Task {
+                    guard let data = try? await item.loadTransferable(type: Data.self),
+                          let img = UIImage(data: data) else { return }
+                    await MainActor.run { pendingAvatarImage = img; showAvatarCrop = true; avatarPhotoItem = nil }
                 }
-                .sheet(isPresented: $showBannerCrop) {
-                    if let img = pendingBannerImage {
-                        ImageCropSheet(image: img, aspectRatio: ClubHeroView.bannerAspectRatio,
-                            title: "Crop Banner",
-                            onCancel: { showBannerCrop = false; pendingBannerImage = nil }
-                        ) { cropped in
-                            showBannerCrop = false; pendingBannerImage = nil
-                            Task { await uploadBannerImage(cropped, clubID: club.id) }
-                        }
+            }
+            .sheet(isPresented: $showAvatarCrop) {
+                if let img = pendingAvatarImage {
+                    ImageCropSheet(image: img, aspectRatio: 1.0, title: "Crop Profile Picture",
+                        onCancel: { showAvatarCrop = false; pendingAvatarImage = nil }
+                    ) { cropped in
+                        showAvatarCrop = false; pendingAvatarImage = nil
+                        Task { await uploadAvatarImage(cropped, clubID: club.id) }
                     }
                 }
             }
-            .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 40)
         }
-        .background(Brand.appBackground)
-        .navigationTitle("Appearance")
-        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    // MARK: Banner
+
+    @ViewBuilder
+    private var bannerSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            CSSectionLabel(text: "Banner")
+            VStack(spacing: 0) {
+                PhotosPicker(selection: $bannerPhotoItem, matching: .images, photoLibrary: .shared()) {
+                    CSNavRow(
+                        icon: isUploadingBanner ? "arrow.triangle.2.circlepath" : "photo.badge.plus",
+                        label: isUploadingBanner ? "Uploading…" : "Upload Custom Banner",
+                        sub: "1500×1000 px · 3:2 ratio"
+                    )
+                }
+                .disabled(isUploadingBanner)
+                .buttonStyle(.plain)
+
+                if let uploadedURL = draft.uploadedBannerURL {
+                    VStack(alignment: .leading, spacing: 4) {
+                        AsyncImage(url: uploadedURL) { phase in
+                            if case let .success(img) = phase { img.resizable().scaledToFill() }
+                            else { Color.secondary.opacity(0.2) }
+                        }
+                        .frame(maxWidth: .infinity).frame(height: 70).clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        HStack {
+                            Text("Custom banner uploaded")
+                                .font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            Button("Remove") { draft.uploadedBannerURL = nil }
+                                .font(.system(size: 13))
+                                .foregroundStyle(Brand.errorRed)
+                                .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, 12)
+                } else {
+                    Text("No banner uploaded — your club uses the curated surface below.")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Brand.secondaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16).padding(.vertical, 12)
+                }
+
+                if let err = bannerUploadError {
+                    Text(err).font(.caption).foregroundStyle(Brand.errorRed)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16).padding(.bottom, 8)
+                }
+            }
+            .background(Brand.cardBackground,
+                        in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .onChange(of: bannerPhotoItem) { _, item in
+                guard let item else { return }
+                Task {
+                    guard let data = try? await item.loadTransferable(type: Data.self),
+                          let img = UIImage(data: data) else { return }
+                    await MainActor.run { pendingBannerImage = img; showBannerCrop = true; bannerPhotoItem = nil }
+                }
+            }
+            .sheet(isPresented: $showBannerCrop) {
+                if let img = pendingBannerImage {
+                    ImageCropSheet(image: img, aspectRatio: ClubHeroView.bannerAspectRatio,
+                        title: "Crop Banner",
+                        onCancel: { showBannerCrop = false; pendingBannerImage = nil }
+                    ) { cropped in
+                        showBannerCrop = false; pendingBannerImage = nil
+                        Task { await uploadBannerImage(cropped, clubID: club.id) }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Surface palette picker
+
+    @ViewBuilder
+    private var paletteSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            CSSectionLabel(text: "Surface Palette")
+            VStack(alignment: .leading, spacing: 12) {
+                Text(previewPalette == nil
+                     ? "Automatic — your club rotates within a curated set of premium surfaces."
+                     : "Pinned to a single palette family.")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Brand.secondaryText)
+
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3),
+                    spacing: 10
+                ) {
+                    automaticPaletteTile
+                    ForEach(HeroSurfaceCatalog.palettes, id: \.palette) { entry in
+                        paletteTile(entry.palette, label: entry.label)
+                    }
+                }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 14)
+            .background(Brand.cardBackground,
+                        in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+    }
+
+    private var automaticPaletteTile: some View {
+        let isSelected = previewPalette == nil
+        return Button {
+            draft.appearancePaletteKey = nil
+        } label: {
+            HeroSurface.deterministic(
+                seed: club.id,
+                lighting: .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+            .frame(height: 64)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isSelected ? Brand.accentGreen : .white.opacity(0.10), lineWidth: 2)
+            )
+            .overlay(alignment: .topLeading) {
+                Text("AUTO")
+                    .font(.system(size: 9.5, weight: .heavy))
+                    .kerning(0.9)
+                    .foregroundStyle(.white.opacity(0.95))
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(.black.opacity(0.32),
+                                in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                    .padding(8)
+            }
+            .overlay(alignment: .bottomLeading) {
+                Text("Automatic")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+            }
+            .overlay(alignment: .topTrailing) {
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.accentGreen)
+                        .padding(6)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func paletteTile(_ palette: HeroPalette, label: String) -> some View {
+        let isSelected = previewPalette == palette
+        return Button {
+            draft.appearancePaletteKey = (isSelected ? nil : palette.rawValue)
+        } label: {
+            HeroSurface(
+                palette: palette,
+                pattern: .diagonal,
+                lighting: .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+            .frame(height: 64)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isSelected ? Brand.accentGreen : .white.opacity(0.10), lineWidth: 2)
+            )
+            .overlay(alignment: .bottomLeading) {
+                Text(label)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+            }
+            .overlay(alignment: .topTrailing) {
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.accentGreen)
+                        .padding(6)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: Surface texture picker
+
+    @ViewBuilder
+    private var textureSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            CSSectionLabel(text: "Surface Texture")
+            VStack(alignment: .leading, spacing: 12) {
+                Text(previewPattern == nil
+                     ? "Automatic — texture rotates with the deterministic surface seed."
+                     : "Pinned to a single texture.")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Brand.secondaryText)
+
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
+                    spacing: 10
+                ) {
+                    automaticTextureTile
+                    ForEach(HeroSurfaceCatalog.patterns, id: \.pattern) { entry in
+                        textureTile(entry.pattern, label: entry.label)
+                    }
+                }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 14)
+            .background(Brand.cardBackground,
+                        in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+    }
+
+    /// Palette used for the texture preview thumbnails. Anchored to the
+    /// owner's pinned palette when set, so the textures preview against
+    /// their final colour family. Falls back to deterministic auto.
+    private var texturePreviewPalette: HeroPalette {
+        if let p = previewPalette { return p }
+        let raw = UInt(bitPattern: club.id.hashValue)
+        return HeroPalette.allCases[Int(raw % UInt(HeroPalette.allCases.count))]
+    }
+
+    private var automaticTextureTile: some View {
+        let isSelected = previewPattern == nil
+        return Button {
+            draft.appearancePatternKey = nil
+        } label: {
+            HeroSurface.deterministic(
+                seed: club.id,
+                lighting: .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+            .frame(height: 60)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isSelected ? Brand.accentGreen : .white.opacity(0.10), lineWidth: 2)
+            )
+            .overlay(alignment: .center) {
+                Text("Auto")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .overlay(alignment: .topTrailing) {
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Brand.accentGreen)
+                        .padding(5)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func textureTile(_ pattern: HeroPattern, label: String) -> some View {
+        let isSelected = previewPattern == pattern
+        let palette = texturePreviewPalette
+        return Button {
+            draft.appearancePatternKey = (isSelected ? nil : pattern.rawValue)
+        } label: {
+            HeroSurface(
+                palette: palette,
+                pattern: pattern,
+                lighting: pattern == .none ? .center : .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+            .frame(height: 60)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isSelected ? Brand.accentGreen : .white.opacity(0.10), lineWidth: 2)
+            )
+            .overlay(alignment: .center) {
+                Text(label)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .overlay(alignment: .topTrailing) {
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Brand.accentGreen)
+                        .padding(5)
+                }
+            }
+        }
+        .buttonStyle(.plain)
     }
 
     @MainActor
@@ -3260,7 +3957,7 @@ struct ClubAppearanceSettingsView: View {
         do {
             let previousURL = draft.uploadedBannerURL
             let url = try await appState.uploadClubBannerImage(jpeg, clubID: clubID)
-            draft.uploadedBannerURL = url; draft.heroImageKey = nil
+            draft.uploadedBannerURL = url
             if let old = previousURL { Task { await appState.deleteClubStorageImageIfManaged(old) } }
         } catch { bannerUploadError = error.localizedDescription }
     }
@@ -3869,7 +4566,7 @@ struct ClubSetupChecklistView: View {
         ("name",   "Name your club",       !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
         ("venue",  "Add a primary venue",  venues.contains(where: { $0.isPrimary })),
         ("avatar", "Set profile picture",  draft.uploadedAvatarURL != nil || draft.avatarBackgroundColor != nil),
-        ("banner", "Choose a banner",      draft.heroImageKey != nil || draft.uploadedBannerURL != nil),
+        ("banner", "Choose a banner",      draft.uploadedBannerURL != nil),
         ("cod",    "Add a Code of Conduct", !draft.codeOfConduct.isEmpty),
     ]}
 
@@ -4943,17 +5640,20 @@ struct OwnerManageGamesView: View {
     @State private var showPastGames = false
     @State private var showCreateGame = false
 
+    // Visibility uses the session END boundary (start + duration), not the start time,
+    // so live/in-progress games stay in "Upcoming" — keeping the Generate Play entry
+    // reachable during the actual session, which is when organizers need it most.
     private var upcomingGames: [Game] {
         let now = Date()
         return appState.games(for: club)
-            .filter { $0.dateTime >= now }
+            .filter { now < $0.dateTime.addingTimeInterval(Double($0.durationMinutes) * 60) }
             .sorted { $0.dateTime < $1.dateTime }
     }
 
     private var pastGames: [Game] {
         let now = Date()
         return appState.games(for: club)
-            .filter { $0.dateTime < now }
+            .filter { now >= $0.dateTime.addingTimeInterval(Double($0.durationMinutes) * 60) }
             .sorted { $0.dateTime > $1.dateTime }
     }
 
@@ -5096,7 +5796,7 @@ struct OwnerManageGamesView: View {
             }
             Button("Keep Game", role: .cancel) { cancelCandidate = nil }
         } message: {
-            Text("Booked players will be notified. This cannot be undone.")
+            Text(cancelDialogMessage(for: cancelCandidate))
         }
         .confirmationDialog(
             "Delete \"\(deleteCandidate?.title ?? "Game")\"?",
@@ -5113,12 +5813,7 @@ struct OwnerManageGamesView: View {
             }
             Button("Cancel", role: .cancel) { deleteCandidate = nil }
         } message: {
-            let bookingCount = deleteCandidate?.confirmedCount ?? 0
-            if bookingCount > 0 {
-                Text("\(bookingCount) player\(bookingCount == 1 ? "" : "s") will lose their booking. This cannot be undone.")
-            } else {
-                Text("This cannot be undone.")
-            }
+            Text(deleteDialogMessage(for: deleteCandidate))
         }
     }
 
@@ -5132,6 +5827,44 @@ struct OwnerManageGamesView: View {
                 group.addTask { await appState.refreshAttendees(for: game) }
             }
         }
+    }
+
+    /// Counts confirmed bookings that were paid via Stripe for the given game,
+    /// using the prefetched attendees cache. Used to decide whether to surface
+    /// the "Paid players will be issued club credit" warning before admin
+    /// cancel/delete. The cache is populated by `prefetchUpcomingAttendees`
+    /// when this view opens, so it's reliable for upcoming games.
+    private func paidBookingCount(for game: Game) -> Int {
+        let attendees = appState.attendeesByGameID[game.id] ?? []
+        return attendees.filter { attendee in
+            guard case .confirmed = attendee.booking.state else { return false }
+            return attendee.booking.feePaid && attendee.booking.paymentMethod == "stripe"
+        }.count
+    }
+
+    private func cancelDialogMessage(for game: Game?) -> String {
+        guard let game else { return "Booked players will be notified. This cannot be undone." }
+        let paid = paidBookingCount(for: game)
+        var lines = ["Booked players will be notified. This cannot be undone."]
+        if paid > 0 {
+            lines.append("Paid players will be issued club credit.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func deleteDialogMessage(for game: Game?) -> String {
+        guard let game else { return "This cannot be undone." }
+        let bookingCount = game.confirmedCount ?? 0
+        let paid = paidBookingCount(for: game)
+        var lines: [String] = []
+        if bookingCount > 0 {
+            lines.append("\(bookingCount) player\(bookingCount == 1 ? "" : "s") will lose their booking.")
+        }
+        if paid > 0 {
+            lines.append("Paid players will be issued club credit.")
+        }
+        lines.append("This cannot be undone.")
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - Row helpers

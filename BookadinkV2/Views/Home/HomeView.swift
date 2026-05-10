@@ -7,6 +7,7 @@ struct HomeView: View {
     @Binding var selectedTab: AppTab
 
     @EnvironmentObject private var locationManager: LocationManager
+    @EnvironmentObject private var scheduleStore: GameScheduleStore
 
     @State private var selectedGame: Game? = nil
     @State private var errorDismissed = false
@@ -17,6 +18,15 @@ struct HomeView: View {
 
     @StateObject private var newsService = PickleballNewsService()
     @State private var articleLink: ArticleLink? = nil
+
+    /// Game share-sheet payload — present a ShareSheet whenever this is set.
+    @State private var shareItems: HomeShareItems? = nil
+
+    /// Transient toast shown under the next-game card after the user taps
+    /// the calendar button (success, permission denied, already added, …).
+    /// Auto-clears after a few seconds so it doesn't hang around.
+    @State private var calendarToast: String? = nil
+    @State private var calendarToastTask: Task<Void, Never>? = nil
 
     private let isOnIPad = UIDevice.current.userInterfaceIdiom == .pad
 
@@ -235,6 +245,9 @@ struct HomeView: View {
             SafariView(url: link.url)
                 .ignoresSafeArea()
         }
+        .sheet(item: $shareItems) { payload in
+            ShareSheet(items: payload.items)
+        }
         .task { await newsService.load() }
         .task(id: nextUpcomingBooking?.game?.id) {
             if let game = nextUpcomingBooking?.game {
@@ -316,48 +329,68 @@ struct HomeView: View {
 
     @ViewBuilder
     private var displayHeadline: some View {
+        let hasNextGame = nextUpcomingBooking?.game != nil
         let suburb = nextGameSuburb ?? "your area"
+        let primaryLine = hasNextGame ? "Your next game" : "Find your next game"
+        let connector  = hasNextGame ? "is waiting in " : "in "
         VStack(alignment: .leading, spacing: 0) {
-            Text("Your next game")
+            Text(primaryLine)
                 .font(.system(size: 42, weight: .bold))
                 .tracking(-1.5)
                 .foregroundStyle(Brand.primaryText)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             HStack(alignment: .bottom, spacing: 0) {
-                Text("is waiting in ")
+                Text(connector)
                     .font(.system(size: 42, weight: .bold))
                     .tracking(-1.5)
                     .foregroundStyle(Brand.tertiaryText)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
-                ZStack(alignment: .bottomLeading) {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Brand.accentGreen.opacity(0.65))
-                        .frame(height: 9)
-                        .offset(y: -3)
-                    Text(suburb + ".")
-                        .font(.system(size: 42, weight: .bold))
-                        .tracking(-1.5)
-                        .foregroundStyle(Brand.primaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
+                Button { showNearbyDiscovery = true } label: {
+                    ZStack(alignment: .bottomLeading) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Brand.accentGreen.opacity(0.65))
+                            .frame(height: 9)
+                            .offset(y: -3)
+                        Text(suburb + ".")
+                            .font(.system(size: 42, weight: .bold))
+                            .tracking(-1.5)
+                            .foregroundStyle(Brand.primaryText)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Explore games in \(suburb)")
+                .accessibilityHint("Opens the nearby games map")
             }
         }
     }
 
-    /// Suburb of the next upcoming confirmed game's club.
+    /// Suburb of the next upcoming confirmed game — resolved from the
+    /// game's actual venue (not the club's primary venue), so multi-venue
+    /// clubs surface where this specific game is being played.
     private var nextGameSuburb: String? {
         guard let item = nextUpcomingBooking, let game = item.game else { return nil }
-        // Try primary venue suburb first
-        if let venue = appState.clubVenuesByClubID[game.clubID]?.first(where: { $0.isPrimary }),
-           let suburb = venue.suburb, !suburb.trimmingCharacters(in: .whitespaces).isEmpty {
+        let venues = appState.clubVenuesByClubID[game.clubID] ?? []
+
+        // 1. Resolved venue for this game (venueId FK or venueName fallback).
+        if let venue = LocationService.resolvedVenue(for: game, venues: venues),
+           let suburb = venue.suburb?.trimmingCharacters(in: .whitespaces),
+           !suburb.isEmpty {
             return suburb
         }
-        // Fall back to club's suburb
+        // 2. Primary venue suburb.
+        if let venue = venues.first(where: { $0.isPrimary }),
+           let suburb = venue.suburb?.trimmingCharacters(in: .whitespaces),
+           !suburb.isEmpty {
+            return suburb
+        }
+        // 3. Club suburb (final fallback).
         if let club = appState.clubs.first(where: { $0.id == game.clubID }),
-           let suburb = club.suburb, !suburb.trimmingCharacters(in: .whitespaces).isEmpty {
+           let suburb = club.suburb?.trimmingCharacters(in: .whitespaces),
+           !suburb.isEmpty {
             return suburb
         }
         return nil
@@ -423,7 +456,7 @@ struct HomeView: View {
                 Circle()
                     .fill(Color(hex: "1A8A2E"))
                     .frame(width: 6, height: 6)
-                Text("Your next game · \(nextUpcomingBooking.flatMap { $0.game }.map { relativeDateLabel(for: $0.dateTime) } ?? "upcoming")")
+                Text(nextUpcomingBooking?.game.map { "Your next game · \(relativeDateLabel(for: $0.dateTime))" } ?? "No upcoming games")
                     .font(.system(size: 11, weight: .medium))
                     .tracking(1.4)
                     .textCase(.uppercase)
@@ -449,8 +482,23 @@ struct HomeView: View {
                         resolvedVenue: nextResolvedVenue,
                         distanceLabel: distLabel,
                         attendeePreviews: appState.attendeesByGameID[game.id] ?? [],
-                        onTap: { selectedGame = game }
+                        hasCalendarExport: scheduleStore.hasCalendarExport(for: game),
+                        isExportingCalendar: scheduleStore.isExportingCalendar(for: game),
+                        onTap: { selectedGame = game },
+                        onAddToCalendar: { handleCalendarToggle(for: game) },
+                        onShare: {
+                            shareItems = HomeShareItems(items: HomeView.shareText(
+                                for: game,
+                                clubName: clubName,
+                                resolvedVenue: nextResolvedVenue
+                            ))
+                        }
                     )
+
+                    if let toast = calendarToast {
+                        calendarToastBanner(toast)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
 
                     // Same-day follow-on indicator — only shown when the user has
                     // additional confirmed games later today beyond the hero card
@@ -482,6 +530,42 @@ struct HomeView: View {
         }
     }
 
+    private func handleCalendarToggle(for game: Game) {
+        calendarToastTask?.cancel()
+        calendarToastTask = Task { @MainActor in
+            await appState.toggleCalendarExport(for: game)
+            // `bookingInfoMessage` is set by AppState on every code path
+            // (success, permission denied, already added, error). Surface
+            // it as a transient toast so the user gets explicit feedback
+            // — otherwise the home card looks unresponsive.
+            let message = appState.bookingInfoMessage ?? appState.bookingsErrorMessage
+            withAnimation(.easeOut(duration: 0.2)) {
+                calendarToast = message
+            }
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.25)) {
+                calendarToast = nil
+            }
+        }
+    }
+
+    private func calendarToastBanner(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: scheduleStore.calendarGameIDs.contains(nextUpcomingBooking?.game?.id ?? UUID()) ? "calendar.badge.checkmark" : "info.circle")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Brand.secondaryText)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(Brand.secondaryText)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
     private func moreTodayIndicator(count: Int) -> some View {
         Button {
             selectedTab = .bookings
@@ -502,35 +586,33 @@ struct HomeView: View {
     }
 
     private var nextGameEmptyState: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                Image(systemName: "sportscourt")
-                    .font(.system(size: 26))
-                    .foregroundStyle(Brand.secondaryText)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("No upcoming games")
-                        .font(.subheadline.weight(.semibold))
+        Button { showNearbyDiscovery = true } label: {
+            VStack(spacing: 14) {
+                Image(systemName: "map")
+                    .font(.system(size: 32, weight: .medium))
+                    .foregroundStyle(Brand.sportPop)
+                VStack(spacing: 5) {
+                    Text("Open map to explore games")
+                        .font(.system(size: 17, weight: .bold))
                         .foregroundStyle(Brand.ink)
-                    Text("Browse clubs and book your next session.")
-                        .font(.caption)
+                    Text("Discover courts and games near you")
+                        .font(.system(size: 14))
                         .foregroundStyle(Brand.secondaryText)
                 }
-            }
-            Button {
-                selectedTab = .clubs
-            } label: {
-                Text("Find a Game")
-                    .font(.subheadline.weight(.semibold))
+                Text("Explore nearby games")
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, 24)
                     .padding(.vertical, 10)
-                    .background(Brand.primaryText, in: Capsule())
+                    .background(Brand.sportPop, in: Capsule())
             }
-            .buttonStyle(.plain)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 28)
+            .padding(.horizontal, 16)
+            .glassCard(cornerRadius: 16, tint: Brand.cardBackground)
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard(cornerRadius: 16, tint: Brand.cardBackground)
+        .buttonStyle(.plain)
     }
 
     // MARK: - Games Near You
@@ -881,6 +963,46 @@ struct HomeView: View {
 
 }
 
+// MARK: - Share Support
+
+extension HomeView {
+    private static let shareDateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_AU")
+        f.dateFormat = "EEE d MMM"
+        return f
+    }()
+
+    private static let shareTimeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "h:mm a"
+        f.amSymbol = "am"
+        f.pmSymbol = "pm"
+        return f
+    }()
+
+    /// One-line share message describing the game (not the club).
+    static func shareText(for game: Game, clubName: String, resolvedVenue: ClubVenue?) -> [Any] {
+        let date = shareDateFmt.string(from: game.dateTime)
+        let time = shareTimeFmt.string(from: game.dateTime)
+        let venuePart: String = {
+            if let v = resolvedVenue {
+                let suburb = v.suburb?.trimmingCharacters(in: .whitespaces) ?? ""
+                if !suburb.isEmpty { return "\(v.venueName), \(suburb)" }
+                return v.venueName
+            }
+            return clubName
+        }()
+        let line = "Join me at \"\(game.title)\" on \(date) at \(time) — \(venuePart). Booked via Bookadink."
+        return [line]
+    }
+}
+
+private struct HomeShareItems: Identifiable {
+    let id = UUID()
+    let items: [Any]
+}
+
 // MARK: - News Support Models
 
 private struct ArticleLink: Identifiable {
@@ -898,7 +1020,11 @@ private struct HomeNextGameCard: View {
     var resolvedVenue: ClubVenue? = nil
     var distanceLabel: String? = nil
     var attendeePreviews: [GameAttendee] = []
+    var hasCalendarExport: Bool = false
+    var isExportingCalendar: Bool = false
     var onTap: (() -> Void)? = nil
+    var onAddToCalendar: (() -> Void)? = nil
+    var onShare: (() -> Void)? = nil
 
     // MARK: Formatters
 
@@ -992,20 +1118,6 @@ private struct HomeNextGameCard: View {
         return Brand.primaryText
     }
 
-    // Tonal gradient picked from clubID hash so it's stable per club
-    private var gradient: LinearGradient {
-        let palettes: [(Color, Color)] = [
-            (Brand.tonalNavyBase, Brand.tonalNavyDeep),
-            (Brand.tonalCharcoalBase, Brand.tonalCharcoalDeep),
-            (Brand.tonalForestBase, Brand.tonalForestDeep),
-            (Brand.tonalTanBase, Brand.tonalTanDeep),
-            (Brand.tonalRoseBase, Brand.tonalRoseDeep),
-            (Brand.tonalSlateBase, Brand.tonalSlateDeep),
-        ]
-        let (base, deep) = palettes[abs(game.clubID.hashValue) % palettes.count]
-        return LinearGradient(colors: [base, deep], startPoint: .topLeading, endPoint: .bottomTrailing)
-    }
-
     // MARK: Body
 
     var body: some View {
@@ -1025,8 +1137,19 @@ private struct HomeNextGameCard: View {
 
     private var heroArea: some View {
         ZStack(alignment: .bottom) {
-            gradient
-            stripeOverlay
+            // Canonical HeroSurface — pinned palette/pattern when admin
+            // selected them, deterministic auto rotation seeded from
+            // `game.id` otherwise.
+            HeroSurface.forGame(
+                game,
+                lighting: .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
+            // Card-specific scrim — light at top (white tint), light at
+            // bottom (22% black) to keep small chips/avatars readable.
+            // Kept separate from HeroSurface vignette because the bottom
+            // darkening here is intentionally subtle for a small card.
             LinearGradient(
                 stops: [
                     .init(color: .white.opacity(0.06), location: 0),
@@ -1066,20 +1189,6 @@ private struct HomeNextGameCard: View {
         }
         .frame(height: 186)
         .clipShape(UnevenRoundedRectangle(topLeadingRadius: 22, topTrailingRadius: 22))
-    }
-
-    private var stripeOverlay: some View {
-        Canvas { ctx, size in
-            var x: CGFloat = -size.height
-            while x < size.width + size.height {
-                var path = Path()
-                path.move(to: CGPoint(x: x, y: 0))
-                path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                ctx.stroke(path, with: .color(Color.white.opacity(0.05)), lineWidth: 1)
-                x += 14
-            }
-        }
-        .allowsHitTesting(false)
     }
 
     @ViewBuilder
@@ -1204,8 +1313,13 @@ private struct HomeNextGameCard: View {
                 .buttonStyle(.plain)
                 .disabled(game.status == "cancelled")
 
-                iconActionButton(systemImage: "calendar")
-                iconActionButton(systemImage: "square.and.arrow.up")
+                iconActionButton(
+                    systemImage: hasCalendarExport ? "calendar.badge.checkmark" : "calendar",
+                    isLoading: isExportingCalendar,
+                    isActive: hasCalendarExport,
+                    action: { onAddToCalendar?() }
+                )
+                iconActionButton(systemImage: "square.and.arrow.up", action: { onShare?() })
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 16)
@@ -1233,16 +1347,30 @@ private struct HomeNextGameCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func iconActionButton(systemImage: String) -> some View {
-        Button { } label: {
-            Image(systemName: systemImage)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(Brand.primaryText)
-                .frame(width: 46, height: 46)
-                .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Brand.softOutline, lineWidth: 1))
+    private func iconActionButton(
+        systemImage: String,
+        isLoading: Bool = false,
+        isActive: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button { action() } label: {
+            ZStack {
+                if isLoading {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                        .tint(Brand.primaryText)
+                } else {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(isActive ? Brand.accentGreen : Brand.primaryText)
+                }
+            }
+            .frame(width: 46, height: 46)
+            .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Brand.softOutline, lineWidth: 1))
         }
         .buttonStyle(.plain)
+        .disabled(isLoading)
     }
 }
 
@@ -1287,12 +1415,7 @@ private struct HomeNearbyGameCard: View {
         return sub.isEmpty ? clubName.uppercased() : sub.uppercased()
     }
 
-    private var priceText: String {
-        if let fee = game.feeAmount, fee > 0 {
-            return fee.truncatingRemainder(dividingBy: 1) == 0 ? "$\(Int(fee))" : String(format: "$%.2f", fee)
-        }
-        return "Free"
-    }
+    private var priceText: String { game.priceLabel }
 
     private var skillLabel: String? {
         switch game.skillLevel.lowercased() {
@@ -1315,19 +1438,6 @@ private struct HomeNearbyGameCard: View {
         }
     }
 
-    private var gradient: LinearGradient {
-        let palettes: [(Color, Color)] = [
-            (Brand.tonalNavyBase, Brand.tonalNavyDeep),
-            (Brand.tonalCharcoalBase, Brand.tonalCharcoalDeep),
-            (Brand.tonalForestBase, Brand.tonalForestDeep),
-            (Brand.tonalTanBase, Brand.tonalTanDeep),
-            (Brand.tonalRoseBase, Brand.tonalRoseDeep),
-            (Brand.tonalSlateBase, Brand.tonalSlateDeep),
-        ]
-        let (base, deep) = palettes[abs(game.clubID.hashValue) % palettes.count]
-        return LinearGradient(colors: [base, deep], startPoint: .topLeading, endPoint: .bottomTrailing)
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             // Hero
@@ -1343,18 +1453,14 @@ private struct HomeNearbyGameCard: View {
 
     private var heroArea: some View {
         ZStack(alignment: .bottom) {
-            gradient
-            Canvas { ctx, size in
-                var x: CGFloat = -size.height
-                while x < size.width + size.height {
-                    var path = Path()
-                    path.move(to: CGPoint(x: x, y: 0))
-                    path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                    ctx.stroke(path, with: .color(Color.white.opacity(0.05)), lineWidth: 1)
-                    x += 14
-                }
-            }
-            .allowsHitTesting(false)
+            // Canonical HeroSurface — pinned palette/pattern when admin
+            // selected them, deterministic auto rotation otherwise.
+            HeroSurface.forGame(
+                game,
+                lighting: .topRight,
+                vignette: .none,
+                direction: .diagonal
+            )
             LinearGradient(
                 stops: [
                     .init(color: .clear, location: 0.5),

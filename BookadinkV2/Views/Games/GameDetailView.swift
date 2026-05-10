@@ -184,12 +184,7 @@ struct GameDetailView: View {
         return "\(m) min"
     }
 
-    private var priceText: String {
-        if let fee = currentGame.feeAmount, fee > 0 {
-            return "$\(String(format: "%.2f", fee))"
-        }
-        return "Free"
-    }
+    private var priceText: String { currentGame.priceLabel }
 
     private var spotsLeft: Int {
         // Prefer live attendee count (updated after refreshAttendees) over the
@@ -443,9 +438,23 @@ struct GameDetailView: View {
         }
         .sheet(isPresented: $showCancellationCreditSheet) { cancellationCreditSheet }
         .onChange(of: currentBookingState) { old, new in
-            if old.canBook, case .confirmed = new { showBookingSuccess = true }
+            guard case .confirmed = new else { return }
+            switch old {
+            case .none, .cancelled, .pendingPayment:
+                showBookingSuccess = true
+            default:
+                break
+            }
         }
         .sheet(isPresented: $showBookingSuccess) { bookingSuccessSheet }
+        .blur(radius: showBookingSuccess ? 22 : 0)
+        .overlay(
+            Color.black
+                .opacity(showBookingSuccess ? 0.55 : 0)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+        )
+        .animation(.easeInOut(duration: 0.32), value: showBookingSuccess)
     }
 
     // MARK: - Hero Helpers
@@ -672,11 +681,7 @@ struct GameDetailView: View {
     @ViewBuilder
     private var tagsRowSection: some View {
         let state = currentBookingState
-        let costValue: String = {
-            guard let fee = currentGame.feeAmount, fee > 0 else { return "Free" }
-            if fee == fee.rounded() { return "$\(Int(fee))" }
-            return String(format: "$%.2f", fee)
-        }()
+        let costValue: String = currentGame.priceLabel
         let creditCents = appState.creditBalance(for: game.clubID)
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
@@ -2631,6 +2636,16 @@ struct GameDetailView: View {
             } catch SupabaseServiceError.authenticationRequired {
                 paymentErrorMessage = "Your session has expired. Please sign out and sign back in, then try again."
                 return
+            } catch SupabaseServiceError.notYetPublished {
+                // Server rejected the reserve because publish_at is still in the future
+                // (e.g. an admin moved publish forward after the user opened this view).
+                // Refresh games so the cached publishAt updates and the scheduled-game
+                // CTA renders on the next layout pass.
+                paymentErrorMessage = "This game isn't open for bookings yet."
+                if let club = appState.clubs.first(where: { $0.id == game.clubID }) {
+                    await appState.refreshGames(for: club)
+                }
+                return
             } catch {
                 paymentErrorMessage = "Could not reserve your spot. Please try again."
                 return
@@ -2950,10 +2965,10 @@ private struct BookingSuccessSheetContent: View {
         }
         .padding(.horizontal, 24)
         .padding(.bottom, 24)
-        .frame(maxWidth: .infinity)
-        .background(Brand.appBackground)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .presentationDetents([.height(400)])
         .presentationDragIndicator(.hidden)
+        .presentationBackground(Brand.appBackground)
         .presentationCornerRadius(28)
         .onAppear { runEntranceSequence() }
     }
@@ -2961,9 +2976,9 @@ private struct BookingSuccessSheetContent: View {
     private var successIcon: some View {
         ZStack {
             Circle()
-                .fill(Brand.accentGreen.opacity(0.28))
-                .frame(width: 100, height: 100)
-                .blur(radius: 18)
+                .fill(Brand.accentGreen.opacity(0.32))
+                .frame(width: 110, height: 110)
+                .blur(radius: 20)
                 .opacity(iconShown ? 1 : 0)
                 .allowsHitTesting(false)
             Circle()
@@ -2972,6 +2987,12 @@ private struct BookingSuccessSheetContent: View {
             Image(systemName: "checkmark")
                 .font(.system(size: 32, weight: .bold))
                 .foregroundStyle(Brand.primaryText)
+            Image(systemName: "sparkle")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(Brand.primaryText)
+                .offset(x: 34, y: -30)
+                .opacity(iconShown ? 0.85 : 0)
+                .allowsHitTesting(false)
         }
         .frame(width: 76, height: 76)
         .scaleEffect(iconShown ? 1.0 : 0.55)
@@ -3015,15 +3036,19 @@ private struct BookingSuccessSheetContent: View {
     private var actionRow: some View {
         HStack(spacing: 10) {
             Button(action: onAddToCalendar) {
-                Text("Add to Calendar")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(Brand.secondaryText)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 50)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(Brand.softOutline, lineWidth: 1)
-                    )
+                HStack(spacing: 6) {
+                    Image(systemName: "calendar")
+                        .font(.system(size: 14, weight: .medium))
+                    Text("Add to Calendar")
+                        .font(.system(size: 14, weight: .medium))
+                }
+                .foregroundStyle(Brand.secondaryText)
+                .frame(maxWidth: .infinity)
+                .frame(height: 50)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Brand.softOutline, lineWidth: 1)
+                )
             }
             .buttonStyle(.plain)
 

@@ -265,23 +265,6 @@ private struct BookingCompactCard: View {
 
     // MARK: - Derived
 
-    private var dateBlockGradient: LinearGradient {
-        let palettes: [(Color, Color)] = [
-            (Brand.tonalNavyBase,     Brand.tonalNavyDeep),
-            (Brand.tonalCharcoalBase, Brand.tonalCharcoalDeep),
-            (Brand.tonalForestBase,   Brand.tonalForestDeep),
-            (Brand.tonalTanBase,      Brand.tonalTanDeep),
-            (Brand.tonalRoseBase,     Brand.tonalRoseDeep),
-            (Brand.tonalSlateBase,    Brand.tonalSlateDeep),
-        ]
-        guard let game = item.game else {
-            return LinearGradient(colors: [Brand.tonalNavyBase, Brand.tonalNavyDeep],
-                                  startPoint: .top, endPoint: .bottom)
-        }
-        let (base, deep) = palettes[abs(game.clubID.hashValue) % palettes.count]
-        return LinearGradient(colors: [base, deep], startPoint: .top, endPoint: .bottom)
-    }
-
     // Resolved display status. Game cancellation takes absolute priority over booking state —
     // a confirmed booking on a cancelled game must never read as "Confirmed".
     private var isGameCancelled: Bool {
@@ -489,20 +472,16 @@ private struct BookingCompactCard: View {
 
     private func dateBlock(for game: Game) -> some View {
         ZStack {
-            dateBlockGradient
-
-            // Diagonal stripe pattern — matches GameDetailView hero
-            Canvas { ctx, size in
-                var x: CGFloat = -size.height
-                while x < size.width + size.height {
-                    var path = Path()
-                    path.move(to: CGPoint(x: x, y: 0))
-                    path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                    ctx.stroke(path, with: .color(.white.opacity(0.045)), lineWidth: 1)
-                    x += 14
-                }
-            }
-            .allowsHitTesting(false)
+            // Canonical HeroSurface — pinned palette/pattern when the
+            // admin selected them, deterministic auto rotation seeded
+            // from `game.id` otherwise. Same surface as ClubGameRow's
+            // date block so a booking and the source club row match.
+            HeroSurface.forGame(
+                game,
+                lighting: .none,
+                vignette: .none,
+                direction: .vertical
+            )
 
             VStack(spacing: 1) {
                 Text(Self.weekdayFmt.string(from: game.dateTime).uppercased())

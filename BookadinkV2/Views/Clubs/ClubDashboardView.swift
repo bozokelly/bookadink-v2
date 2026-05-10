@@ -31,17 +31,8 @@ struct ClubDashboardView: View {
     private var planTier: String {
         entitlements?.planTier ?? "free"
     }
-    private var members: [ClubDirectoryMember] {
-        appState.clubDirectoryMembers(for: club)
-    }
     private var pendingCount: Int {
         appState.ownerJoinRequests(for: club).count
-    }
-    private var kpis: ClubAnalyticsKPIs? {
-        appState.analyticsKPIsByClubID[club.id]
-    }
-    private var summary: ClubDashboardSummary? {
-        appState.dashboardSummaryByClubID[club.id]
     }
     private var analyticsLocked: Bool {
         if case .blocked = FeatureGateService.canAccessAnalytics(entitlements) { return true }
@@ -144,7 +135,6 @@ struct ClubDashboardView: View {
                     }
                     setupAndIssuesSection
                     primaryActionsRow
-                    metricsSection
                     navCardsSection
                 }
                 .padding(.horizontal, 18)
@@ -161,7 +151,7 @@ struct ClubDashboardView: View {
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(Brand.primaryText)
                             .lineLimit(1)
-                        Text("Admin Dashboard")
+                        Text("Manage Club")
                             .font(.caption2)
                             .foregroundStyle(Brand.tertiaryText)
                     }
@@ -193,18 +183,6 @@ struct ClubDashboardView: View {
             )) { sheet in childSheetContent(sheet) }
         }
         .task { await refreshAll() }
-        .onChange(of: appState.lastConfirmedBookingClubID) { newClubID in
-            guard newClubID == club.id else { return }
-            Task { await appState.loadDashboardSummary(for: club.id) }
-        }
-        .onChange(of: appState.lastCancellationCredit) { credit in
-            guard credit?.clubID == club.id else { return }
-            Task { await appState.loadDashboardSummary(for: club.id) }
-        }
-        .onChange(of: appState.lastAttendanceUpdateClubID) { newClubID in
-            guard newClubID == club.id else { return }
-            Task { await appState.loadDashboardSummary(for: club.id) }
-        }
         .onChange(of: scenePhase) { phase in
             guard phase == .active else { return }
             Task { await refreshAll() }
@@ -213,16 +191,19 @@ struct ClubDashboardView: View {
 
     // MARK: - Data Refresh
 
+    /// Refreshes only what the Manage Club hub itself needs to render:
+    /// entitlements (tier pill, analytics-locked bullet, payment readiness)
+    /// and Stripe account state (setup banner). Member directory, dashboard
+    /// summary, and advanced analytics moved to the dedicated Analytics
+    /// destination — fetching them here is wasted work and slows hub open.
     private func refreshAll() async {
         guard !isRefreshingDashboard else { return }
         isRefreshingDashboard = true
         defer { isRefreshingDashboard = false }
 
         async let fetchEntitlements: Void = appState.fetchClubEntitlements(for: club.id)
-        async let fetchMembers: Void = appState.refreshClubDirectoryMembers(for: club)
-        async let fetchSummary: Void = appState.loadDashboardSummary(for: club.id)
         async let fetchStripe: Void = appState.refreshStripeAccountStatus(for: club.id)
-        _ = await (fetchEntitlements, fetchMembers, fetchSummary, fetchStripe)
+        _ = await (fetchEntitlements, fetchStripe)
 
         stripeStatusLoaded = true
 
@@ -234,26 +215,10 @@ struct ClubDashboardView: View {
             LocalNotificationManager.shared.cancelSetupReminder(for: club.id)
         }
 
-        // Always fetch analytics when unlocked — no nil guard so re-opens get fresh data.
-        if !analyticsLocked {
-            await appState.fetchClubAdvancedAnalytics(for: club.id, days: 30)
-        }
-
         #if DEBUG
-        let s = appState.dashboardSummaryByClubID[club.id]
         let e = appState.entitlementsByClubID[club.id]
         let sa = appState.stripeAccountByClubID[club.id]
-        print("""
-        [Dashboard] club=\(club.name) \
-        members=\(s?.totalMembers ?? -1) \
-        activePlayers=\(s?.monthlyActivePlayers30d ?? -1) \
-        upcomingBookings=\(s?.upcomingBookingsCount ?? -1) \
-        fillRate=\(s?.fillRate30d.map { String(format: "%.0f%%", $0 * 100) } ?? "nil") \
-        plan=\(e?.planTier ?? "nil") \
-        analyticsAccess=\(e?.analyticsAccess ?? false) \
-        payoutsEnabled=\(sa?.payoutsEnabled ?? false) \
-        refreshedAt=\(Date())
-        """)
+        print("[ManageClub] club=\(club.name) plan=\(e?.planTier ?? "nil") payoutsEnabled=\(sa?.payoutsEnabled ?? false) refreshedAt=\(Date())")
         #endif
     }
 
@@ -275,7 +240,11 @@ struct ClubDashboardView: View {
         case .members:
             OwnerMembersSheet(club: club).environmentObject(appState)
         case .analytics:
-            AnalyticsSheet(club: club).environmentObject(appState)
+            // Analytics is now a true full-screen NavigationLink destination,
+            // not a child sheet. This case stays as a defensive no-op so the
+            // OwnerToolSheet switch remains exhaustive; nothing should set
+            // childSheet = .analytics anymore.
+            EmptyView()
         case .roleHistory:
             OwnerRoleHistorySheet(club: club).environmentObject(appState)
         }
@@ -484,215 +453,6 @@ struct ClubDashboardView: View {
         }
     }
 
-    // MARK: - Metrics Section
-
-    private var metricsSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Overview")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(Brand.tertiaryText)
-                .textCase(.uppercase)
-                .tracking(0.5)
-
-            heroMetricCard
-
-            HStack(spacing: 10) {
-                supportingMetric(
-                    label: "Members",
-                    value: membersValue,
-                    subtext: membersSubtext,
-                    delta: membersDelta
-                )
-                supportingMetric(
-                    label: "Fill Rate",
-                    value: fillRateDisplay,
-                    subtext: fillRateSubtext,
-                    delta: fillRateDelta
-                )
-                supportingMetric(
-                    label: "Bookings",
-                    value: bookingsDisplay,
-                    subtext: bookingsSubtext,
-                    delta: bookingsDelta
-                )
-            }
-        }
-    }
-
-    // Hero active players card
-    private var heroMetricCard: some View {
-        // Prefer the ungated dashboard summary; fall back to Pro KPIs if available.
-        let curr = summary?.monthlyActivePlayers30d ?? kpis?.currActivePlayers
-        let prev = summary?.prevActivePlayers30d    ?? kpis?.prevActivePlayers
-        let delta: String? = {
-            guard let c = curr, let p = prev, p > 0 || c > 0 else { return nil }
-            let diff = c - p
-            if diff == 0 { return "Same as last month" }
-            return diff > 0 ? "+\(diff) vs last month" : "\(diff) vs last month"
-        }()
-
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Monthly Active Players")
-                    .font(.caption)
-                    .foregroundStyle(Brand.secondaryText)
-                Spacer(minLength: 0)
-                Image(systemName: "person.2.fill")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Brand.tertiaryText)
-            }
-
-            if let value = curr {
-                Text("\(value)")
-                    .font(.system(size: 36, weight: .bold, design: .rounded))
-                    .foregroundStyle(Brand.primaryText)
-            } else {
-                Text("No data yet")
-                    .font(.title2.weight(.semibold))
-                    .foregroundStyle(Brand.tertiaryText)
-            }
-
-            if let d = delta {
-                deltaLabel(d)
-            } else if curr != nil {
-                Text("last 30 days")
-                    .font(.caption2)
-                    .foregroundStyle(Brand.tertiaryText)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(Brand.cardBackground)
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Brand.dividerColor, lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
-    // MARK: - Supporting metric helpers
-
-    // Members
-    private var membersValue: String {
-        if let s = summary { return s.totalMembers > 0 ? "\(s.totalMembers)" : "—" }
-        return members.count > 0 ? "\(members.count)" : "—"
-    }
-    private var membersDelta: String? {
-        guard let s = summary, s.totalMembers > 0 else { return nil }
-        if s.memberGrowth30d == 0 { return "No change" }
-        return "+\(s.memberGrowth30d) this month"
-    }
-    private var membersSubtext: String? {
-        guard let s = summary else {
-            return members.count > 0 ? nil : "No members yet"
-        }
-        return s.totalMembers == 0 ? "No members yet" : nil
-    }
-
-    // Fill Rate — prefer summary (ungated), fall back to Pro KPIs
-    private var fillRateDisplay: String {
-        if let s = summary {
-            // summary loaded: show rate if data exists, "—" if no qualifying games
-            guard let r = s.fillRate30d else { return "—" }
-            return String(format: "%.0f%%", r * 100)
-        }
-        guard let r = kpis?.currFillRate else { return "—" }
-        return String(format: "%.0f%%", r * 100)
-    }
-    private var fillRateSubtext: String? {
-        if let s = summary { return s.fillRate30d != nil ? "avg per game" : "No data yet" }
-        return kpis != nil ? "avg per game" : nil
-    }
-    private var fillRateDelta: String? {
-        if let s = summary {
-            guard let c = s.fillRate30d, let p = s.prevFillRate30d else { return nil }
-            let diff = (c - p) * 100
-            if abs(diff) < 0.5 { return nil }
-            return diff > 0 ? String(format: "+%.0f%%", diff) : String(format: "%.0f%%", diff)
-        }
-        guard let c = kpis?.currFillRate, let p = kpis?.prevFillRate else { return nil }
-        let diff = (c - p) * 100
-        if abs(diff) < 0.5 { return nil }
-        return diff > 0 ? String(format: "+%.0f%%", diff) : String(format: "%.0f%%", diff)
-    }
-
-    // Bookings — summary shows upcoming confirmed; Pro KPIs show historical last-30d
-    private var bookingsDisplay: String {
-        if let b = summary?.upcomingBookingsCount { return "\(b)" }
-        guard let b = kpis?.currBookingCount else { return "—" }
-        return "\(b)"
-    }
-    private var bookingsSubtext: String? {
-        if summary != nil { return "upcoming" }
-        return kpis != nil ? "last 30 days" : nil
-    }
-    private var bookingsDelta: String? {
-        // Upcoming bookings is a point-in-time count; no meaningful prior-period delta.
-        guard summary == nil else { return nil }
-        guard let c = kpis?.currBookingCount, let p = kpis?.prevBookingCount else { return nil }
-        let diff = c - p
-        if diff == 0 { return nil }
-        return diff > 0 ? "+\(diff)" : "\(diff)"
-    }
-
-    private func supportingMetric(label: String, value: String, subtext: String?, delta: String? = nil) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(Brand.tertiaryText)
-                .lineLimit(1)
-
-            Text(value)
-                .font(.title3.weight(.bold))
-                .foregroundStyle(value == "—" ? Brand.tertiaryText : Brand.primaryText)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-
-            if let d = delta {
-                deltaLabel(d)
-            } else if let s = subtext {
-                Text(s)
-                    .font(.caption2)
-                    .foregroundStyle(Brand.tertiaryText)
-                    .lineLimit(1)
-            } else if value == "—" {
-                Text("No data yet")
-                    .font(.caption2)
-                    .foregroundStyle(Brand.tertiaryText)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(Brand.cardBackground)
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Brand.dividerColor, lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    /// Arrow icon + grey label for metric deltas.
-    /// Positive ("+" prefix) → green up arrow. Negative ("-" prefix) → red down arrow.
-    /// Neutral (no prefix) → grey minus icon.
-    /// The "+" or "-" sign is stripped from the display text; the icon carries the direction.
-    @ViewBuilder
-    private func deltaLabel(_ text: String) -> some View {
-        let isPos = text.hasPrefix("+")
-        let isNeg = text.hasPrefix("-")
-        let icon  = isPos ? "arrow.up" : isNeg ? "arrow.down" : "minus"
-        let tint: Color = isPos ? Brand.accentGreen : isNeg ? Brand.errorRed : Brand.tertiaryText
-        let display = (isPos || isNeg) ? String(text.dropFirst()) : text
-        HStack(spacing: 3) {
-            Image(systemName: icon)
-                .font(.system(size: 8, weight: .bold))
-                .foregroundStyle(tint)
-            Text(display)
-                .font(.caption2)
-                .foregroundStyle(Brand.tertiaryText)
-                .lineLimit(1)
-        }
-    }
-
     // MARK: - Navigation Cards
 
     private var navCardsSection: some View {
@@ -712,9 +472,7 @@ struct ClubDashboardView: View {
                     navCard(title: "Members", icon: "person.2",
                             bullets: ["Roles, approvals & contact details"],
                             locked: false) { childSheet = .members }
-                    navCard(title: "Analytics", icon: "chart.bar",
-                            bullets: [analyticsLocked ? "Preview available · Pro plan unlocks live data" : "Revenue, fill rate & player trends"],
-                            locked: false) { childSheet = .analytics }
+                    analyticsNavCard
                     navCard(title: "Club Settings", icon: "slider.horizontal.3",
                             bullets: ["Images, courts, rules & visibility"],
                             locked: false) { childSheet = .editClub }
@@ -731,9 +489,7 @@ struct ClubDashboardView: View {
                 navCard(title: "Members", icon: "person.2",
                         bullets: ["Roles, approvals & contact details"],
                         locked: false) { childSheet = .members }
-                navCard(title: "Analytics", icon: "chart.bar",
-                        bullets: [analyticsLocked ? "Preview available · Pro plan unlocks live data" : "Revenue, fill rate & player trends"],
-                        locked: false) { childSheet = .analytics }
+                analyticsNavCard
                 navCard(title: "Club Settings", icon: "slider.horizontal.3",
                         bullets: ["Images, courts, rules & visibility"],
                         locked: false) { childSheet = .editClub }
@@ -744,6 +500,50 @@ struct ClubDashboardView: View {
                 }
             }
         }
+    }
+
+    /// Analytics card uses NavigationLink so the destination feels permanent
+    /// (true full-screen push with back-button navigation) rather than a
+    /// dismissible modal sheet. Visually identical to `navCard` so the
+    /// Manage section stays a single coherent grid.
+    private var analyticsNavCard: some View {
+        NavigationLink {
+            ClubPulseView(club: club).environmentObject(appState)
+        } label: {
+            HStack(spacing: 14) {
+                Image(systemName: "chart.bar")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Brand.primaryText)
+                    .frame(width: 34, height: 34)
+                    .background(Brand.secondarySurface,
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Analytics")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Brand.primaryText)
+                    Text(analyticsLocked ? "Preview available · Pro plan unlocks live data" : "Revenue, members, operations & insights")
+                        .font(.caption)
+                        .foregroundStyle(Brand.tertiaryText)
+                }
+
+                Spacer(minLength: 0)
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.softOutline)
+            }
+            .padding(14)
+            .background(Brand.cardBackground)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Brand.dividerColor, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Analytics")
+        .accessibilityHint("Opens club analytics including revenue, members, and operations.")
     }
 
     private func navCard(

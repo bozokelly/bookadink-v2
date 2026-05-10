@@ -13,7 +13,7 @@ enum ContentTabKind: String, CaseIterable { case games = "Games", chat = "Chat" 
 // Renders the club banner image (custom upload, then preset). Sized via the
 // shared `bannerAspectRatio` so the crop preview in ClubOwnerSheets matches
 // the rendered banner here exactly. The dark gradient/scrim/stripes and all
-// overlay chrome live in ClubDetailView's `clubHero` view — this struct is
+// overlay chrome live in ClubDetailView's hero foreground — this struct is
 // only the underlying image layer.
 
 struct ClubHeroView: View {
@@ -24,18 +24,6 @@ struct ClubHeroView: View {
 
     let club: Club
 
-    private static func heroImageName(for key: String?) -> String {
-        switch key {
-        case "hero_1": return "vine_concept"
-        case "hero_2": return "red_topdown"
-        case "hero_3": return "blue_collage"
-        case "hero_4": return "blue_closeup"
-        case "hero_5": return "red_aerial"
-        case "hero_6": return "dark_aerial"
-        default:       return "club_hero_default"
-        }
-    }
-
     var body: some View {
         GeometryReader { geo in
             if let customURL = club.customBannerURL {
@@ -44,8 +32,16 @@ struct ClubHeroView: View {
                     case let .success(image):
                         image.resizable().scaledToFill()
                     case .failure:
-                        Image(Self.heroImageName(for: club.heroImageKey))
-                            .resizable().scaledToFill()
+                        // AsyncImage failure → fall back to the curated
+                        // HeroSurface for this club rather than a stale
+                        // preset image. Same surface the no-banner path
+                        // would render, so the visual identity is stable.
+                        HeroSurface.forClub(
+                            club,
+                            lighting: .topRight,
+                            vignette: .none,
+                            direction: .diagonal
+                        )
                     default:
                         Color.black.opacity(0.6)
                     }
@@ -56,11 +52,14 @@ struct ClubHeroView: View {
                 .frame(width: geo.size.width, height: geo.size.height)
                 .clipped()
             } else {
-                Image(Self.heroImageName(for: club.heroImageKey))
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: geo.size.width, height: geo.size.height)
-                    .clipped()
+                HeroSurface.forClub(
+                    club,
+                    lighting: .topRight,
+                    vignette: .none,
+                    direction: .diagonal
+                )
+                .frame(width: geo.size.width, height: geo.size.height)
+                .clipped()
             }
         }
     }
@@ -79,8 +78,13 @@ struct ClubDetailView: View {
     private static let maxManagerLength = 160
     private static let maxTagLength = 40
 
-    /// Hero block height — anchors the dark gradient overlay layout.
-    private static let heroHeight: CGFloat = 340
+    /// Hero block height — anchors the parallax background and the
+    /// position the bridge avatar straddles. Trimmed from the original
+    /// 340pt to ~280pt so first-fold content (Upcoming Games) is visible
+    /// sooner. The bridge composition (avatar size, overlap ratio, font
+    /// weights) is preserved at the same metrics — only the empty
+    /// atmospheric region above the avatar is reduced.
+    private static let heroHeight: CGFloat = 280
 
     @EnvironmentObject private var appState: AppState
     @Environment(\.openURL) private var openURL
@@ -106,6 +110,317 @@ struct ClubDetailView: View {
     @State private var pendingConductDate: Date? = nil
     @State private var now = Date()
     private let minuteTick = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
+
+    /// Normalised hero collapse progress driven by scroll offset.
+    /// 0 = fully expanded, 1 = fully collapsed. Single source of truth —
+    /// every animation curve below is derived from this value via
+    /// `interp(_:start:end:)`. No threshold booleans, no separate
+    /// expanded/collapsed state.
+    @State private var collapseProgress: CGFloat = 0
+
+    /// Vertical offset applied to `fixedHeroBackground` for parallax.
+    /// Updated in lockstep with `collapseProgress` from the same scroll
+    /// reading, so the hero drifts upward at ~30% of scroll speed (capped
+    /// at `heroHeight`) — feels attached to the page, never pinned to
+    /// the screen, never bouncy on pull-to-refresh (clamps to 0).
+    @State private var heroParallaxOffset: CGFloat = 0
+
+    /// Positive distance the user has pulled the ScrollView down past
+    /// its rest position (pull-to-refresh region). Drives two coordinated
+    /// counter-translations so the bridge identity / sheet edge feel
+    /// anchored rather than dragged 1:1 with the pull:
+    ///   • `scrollColumn` is offset upward by 80% of the pull (so the
+    ///     bridge + sheet only appear to move at 20% of finger speed)
+    ///   • `fixedHeroBackground` stretches downward by the matching 20%
+    ///     so the hero ↔ sheet seam stays continuous (no appBackground
+    ///     gap opens between the hero bottom and the sheet top).
+    @State private var pullDownAmount: CGFloat = 0
+
+    /// Transient acknowledgement shown briefly after a pull-to-refresh
+    /// completes. Drives the "Games up-to-date" pill in the upcoming
+    /// games section so the user gets positive confirmation that their
+    /// pull resolved (regardless of whether new games actually arrived).
+    /// Auto-dismissed by `refreshAckToken` after ~1.8s.
+    @State private var refreshAckVisible: Bool = false
+    /// Token used to invalidate older auto-dismiss tasks if the user
+    /// pulls again before the previous ack has timed out — only the
+    /// most recent pull's ack should hide itself.
+    @State private var refreshAckToken: UUID = UUID()
+
+    /// Visual movement ratio applied during pull-to-refresh. The hero
+    /// stretches by this fraction; the sheet/bridge moves by this same
+    /// fraction (counter-offset is `1 - pullDampening`). At 0.20 the pull
+    /// felt over-anchored — fingers moved much faster than content. At
+    /// 0.35 the seam still travels less than the finger (so it doesn't
+    /// read as a 1:1 drag), but the resistance feels native rather than
+    /// stiff.
+    private static let pullDampening: CGFloat = 0.35
+
+    /// Pixels of upward scroll over which the hero collapses into the
+    /// compact header. Scales with `heroHeight` (~65% of it) so the
+    /// transition completes well before the hero fully scrolls off.
+    private static let collapseDistance: CGFloat = 180
+
+    /// Linear interpolation helper. Returns 0 below `start`, 1 above `end`,
+    /// linear in-between. Used to drive every choreographed curve from a
+    /// single `collapseProgress` value with explicit start/end keyframes.
+    private func interp(_ progress: CGFloat, start: CGFloat, end: CGFloat) -> CGFloat {
+        guard end > start else { return progress >= end ? 1 : 0 }
+        return min(max((progress - start) / (end - start), 0), 1)
+    }
+
+    // MARK: Choreography curves
+    //
+    // The expanded title and compact title are spatially far apart (hero
+    // position vs. nav position) so a brief crossfade reads as one
+    // continuous identity handoff. The avatar, by contrast, is the same
+    // identity element drawn twice — its handoff must not overlap, or
+    // the user briefly sees two avatars at slightly different sizes/
+    // positions. So the avatar curves are sequenced (bridge fades all
+    // the way out before the compact one fades in), while the title
+    // curves overlap a little. Timing keyframes:
+    //
+    //   bridge title opacity    : 1 → 0   on 0.00 … 0.48   (commits early so
+    //                                                       it never appears
+    //                                                       outside the
+    //                                                       compact bar)
+    //   bridge title scale      : 1 → 0.94 on 0.00 … 0.65
+    //   bridge title yOffset    : 0 → -16pt on 0.00 … 0.65
+    //   bridge avatar opacity   : 1 → 0   on 0.00 … 0.75   (avatar handoff
+    //                                                       intentionally
+    //                                                       slower — Phase 9
+    //                                                       sequencing)
+    //   compact avatar opacity  : 0 → 1   on 0.70 … 1.00   (≥0.70 — bridge ~gone)
+    //   compact title opacity   : 0 → 1   on 0.42 … 0.85   (small 0.42…0.48
+    //                                                       overlap with
+    //                                                       bridge fade)
+    //   compact identity scale  : 0.92 → 1 on 0.42 … 0.85
+    //   compact material        : 0 → 1   on 0.30 … 0.70   (commits with the
+    //                                                       title so the bar
+    //                                                       isn't a floating
+    //                                                       label)
+
+    private var expandedIdentityScale: CGFloat {
+        1 - 0.06 * interp(collapseProgress, start: 0, end: 0.65)
+    }
+    private var expandedIdentityYOffset: CGFloat {
+        -16 * interp(collapseProgress, start: 0, end: 0.65)
+    }
+    /// Bridge title block (name + descriptor + meta + role chip). Fades
+    /// out early (by progress 0.48) so it has fully committed to invisible
+    /// before the compact bar's title commits to visible — eliminates the
+    /// "title appears outside / below the compact header" perception. The
+    /// avatar handoff is deliberately slower (see `bridgeAvatarOpacity`).
+    private var bridgeTitleOpacity: Double {
+        Double(1 - interp(collapseProgress, start: 0, end: 0.48))
+    }
+    /// Bridge avatar — fades all the way out by 0.75 so it has fully
+    /// vanished before the compact avatar starts fading in at 0.70 (the
+    /// 0.05 overlap is below visual perception threshold for two
+    /// adjacent avatars, in practice the user only ever sees one).
+    private var bridgeAvatarOpacity: Double {
+        Double(1 - interp(collapseProgress, start: 0, end: 0.75))
+    }
+
+    /// Compact avatar — held off until 0.70 so the bridge avatar is
+    /// nearly invisible before this one starts to commit. Avoids the
+    /// "two avatars on screen at once" perception that triggered the
+    /// Phase 9 fix.
+    private var compactAvatarOpacity: Double {
+        Double(interp(collapseProgress, start: 0.70, end: 1.0))
+    }
+    /// Compact title (and the back / gear chrome). Overlaps the bridge
+    /// title fadeout very briefly (0.42…0.48) — small enough that the
+    /// titles don't read as two duelling labels, but enough that the
+    /// transition isn't a hard cut.
+    private var compactTitleOpacity: Double {
+        Double(interp(collapseProgress, start: 0.42, end: 0.85))
+    }
+    private var compactIdentityScale: CGFloat {
+        0.92 + 0.08 * interp(collapseProgress, start: 0.42, end: 0.85)
+    }
+    private var compactBackgroundOpacity: Double {
+        // Reaches full opacity by progress 0.55 — well before the bridge
+        // title finishes fading (0.48) so by the time anything is
+        // scrolling under the bar zone, the bar is already opaque enough
+        // to fully hide it. No more "title visible inside compact bar".
+        Double(interp(collapseProgress, start: 0.18, end: 0.55))
+    }
+
+    // MARK: - Body decomposition
+    //
+    // The view body is intentionally split into small computed properties
+    // so the Swift type-checker can resolve each piece independently. A
+    // single monolithic body containing the ScrollView, all its modifiers,
+    // the overlay, and the bottom `floatingCTABar` exceeded the
+    // type-checker's reasonable-time budget.
+
+    /// The scrolling column (hero + banners + sections) wrapped in a
+    /// ScrollView with the named coordinate space, refreshable, and the
+    /// compact-header overlay. Lives in its own property so the body
+    /// stays trivially typed.
+    private var scrollableContent: some View {
+        ScrollView {
+            // Scroll-offset probe — must live inside the ScrollView so
+            // its UIView lands as a descendant of the underlying
+            // UIScrollView and can KVO-observe its `contentOffset`. The
+            // iOS-18 `.onScrollGeometryChange` modifier would be cleaner
+            // but it's gated by deployment target; the named-
+            // coordinate-space + PreferenceKey reader couldn't see
+            // pull-to-refresh translation, which is what we need here.
+            ScrollOffsetReader { offset in
+                // `offset` is contentOffset.y + adjustedContentInset.top,
+                // i.e. logical position relative to the natural rest:
+                //   + N → user scrolled up by N (collapse / parallax)
+                //   − N → user pulled past rest by N (pull-to-refresh)
+                //     0 → at rest
+                let upward = max(offset, 0)
+                collapseProgress = min(upward / Self.collapseDistance, 1)
+                heroParallaxOffset = -min(upward, Self.heroHeight) * 0.30
+                pullDownAmount = max(-offset, 0)
+            }
+            .frame(height: 0)
+
+            scrollColumn
+        }
+        .refreshable {
+            // `refreshClubs()` internally awaits `refreshMemberships()` once
+            // it's done (see AppState), so we don't call it explicitly here
+            // — doing both runs the membership fetch twice in quick
+            // succession, which can flap `membershipStatesByClubID` mid-
+            // pull and cancel in-flight URLSession tasks belonging to the
+            // sibling refreshes (which surfaces as the "Upcoming Games"
+            // network error). One source of truth for memberships per pull.
+            await appState.refreshClubs()
+            await appState.refreshClubAdminRole(for: club)
+            await appState.refreshGames(for: club)
+            await appState.fetchReviews(for: club.id)
+            await appState.refreshCreditBalance(for: club.id)
+
+            // Positive acknowledgement — show "Games up-to-date" briefly so
+            // the pull feels resolved even when nothing new arrived. The
+            // token guards against a stale auto-dismiss firing after the
+            // user pulls again before the previous ack times out.
+            let token = UUID()
+            refreshAckToken = token
+            withAnimation(.easeInOut(duration: 0.18)) {
+                refreshAckVisible = true
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: 1_800_000_000)
+                if refreshAckToken == token {
+                    await MainActor.run {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            refreshAckVisible = false
+                        }
+                    }
+                }
+            }
+        }
+        .ignoresSafeArea(edges: .top)
+        // The ScrollView itself is transparent so `fixedHeroBackground`
+        // shows through behind the hero-foreground placeholder. Sections
+        // below the hero carry their own solid background (see
+        // `scrollContentCard`) so they mask the fixed hero as they rise.
+        // Compact sticky identity header — pinned to the top of the
+        // ScrollView's overlay area so it stays in place as the hero
+        // scrolls underneath it.
+        .overlay(alignment: .top) {
+            // The bar carries its own internal opacity curves (material
+            // backdrop, avatar, title, and chrome buttons fade
+            // independently) — no outer opacity here, just a hit-test
+            // gate that opens once the title is past 50% visible
+            // (midpoint of the 0.42…0.85 title curve ≈ 0.64). Below
+            // that, taps fall through to the expanded hero so the
+            // sticky bar can't intercept gestures while it's still
+            // mostly invisible.
+            compactCollapsedHeader
+                .allowsHitTesting(collapseProgress > 0.64)
+        }
+    }
+
+    /// The vertical content stack inside the ScrollView. The first child
+    /// is the hero foreground placeholder (transparent, sized to the
+    /// hero) — its background carries the only geometry probe. The
+    /// second child is the content card (banners + sections) on a solid
+    /// background so it visually covers the fixed hero as it rises.
+    @ViewBuilder
+    private var scrollColumn: some View {
+        VStack(spacing: 0) {
+            heroForeground
+
+            scrollContentCard
+                // 1pt negative top inset preserves the original
+                // hero-to-content overlap and removes any sub-pixel seam
+                // between the fixed hero and the rising content card.
+                .padding(.top, -1)
+        }
+        .padding(.bottom, 130)
+        // Pull-to-refresh dampening — counter-translates the entire
+        // scroll column upward by (1 - pullDampening) × pull distance,
+        // so the bridge identity, sheet edge, and content beneath it
+        // appear anchored (moving only at `pullDampening` × finger
+        // speed) instead of being dragged 1:1 with the gesture. Render
+        // transform only — does not affect layout, so the underlying
+        // scroll offset (and therefore `collapseProgress`) is unchanged.
+        .offset(y: -pullDownAmount * (1 - Self.pullDampening))
+    }
+
+    /// Solid-background content card that sits below the hero foreground
+    /// and visually rises over the fixed hero as the user scrolls. The
+    /// rounded top corners + subtle lifted shadow give the card a sheet
+    /// feel — content reads as continuous with the hero, not as a flat
+    /// list slapped underneath. `Brand.appBackground` is applied via a
+    /// rounded background shape (not as a clip) so the section content
+    /// inside isn't clipped at the corners.
+    private static let contentSheetCornerRadius: CGFloat = 22
+
+    @ViewBuilder
+    private var scrollContentCard: some View {
+        VStack(spacing: 0) {
+            // Bridge identity — the first child on the sheet. Avatar
+            // straddles the hero / sheet seam (drawn outside the sheet's
+            // top edge via a transform) and the title + descriptor +
+            // meta + role chip read against the sheet rather than the
+            // hero. This is what makes the hero ↔ content transition
+            // feel like one connected surface.
+            bridgeIdentityBlock
+
+            // Membership feedback banner — real state, kept above the fold.
+            if let msg = membershipFeedbackMessage {
+                membershipBanner(msg: msg)
+            }
+
+            // Credit balance banner — only when the user holds credits at this club.
+            let clubCredit = appState.creditBalance(for: club.id)
+            if clubCredit > 0 {
+                creditBanner(amountCents: clubCredit)
+            }
+
+            upcomingGamesSection
+            aboutCardSection
+            reviewsCardSection
+            locationCardSection
+
+            Color.clear.frame(height: 24)
+        }
+        .frame(maxWidth: .infinity)
+        .background(
+            UnevenRoundedRectangle(
+                topLeadingRadius: Self.contentSheetCornerRadius,
+                bottomLeadingRadius: 0,
+                bottomTrailingRadius: 0,
+                topTrailingRadius: Self.contentSheetCornerRadius,
+                style: .continuous
+            )
+            .fill(Brand.appBackground)
+            // Subtle lift shadow above the sheet edge — gives the
+            // hero-to-content transition a defined seam without a hard
+            // line. Below the visible cutoff in any direction, the
+            // shadow disappears under content.
+            .shadow(color: .black.opacity(0.10), radius: 8, x: 0, y: -2)
+        )
+    }
 
     /// Always reads the latest in-memory version of this club so fields like
     /// codeOfConduct reflect the most recent fetch, not the navigation-time snapshot.
@@ -238,42 +553,21 @@ struct ClubDetailView: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            ScrollView {
-                VStack(spacing: 0) {
-                    clubHero
-                        .padding(.bottom, -1)
+            // Layer 1: the hero surface itself — fixed at the top of the
+            // screen, never scrolls. The scrolling content layer above
+            // covers it as the user pulls content up. This is the
+            // Facebook-style parallax structure: hero is *behind* the
+            // ScrollView, not part of it.
+            fixedHeroBackground
 
-                    // Membership feedback banner — real state, kept above the fold.
-                    if let msg = membershipFeedbackMessage {
-                        membershipBanner(msg: msg)
-                    }
+            // Layer 2: scrolling content. Starts with the hero foreground
+            // (chrome + title + role badge) as a transparent placeholder
+            // sized to the hero height — through which `fixedHeroBackground`
+            // is visible — then continues with banners + sections on a
+            // solid background card so they mask the hero as they rise.
+            scrollableContent
 
-                    // Credit balance banner — only when the user holds credits at this club.
-                    let clubCredit = appState.creditBalance(for: club.id)
-                    if clubCredit > 0 {
-                        creditBanner(amountCents: clubCredit)
-                    }
-
-                    upcomingGamesSection
-                    aboutCardSection
-                    reviewsCardSection
-                    locationCardSection
-
-                    Color.clear.frame(height: 24)
-                }
-                .padding(.bottom, 130)
-            }
-            .refreshable {
-                await appState.refreshMemberships()
-                await appState.refreshClubAdminRole(for: club)
-                await appState.refreshGames(for: club)
-                await appState.refreshClubs()
-                await appState.fetchReviews(for: club.id)
-                await appState.refreshCreditBalance(for: club.id)
-            }
-            .ignoresSafeArea(edges: .top)
-            .background(Brand.appBackground)
-
+            // Layer 3: existing bottom action bar — unchanged.
             floatingCTABar
         }
         .navigationBarTitleDisplayMode(.inline)
@@ -353,7 +647,23 @@ struct ClubDetailView: View {
             }
             Button("Cancel", role: .cancel) { ownerDeleteGameCandidate = nil }
         } message: {
-            Text(ownerDeleteGameCandidate?.title ?? "This cannot be undone.")
+            // Append a credit-issuance warning when the visible instance has
+            // paid bookings. For series-scope deletes the server cancels each
+            // target idempotently — paid players in any affected instance get
+            // refunded regardless of which scope the admin picks.
+            if let game = ownerDeleteGameCandidate {
+                let paid = (appState.attendeesByGameID[game.id] ?? []).filter { attendee in
+                    guard case .confirmed = attendee.booking.state else { return false }
+                    return attendee.booking.feePaid && attendee.booking.paymentMethod == "stripe"
+                }.count
+                if paid > 0 {
+                    Text("\(game.title)\nPaid players will be issued club credit.")
+                } else {
+                    Text(game.title)
+                }
+            } else {
+                Text("This cannot be undone.")
+            }
         }
         .confirmationDialog("Leave club?", isPresented: $showLeaveClubConfirm, titleVisibility: .visible) {
             Button("Leave Club", role: .destructive) {
@@ -432,27 +742,52 @@ struct ClubDetailView: View {
         }
     }
 
-    // MARK: - Hero
+    // MARK: - Hero (split into fixed back layer + scrolling foreground)
+    //
+    // `fixedHeroBackground` is the bottom layer of the body's outer
+    // ZStack — it never scrolls. `heroForeground` is the FIRST item in
+    // the scrolling content tree — a transparent placeholder sized to
+    // the hero, on which the chrome (back / settings) and identity
+    // content (title, descriptor, meta, role badge) ride. As the user
+    // scrolls upward the foreground rises off the fixed background and
+    // is replaced from below by the solid-background `scrollContentCard`.
 
-    private var clubHero: some View {
-        ZStack(alignment: .bottomLeading) {
-            // Background: banner image (when uploaded) or hue-derived dark gradient.
-            heroBackground
+    /// Fixed hero surface (uploaded banner image OR curated HeroSurface).
+    /// Pinned to the top of the body's ZStack at exactly `heroHeight` and
+    /// hit-test disabled so taps on this region pass through to the
+    /// chrome buttons living in `heroForeground` above it.
+    private var fixedHeroBackground: some View {
+        heroBackground
+            // Height stretches downward during pull-to-refresh by
+            // exactly `pullDampening` × pull, so the hero's bottom edge
+            // tracks the bridge/sheet's dampened movement and there's
+            // no gap at the seam. At rest (and during upward scroll)
+            // pullDownAmount = 0 so this collapses to the static
+            // `heroHeight`.
+            .frame(height: Self.heroHeight + pullDownAmount * Self.pullDampening)
+            // Parallax — drifts upward at 30% of scroll speed (clamped).
+            // Applied before the alignment-fill frame so the offset
+            // interpolates the visual position of the hero, not the
+            // outer container.
+            .offset(y: heroParallaxOffset)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
+    }
 
-            // Diagonal stripes — design's signature texture.
-            heroStripes
-
-            // Bottom-fade legibility scrim (over both image and gradient).
-            LinearGradient(
-                colors: [
-                    Color.black.opacity(0.0),
-                    Color.black.opacity(0.55),
-                    Color.black.opacity(0.78)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(maxHeight: .infinity)
+    /// Scrolling hero foreground — just the chrome (back / settings)
+    /// over a transparent placeholder sized to the hero. The expanded
+    /// identity (avatar, title, descriptor, meta, role chip) lives in
+    /// `bridgeIdentityBlock` instead, where it can hug the sheet edge
+    /// and have the avatar straddle the hero / sheet seam — that's what
+    /// makes the transition feel like one connected surface rather than
+    /// two stacked elements.
+    private var heroForeground: some View {
+        ZStack(alignment: .topLeading) {
+            // Transparent placeholder — sized so the ScrollView's first
+            // item occupies the hero region exactly. Lets the fixed
+            // background layer below show through.
+            Color.clear
 
             // Top chrome — back button + settings menu.
             VStack {
@@ -467,97 +802,127 @@ struct ClubDetailView: View {
                 Spacer()
             }
             .padding(.top, safeAreaTopPad)
+        }
+        .frame(height: Self.heroHeight)
+        .frame(maxWidth: .infinity)
+    }
 
-            // Owner / Admin chip — bottom-right.
-            if let roleLabel = roleBadgeLabel {
-                roleBadge(label: roleLabel)
-                    .padding(.trailing, 16)
-                    .padding(.bottom, 22)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
+    // MARK: - Bridge identity block
+    //
+    // The "bridge" is the identity composition that ties hero ↔ sheet:
+    //
+    //   ┌──────── hero region ────────┐
+    //   │                             │
+    //   │            ┌──────┐         │
+    //   │            │      │ ← avatar straddles the seam (half on hero,
+    //   │            │  ⌂   │   half on sheet) so the visual surface feels
+    //   │            │      │   continuous instead of two stacked layers.
+    //   ├────────────└──────┘─────────┤  ← rounded sheet edge
+    //   │  Club Name                  │
+    //   │  SUBURB                     │
+    //   │  ★ 4.6 (12) · 87 members    │
+    //   │  ───────────────────────    │
+    //   │  Upcoming Games …           │
+    //
+    // The identity content scrolls with the sheet (it's at the top of
+    // `scrollContentCard`), and the same choreographed opacity / scale /
+    // y-offset curves now apply to the *bridge* — anchored to its top-
+    // leading corner so it shrinks toward the avatar's position, which
+    // is where the compact bar's identity row continues from.
 
-            // Bottom block: name, descriptor, ★ rating · members.
-            VStack(alignment: .leading, spacing: 8) {
-                Text(safeClubName)
-                    .font(.system(size: 32, weight: .heavy))
-                    .kerning(-0.5)
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.75)
-                    .shadow(color: .black.opacity(0.35), radius: 8, x: 0, y: 2)
-                    .padding(.trailing, roleBadgeLabel != nil ? 80 : 0)
+    /// Avatar size used by the bridge block. The avatar straddles the
+    /// hero / sheet seam — `bridgeAvatarOverlap` is how far it visually
+    /// rises above the sheet's top edge into the hero region.
+    private static let bridgeAvatarSize: CGFloat = 76
+    private static let bridgeAvatarOverlap: CGFloat = 38
+
+    private var bridgeIdentityBlock: some View {
+        ZStack(alignment: .topLeading) {
+            // Identity column — sits on the sheet. The top padding
+            // reserves vertical space for the avatar to drop into; the
+            // avatar itself is offset upward via a transform below so
+            // half of it overlaps the hero region.
+            //
+            // The title column carries its own opacity curve (faster
+            // fadeout than the avatar) so the avatar can stay anchored
+            // on the seam slightly longer — mirroring how the compact
+            // avatar is the last identity element to commit on the way
+            // in. Using a single outer opacity here would force the
+            // avatar to vanish on the same curve as the title and
+            // re-introduce the duplicate-avatar overlap during the
+            // 0.55 … 0.85 window where both compact and bridge avatars
+            // would otherwise be partially visible.
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(safeClubName)
+                        .font(.system(size: 26, weight: .heavy))
+                        .kerning(-0.4)
+                        .foregroundStyle(Brand.primaryText)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.75)
+                        .layoutPriority(1)
+
+                    if let roleLabel = roleBadgeLabel {
+                        roleBadgeChip(label: roleLabel)
+                            .alignmentGuide(.firstTextBaseline) { d in
+                                d[VerticalAlignment.center]
+                            }
+                    }
+                }
 
                 if !heroDescriptor.isEmpty {
                     Text(heroDescriptor.uppercased())
                         .font(.system(size: 11.5, weight: .heavy))
-                        .kerning(1.2)
-                        .foregroundStyle(Color.white.opacity(0.72))
+                        .kerning(1.0)
+                        .foregroundStyle(Brand.secondaryText)
                         .lineLimit(1)
                 }
 
-                heroMetaRow
+                bridgeMetaRow
+                    .padding(.top, 2)
             }
             .padding(.horizontal, 18)
-            .padding(.bottom, 22)
-        }
-        .frame(height: Self.heroHeight)
-        .frame(maxWidth: .infinity)
-        .clipped()
-        .ignoresSafeArea(edges: .top)
-    }
+            // Reserve room above the title for the avatar's visible half
+            // (everything below the seam) plus a tighter gap — the
+            // empty atmospheric region above the identity is reduced so
+            // first-fold content surfaces sooner without compressing
+            // the bridge composition itself.
+            .padding(.top, Self.bridgeAvatarSize - Self.bridgeAvatarOverlap + 8)
+            .padding(.bottom, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .opacity(bridgeTitleOpacity)
 
-    @ViewBuilder
-    private var heroBackground: some View {
-        if club.customBannerURL != nil {
-            ClubHeroView(club: club)
-                .overlay(Color.black.opacity(0.30))
-        } else {
-            // Hue-derived deep gradient (per-club deterministic).
-            let h = clubHue / 360
-            let a = Color(hue: h, saturation: 0.28, brightness: 0.28)
-            let b = Color(hue: h, saturation: 0.30, brightness: 0.14)
-            let c = Color(hue: h, saturation: 0.35, brightness: 0.08)
-            ZStack {
-                LinearGradient(
-                    colors: [a, b, c],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
+            // Avatar — sits at the top-leading of the ZStack and is
+            // visually offset upward so half of it crosses into the
+            // hero. Drawn with a thick `Brand.appBackground` border so
+            // there's a clean halo where it overlaps the hero, plus a
+            // soft drop-shadow that reads on both the hero and the sheet.
+            ClubImageBadge(club: liveClub)
+                .frame(width: Self.bridgeAvatarSize, height: Self.bridgeAvatarSize)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Brand.appBackground, lineWidth: 4)
                 )
-                // Soft radial glow from top-right.
-                RadialGradient(
-                    colors: [
-                        Color(hue: h, saturation: 0.55, brightness: 0.45).opacity(0.45),
-                        .clear
-                    ],
-                    center: .init(x: 0.85, y: 0.05),
-                    startRadius: 10,
-                    endRadius: 280
-                )
-            }
+                .shadow(color: .black.opacity(0.18), radius: 7, y: 2)
+                .padding(.leading, 18)
+                .offset(y: -Self.bridgeAvatarOverlap)
+                .opacity(bridgeAvatarOpacity)
         }
+        // Outer transform applies to the entire ZStack so the avatar +
+        // title shrink and lift toward the leading edge as one unit,
+        // pointing at the compact bar's identity row. No outer opacity
+        // here — the per-element opacity curves above handle the
+        // sequenced handoff.
+        .scaleEffect(expandedIdentityScale, anchor: .topLeading)
+        .offset(y: expandedIdentityYOffset)
     }
 
-    private var heroStripes: some View {
-        GeometryReader { geo in
-            Canvas { ctx, size in
-                let gap: CGFloat = 14
-                ctx.translateBy(x: 0, y: 0)
-                let count = Int((size.width + size.height) / gap) + 2
-                for i in 0..<count {
-                    let x = CGFloat(i) * gap - size.height
-                    var path = Path()
-                    path.move(to: CGPoint(x: x, y: 0))
-                    path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                    ctx.stroke(path, with: .color(Color.white.opacity(0.045)), lineWidth: 1)
-                }
-            }
-            .frame(width: geo.size.width, height: geo.size.height)
-            .blendMode(.screen)
-            .allowsHitTesting(false)
-        }
-    }
-
-    private var heroMetaRow: some View {
+    /// Identity metadata row — uses `Brand.primaryText` /
+    /// `Brand.secondaryText` so it reads against the light content sheet
+    /// rather than against the hero. ★ rating · members count · pinned
+    /// indicator (when applicable).
+    private var bridgeMetaRow: some View {
         HStack(spacing: 8) {
             if let avg = avgRating {
                 HStack(spacing: 5) {
@@ -566,36 +931,201 @@ struct ClubDetailView: View {
                         .foregroundStyle(Color(hex: "F5B70A"))
                     Text(String(format: "%.1f", avg))
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Color.white.opacity(0.92))
+                        .foregroundStyle(Brand.primaryText)
                     let count = appState.reviewsByClubID[club.id]?.count ?? 0
                     Text("(\(count))")
-                        .font(.system(size: 13, weight: .regular))
-                        .foregroundStyle(Color.white.opacity(0.55))
+                        .font(.system(size: 13))
+                        .foregroundStyle(Brand.secondaryText)
                 }
-                Text("·")
-                    .foregroundStyle(Color.white.opacity(0.4))
+                Text("·").foregroundStyle(Brand.tertiaryText)
             }
 
             HStack(spacing: 5) {
                 Text("\(club.memberCount)")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.92))
+                    .foregroundStyle(Brand.primaryText)
                 Text(club.memberCount == 1 ? "member" : "members")
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundStyle(Color.white.opacity(0.78))
+                    .font(.system(size: 13))
+                    .foregroundStyle(Brand.secondaryText)
             }
 
             if appState.isClubPinned(club) {
-                Text("·").foregroundStyle(Color.white.opacity(0.4))
+                Text("·").foregroundStyle(Brand.tertiaryText)
                 HStack(spacing: 4) {
                     Image(systemName: "pin.fill")
                         .font(.system(size: 10, weight: .semibold))
                     Text("Pinned")
                         .font(.system(size: 12, weight: .semibold))
                 }
-                .foregroundStyle(Color.white.opacity(0.78))
+                .foregroundStyle(Brand.secondaryText)
             }
         }
+    }
+
+    /// Owner / Admin chip rendered next to the title in the bridge
+    /// identity block. `Brand.primaryText` over `Brand.secondarySurface`
+    /// so it reads on the light sheet rather than over the hero.
+    private func roleBadgeChip(label: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "crown.fill")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(Brand.sportPop)
+            Text(label.uppercased())
+                .font(.system(size: 11, weight: .heavy))
+                .kerning(0.4)
+                .foregroundStyle(Brand.primaryText)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Brand.secondarySurface, in: Capsule())
+        .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 0.5))
+    }
+
+    @ViewBuilder
+    private var heroBackground: some View {
+        // Read from `liveClub` (the in-memory cached copy in AppState),
+        // not the navigation-time `club` snapshot. After an owner saves a
+        // new palette / pattern / banner via the Appearance sheet,
+        // `appState.clubs[index]` is patched in place — using `liveClub`
+        // here means the hero re-renders immediately without requiring
+        // the user to navigate away and back.
+        let renderClub = liveClub
+        if renderClub.customBannerURL != nil {
+            // Uploaded photograph — heavy scrim preserved exactly as before
+            // (clear → 0.55 mid → 0.78 bottom) so any bright image still
+            // yields a readable title block. Behaviour intentionally
+            // unchanged from the pre-HeroSurface era.
+            ClubHeroView(club: renderClub)
+                .overlay(Color.black.opacity(0.30))
+                .overlay(uploadedBannerLegibilityScrim)
+        } else {
+            // Curated HeroSurface with `.bottomStrong` vignette baked in.
+            // No additional global scrim — the surface's own lighting +
+            // bottom fade handles legibility without darkening the upper
+            // half of the hero. Pinned palette/pattern when the owner has
+            // selected them, deterministic auto-rotation otherwise.
+            HeroSurface.forClub(
+                renderClub,
+                lighting: .topRight,
+                vignette: .bottomStrong,
+                direction: .diagonal
+            )
+        }
+    }
+
+    /// Compact sticky identity header. Pinned at the top of the screen
+    /// via `scrollableContent`'s `.overlay(alignment: .top)`. Splits its
+    /// choreography across four independent curves so the handoff from
+    /// the expanded hero reads as one continuous identity element
+    /// rather than as two avatars / two titles briefly co-existing:
+    ///
+    ///   • material backdrop : fades in 0.45 … 0.85
+    ///   • compact title +
+    ///     back / gear chrome : fades + scales in 0.55 … 1.00
+    ///   • compact avatar    : fades in 0.70 … 1.00 (held off so the
+    ///                         bridge avatar is ~gone before this one
+    ///                         starts to commit — no duplicate avatar)
+    ///
+    /// Action wiring is shared with the expanded hero via
+    /// `settingsMenuContent` and a single `dismiss()` — no duplicate
+    /// buttons exist in the view tree at the same time, since the
+    /// expanded chrome scrolls off naturally and the compact chrome is
+    /// hit-disabled until the title is past 50% visible.
+    private var compactCollapsedHeader: some View {
+        ZStack(alignment: .top) {
+            // Solid backdrop + hairline divider. Brand.appBackground sits
+            // beneath a thin material so once `compactBackgroundOpacity`
+            // commits the bar is fully opaque — scroll content beneath
+            // (upcoming-games carousel cards, bridge title, hero) can no
+            // longer bleed through. A pure `.regularMaterial` was used
+            // earlier and proved too translucent: at full collapse the
+            // user could still read the carousel through the bar, which
+            // gave the impression that the bridge title was floating
+            // *inside* the compact header rather than being hidden by it.
+            ZStack {
+                Brand.appBackground
+                Rectangle().fill(.regularMaterial).opacity(0.35)
+            }
+            .frame(height: safeAreaTopPad + 52)
+            .frame(maxWidth: .infinity)
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(Brand.softOutline.opacity(0.55))
+                    .frame(height: 0.5)
+            }
+            .opacity(compactBackgroundOpacity)
+            .ignoresSafeArea(edges: .top)
+
+            // Bar content: back button | (avatar + title) | gear.
+            // The avatar carries `compactAvatarOpacity` (held off until
+            // 0.70) while the title + chrome share `compactTitleOpacity`
+            // (overlaps the bridge fadeout at 0.55) — split because the
+            // avatar is the same identity element drawn twice and must
+            // not visually overlap with the bridge avatar, but the
+            // titles are spatially distant and benefit from the brief
+            // crossfade reading as one continuous title.
+            HStack(spacing: 12) {
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(Brand.primaryText)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Back")
+                .opacity(compactTitleOpacity)
+
+                HStack(spacing: 10) {
+                    ClubImageBadge(club: liveClub)
+                        .frame(width: 30, height: 30)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .opacity(compactAvatarOpacity)
+
+                    Text(safeClubName)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(Brand.primaryText)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .opacity(compactTitleOpacity)
+                }
+                .scaleEffect(compactIdentityScale, anchor: .leading)
+
+                Spacer(minLength: 8)
+
+                compactSettingsMenu
+                    .opacity(compactTitleOpacity)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity)
+            // The overlay's coordinate origin already sits below the
+            // status bar — only the Rectangle backdrop extends *up*
+            // into the safe area via `.ignoresSafeArea(edges: .top)`.
+            // Adding `padding(.top, safeAreaTopPad)` here was applying
+            // safe-area inset a second time and pushing the chrome row
+            // below the bar's bottom edge (avatar + title + back/gear
+            // ended up sitting in the scroll content underneath the bar
+            // instead of inside it). No padding needed — the ZStack's
+            // top alignment puts the chrome at the correct y already.
+        }
+    }
+
+    /// Legacy heavy scrim — only applied over uploaded photographic banners
+    /// where the underlying image brightness is unknown. HeroSurface
+    /// fallbacks render with their own `.bottomStrong` vignette instead.
+    private var uploadedBannerLegibilityScrim: some View {
+        LinearGradient(
+            colors: [
+                Color.black.opacity(0.0),
+                Color.black.opacity(0.55),
+                Color.black.opacity(0.78),
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
     }
 
     private func glassNavButton(systemName: String, action: @escaping () -> Void) -> some View {
@@ -608,22 +1138,6 @@ struct ClubDetailView: View {
                 .overlay(Circle().stroke(Color.white.opacity(0.10), lineWidth: 1))
         }
         .buttonStyle(.plain)
-    }
-
-    private func roleBadge(label: String) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: "crown.fill")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(Brand.sportPop)
-            Text(label.uppercased())
-                .font(.system(size: 11, weight: .heavy))
-                .kerning(0.4)
-                .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 6)
-        .background(Color.white.opacity(0.10), in: Capsule())
-        .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 1))
     }
 
     private var roleBadgeLabel: String? {
@@ -641,53 +1155,64 @@ struct ClubDetailView: View {
 
     // MARK: - Settings Menu
 
+    /// Menu contents (Manage Club / Share / Pin / Leave / Cancel Request).
+    /// Extracted from `settingsMenu` so the compact collapsing header can
+    /// reuse the same actions behind a different label without duplicating
+    /// the action wiring or risking the two menus drifting apart.
     @ViewBuilder
-    private var settingsMenu: some View {
+    private var settingsMenuContent: some View {
         let pinned = appState.isClubPinned(club)
         let state = appState.membershipState(for: club)
 
-        Menu {
-            if isClubAdminUser {
-                Button {
-                    isDashboardPresented = true
-                } label: {
-                    Label("Manage Club", systemImage: "square.grid.2x2")
-                }
-                Divider()
-            }
-
-            if let shareURL = clubShareURL {
-                ShareLink(item: shareURL) {
-                    Label("Share", systemImage: "square.and.arrow.up")
-                }
-            }
-
+        if isClubAdminUser {
             Button {
-                let success = appState.togglePinClub(club)
-                if !success { showPinCapAlert = true }
+                isDashboardPresented = true
             } label: {
-                Label(pinned ? "Unpin from Home" : "Pin to Home",
-                      systemImage: pinned ? "pin.slash" : "pin")
+                Label("Manage Club", systemImage: "square.grid.2x2")
             }
+            Divider()
+        }
 
-            switch state {
-            case .approved:
-                Divider()
-                Button(role: .destructive) {
-                    showLeaveClubConfirm = true
-                } label: {
-                    Label("Leave Club", systemImage: "rectangle.portrait.and.arrow.right")
-                }
-            case .pending:
-                Divider()
-                Button(role: .destructive) {
-                    showCancelRequestConfirm = true
-                } label: {
-                    Label("Cancel Request", systemImage: "xmark.circle")
-                }
-            default:
-                EmptyView()
+        if let shareURL = clubShareURL {
+            ShareLink(item: shareURL) {
+                Label("Share", systemImage: "square.and.arrow.up")
             }
+        }
+
+        Button {
+            let success = appState.togglePinClub(club)
+            if !success { showPinCapAlert = true }
+        } label: {
+            Label(pinned ? "Unpin from Home" : "Pin to Home",
+                  systemImage: pinned ? "pin.slash" : "pin")
+        }
+
+        switch state {
+        case .approved:
+            Divider()
+            Button(role: .destructive) {
+                showLeaveClubConfirm = true
+            } label: {
+                Label("Leave Club", systemImage: "rectangle.portrait.and.arrow.right")
+            }
+        case .pending:
+            Divider()
+            Button(role: .destructive) {
+                showCancelRequestConfirm = true
+            } label: {
+                Label("Cancel Request", systemImage: "xmark.circle")
+            }
+        default:
+            EmptyView()
+        }
+    }
+
+    /// Glass-style gear used inside the expanded hero (white-on-black-glass
+    /// over the hero image / HeroSurface).
+    @ViewBuilder
+    private var settingsMenu: some View {
+        Menu {
+            settingsMenuContent
         } label: {
             ZStack(alignment: .topTrailing) {
                 Image(systemName: "gearshape")
@@ -702,6 +1227,31 @@ struct ClubDetailView: View {
                         .frame(width: 9, height: 9)
                         .padding(.top, 2)
                         .padding(.trailing, 2)
+                }
+            }
+        }
+        .accessibilityLabel("Club options")
+    }
+
+    /// Compact gear used inside the collapsed header (monochrome SF Symbol
+    /// over the regular-material backdrop). Same actions as `settingsMenu`.
+    @ViewBuilder
+    private var compactSettingsMenu: some View {
+        Menu {
+            settingsMenuContent
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Brand.primaryText)
+                    .frame(width: 40, height: 40)
+                    .contentShape(Rectangle())
+                if isClubAdminUser, pendingJoinRequestCount > 0 {
+                    Circle()
+                        .fill(Brand.errorRed)
+                        .frame(width: 8, height: 8)
+                        .padding(.top, 4)
+                        .padding(.trailing, 4)
                 }
             }
         }
@@ -798,46 +1348,26 @@ struct ClubDetailView: View {
             sectionLabel("Upcoming games", accent: true)
                 .padding(.top, 22)
 
-            if let error = appState.clubGamesError(for: club) {
-                cardContainer {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.circle")
-                            .foregroundStyle(Brand.errorRed)
-                        Text(AppCopy.friendlyError(error))
-                            .font(.footnote)
-                            .foregroundStyle(Brand.errorRed)
-                            .lineLimit(2)
-                        Spacer(minLength: 4)
-                        Button("Retry") {
-                            Task { await appState.refreshGames(for: club) }
-                        }
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Brand.errorRed)
-                    }
-                    .padding(14)
+            // Non-destructive refresh UX:
+            //
+            //   1. We have games  → render the carousel (always wins).
+            //                       After a successful pull-to-refresh,
+            //                       the "Games up-to-date" pill appears
+            //                       briefly above it. Refresh errors are
+            //                       swallowed silently when cached games
+            //                       are already on screen — the user
+            //                       can pull again and the bar will
+            //                       reappear with the same positive
+            //                       confirmation when the network comes
+            //                       back. Persistent errors still surface
+            //                       in the empty state below.
+            //   2. No games, error → full error card with Retry.
+            //   3. No games, no error → loading spinner or empty state.
+            if !filteredClubGames.isEmpty {
+                if refreshAckVisible {
+                    refreshAcknowledgementPill
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                 }
-            } else if filteredClubGames.isEmpty {
-                if appState.isLoadingGames(for: club) {
-                    cardContainer {
-                        HStack {
-                            ProgressView().tint(Brand.secondaryText)
-                            Text("Loading games…")
-                                .font(.subheadline)
-                                .foregroundStyle(Brand.secondaryText)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(18)
-                    }
-                } else {
-                    cardContainer {
-                        Text("No upcoming games scheduled.")
-                            .font(.subheadline)
-                            .foregroundStyle(Brand.mutedText)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(18)
-                    }
-                }
-            } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
                         ForEach(filteredClubGames) { game in
@@ -860,8 +1390,73 @@ struct ClubDetailView: View {
                     .padding(.horizontal, 16)
                 }
                 .scrollTargetBehavior(.viewAligned)
+            } else if let error = appState.clubGamesError(for: club) {
+                cardContainer {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.circle")
+                            .foregroundStyle(Brand.errorRed)
+                        Text(AppCopy.friendlyError(error))
+                            .font(.footnote)
+                            .foregroundStyle(Brand.errorRed)
+                            .lineLimit(2)
+                        Spacer(minLength: 4)
+                        Button("Retry") {
+                            Task { await appState.refreshGames(for: club) }
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.errorRed)
+                    }
+                    .padding(14)
+                }
+            } else if appState.isLoadingGames(for: club) {
+                cardContainer {
+                    HStack {
+                        ProgressView().tint(Brand.secondaryText)
+                        Text("Loading games…")
+                            .font(.subheadline)
+                            .foregroundStyle(Brand.secondaryText)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(18)
+                }
+            } else {
+                if refreshAckVisible {
+                    refreshAcknowledgementPill
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+                cardContainer {
+                    Text("No upcoming games scheduled.")
+                        .font(.subheadline)
+                        .foregroundStyle(Brand.mutedText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(18)
+                }
             }
         }
+    }
+
+    /// Transient positive confirmation shown briefly after a successful
+    /// pull-to-refresh — replaces the previous "Couldn't refresh —
+    /// showing latest" chip, which surfaced as a negative even when the
+    /// refresh had actually completed (just with no new games to show).
+    /// Auto-dismissed by the `refreshAckToken` task in `.refreshable`.
+    private var refreshAcknowledgementPill: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Brand.sportPop)
+            Text("Games up to date")
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(Brand.secondaryText)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Brand.secondarySurface, in: Capsule())
+        .overlay(Capsule().stroke(Brand.softOutline.opacity(0.55), lineWidth: 0.5))
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .accessibilityLabel("Games up to date")
     }
 
     // MARK: - About Card
@@ -1393,11 +1988,6 @@ private struct UpcomingGameCarouselCard: View {
         return f
     }()
 
-    private var hue: Double {
-        let bytes = withUnsafeBytes(of: game.id.uuid) { Array($0) }
-        let seed = bytes.reduce(0) { Int($0) &+ Int($1) }
-        return Double(seed % 360)
-    }
     private var dateLabel: String { Self.dateFormatter.string(from: game.dateTime).uppercased() }
     private var timeLabel: String { Self.timeFormatter.string(from: game.dateTime).uppercased() }
     private var confirmed: Int { game.confirmedCount ?? 0 }
@@ -1412,13 +2002,7 @@ private struct UpcomingGameCarouselCard: View {
         if let trimmed, !trimmed.isEmpty { return trimmed }
         return nil
     }
-    private var costLabel: String {
-        guard let fee = game.feeAmount, fee > 0 else { return "Free" }
-        if fee.truncatingRemainder(dividingBy: 1) == 0 {
-            return String(format: "$%.0f", fee)
-        }
-        return String(format: "$%.2f", fee)
-    }
+    private var costLabel: String { game.priceLabel }
     private var capacityColor: Color {
         if isFull { return Color(hex: "FF6B6B") }
         if pct >= 0.75 { return Color(hex: "FFC23A") }
@@ -1442,17 +2026,20 @@ private struct UpcomingGameCarouselCard: View {
     }
 
     private var heroBlock: some View {
-        let h = hue / 360
-        let topColor = Color(hue: h, saturation: 0.32, brightness: 0.24)
-        let botColor = Color(hue: h, saturation: 0.38, brightness: 0.10)
-
-        return ZStack(alignment: .topTrailing) {
-            LinearGradient(
-                colors: [topColor, botColor],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
+        ZStack(alignment: .topTrailing) {
+            // Same surface composition as the game detail hero — picks
+            // up the admin's pinned palette + pattern (recurring games
+            // inherit from the template) and falls back to the
+            // deterministic auto rotation seeded from `game.id` on any
+            // axis the admin hasn't pinned. Previously this card painted
+            // a hue-hashed gradient + hardcoded diagonal stripes which
+            // ignored both selections.
+            HeroSurface.forGame(
+                game,
+                lighting: .topRight,
+                vignette: .bottom,
+                direction: .diagonal
             )
-            stripesOverlay
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 5) {
@@ -1541,21 +2128,6 @@ private struct UpcomingGameCarouselCard: View {
         .padding(.vertical, 12)
     }
 
-    private var stripesOverlay: some View {
-        Canvas { ctx, size in
-            let gap: CGFloat = 12
-            let count = Int((size.width + size.height) / gap) + 2
-            for i in 0..<count {
-                let x = CGFloat(i) * gap - size.height
-                var path = Path()
-                path.move(to: CGPoint(x: x, y: 0))
-                path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                ctx.stroke(path, with: .color(Color.white.opacity(0.05)), lineWidth: 1)
-            }
-        }
-        .blendMode(.screen)
-        .allowsHitTesting(false)
-    }
 }
 
 // MARK: - Share Sheet
@@ -1601,3 +2173,105 @@ struct ShakeEffect: GeometryEffect {
             }())
     }
 }
+
+// MARK: - Scroll offset reader (UIKit introspect)
+//
+// Reads the enclosing `UIScrollView`'s `contentOffset` directly via KVO,
+// so callers see pull-to-refresh / overscroll translation that the
+// SwiftUI-only `GeometryReader` + named coordinate space doesn't expose.
+// The reported value is the **logical** offset relative to the natural
+// rest position — i.e. `contentOffset.y + adjustedContentInset.top` —
+// so `0` is rest regardless of any inset the refresh control applies,
+// `+N` is upward scroll, and `−N` is a pull past rest.
+//
+// To use, place an instance inside the ScrollView's content with a
+// 0-height frame:
+//
+//     ScrollView {
+//         ScrollOffsetReader { offset in /* read */ }
+//             .frame(height: 0)
+//         <real content>
+//     }
+//
+// iOS 18 callers can drop this in favour of `.onScrollGeometryChange` —
+// the value is identical.
+
+// File-scope so other views (e.g. GameDetailView) can reuse the same
+// pull-tracking probe — the implementation is generic and reading
+// scroll offset via UIKit introspection isn't ClubDetailView-specific.
+struct ScrollOffsetReader: UIViewRepresentable {
+    let onChange: (CGFloat) -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let view = ScrollOffsetProbeView(frame: .zero)
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
+        view.onChange = onChange
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        // Refresh the captured closure on every body recompute so any
+        // captured state setters point at the latest @State storage.
+        (uiView as? ScrollOffsetProbeView)?.onChange = onChange
+    }
+}
+
+/// Headless `UIView` whose only job is to find its enclosing
+/// `UIScrollView` once it's in the hierarchy and KVO-observe
+/// `contentOffset` on it. The KVO callback fires on the main thread
+/// (since `UIScrollView` is a `UIView`), so it's safe to drive SwiftUI
+/// `@State` from `onChange`.
+private final class ScrollOffsetProbeView: UIView {
+    var onChange: ((CGFloat) -> Void)?
+    private var observation: NSKeyValueObservation?
+    private weak var observedScrollView: UIScrollView?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            // Detached from window — drop the observer to avoid leaks
+            // and stale callbacks.
+            observation?.invalidate()
+            observation = nil
+            observedScrollView = nil
+        } else {
+            attachObserverIfNeeded()
+        }
+    }
+
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        // The enclosing UIScrollView may not be present at
+        // `didMoveToWindow` time on every layout pass; re-checking on
+        // superview changes covers SwiftUI's compositional shuffle.
+        attachObserverIfNeeded()
+    }
+
+    private func attachObserverIfNeeded() {
+        guard window != nil, observation == nil,
+              let scrollView = enclosingScrollView() else { return }
+        observedScrollView = scrollView
+        observation = scrollView.observe(
+            \.contentOffset,
+            options: [.new, .initial]
+        ) { [weak self] scroll, _ in
+            let logical = scroll.contentOffset.y + scroll.adjustedContentInset.top
+            self?.onChange?(logical)
+        }
+    }
+
+    private func enclosingScrollView() -> UIScrollView? {
+        var view: UIView? = self.superview
+        while let v = view {
+            if let s = v as? UIScrollView { return s }
+            view = v.superview
+        }
+        return nil
+    }
+
+    deinit {
+        observation?.invalidate()
+    }
+}
+

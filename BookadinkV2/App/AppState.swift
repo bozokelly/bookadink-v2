@@ -111,6 +111,10 @@ final class AppState: ObservableObject {
     @Published var revenueTrendByClubID: [UUID: [ClubRevenueTrendPoint]] = [:]
     @Published var topGamesByClubID: [UUID: [ClubTopGame]] = [:]
     @Published var peakTimesByClubID: [UUID: [ClubPeakTime]] = [:]
+    /// Per-member activity for the Club Intelligence Members tab. Populated by
+    /// `loadClubMemberActivity(for:days:)`. Server enforces admin-only access.
+    @Published var memberActivityByClubID: [UUID: [ClubMemberActivity]] = [:]
+    @Published var loadingMemberActivityClubIDs: Set<UUID> = []
     @Published var loadingAnalyticsClubIDs: Set<UUID> = []
     /// Last analytics fetch error per club. Nil when last fetch succeeded or hasn't run yet.
     @Published var analyticsErrorByClubID: [UUID: String] = [:]
@@ -213,6 +217,19 @@ final class AppState: ObservableObject {
     private var duprHistoryByUserID: [UUID: [DUPREntry]] = [:]
     @Published var duprHistory: [DUPREntry] = []
 
+    // Generate Play active-session surface — independent from `game.status` and
+    // from `dateTime`. A session is "active" while a persisted LiveGameSession
+    // exists for an admin's non-cancelled game and now is before the auto-close
+    // window (game end + 15 min). Auto-close exists so abandoned sessions don't
+    // linger forever and so the resume prompt never fires post-event.
+    @Published var activePlaySessionGame: Game? = nil
+    /// When the active session was first started (LiveGameSession.startedAt).
+    /// Falls back to game.dateTime for legacy sessions persisted before that
+    /// field existed, so the floating pill always has a stable anchor.
+    @Published var activePlaySessionStartedAt: Date? = nil
+    private var activePlaySessionTimer: Timer?
+    private var activePlaySessionCancellables: Set<AnyCancellable> = []
+
     init(dataProvider: ClubDataProviding = SupabaseService()) {
         self.dataProvider = dataProvider
         restorePersistedSession()
@@ -229,6 +246,7 @@ final class AppState: ObservableObject {
         // breaking multi-device consistency when two staff devices share a game.
         restoreClubNewsNotificationPreference()
         restorePinnedClubIDs()
+        startActivePlaySessionTracking()
 
         Task {
             if authState == .signedIn {
@@ -288,6 +306,8 @@ final class AppState: ObservableObject {
         allUpcomingGames = []
         bookings = []
         attendeesByGameID = [:]
+        activePlaySessionGame = nil
+        activePlaySessionStartedAt = nil
         membershipStatesByClubID = [:]
         ownerJoinRequestsByClubID = [:]
         ownerMembersByClubID = [:]
@@ -601,6 +621,91 @@ final class AppState: ObservableObject {
         if club.createdByUserID == authUserID { return true }
         guard let role = clubAdminRoleByClubID[club.id] else { return false }
         return role == .owner
+    }
+
+    // MARK: - Active Generate Play Session
+
+    /// Hooks observers and a low-frequency timer that keep `activePlaySessionGame`
+    /// in step with persisted Generate Play state. Recompute fires on:
+    ///   • app foreground (catches sessions that aged past auto-close in background)
+    ///   • ScheduleSessionManager save/clear (immediate UI response on start/finish)
+    ///   • a 30s tick (background drift safety net + auto-close enforcement)
+    private func startActivePlaySessionTracking() {
+        recomputeActivePlaySession()
+
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.recomputeActivePlaySession()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .bookADinkPlaySessionDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.recomputeActivePlaySession()
+        }
+
+        activePlaySessionTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.recomputeActivePlaySession()
+        }
+        timer.tolerance = 5
+        activePlaySessionTimer = timer
+
+        // Cold-launch: gamesByClubID is empty when the first recompute runs; the
+        // refreshClubs/refreshUpcomingGames cascade fills it shortly after, so
+        // re-evaluate when it changes (also covers admin role changes via clubs).
+        $gamesByClubID
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.recomputeActivePlaySession() }
+            .store(in: &activePlaySessionCancellables)
+        $clubs
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.recomputeActivePlaySession() }
+            .store(in: &activePlaySessionCancellables)
+    }
+
+    /// Picks the most recently saved persisted session belonging to a non-cancelled
+    /// game in a club the current user administers, provided we are still inside
+    /// the auto-close window. Sessions past the window are cleared in-place so the
+    /// resume prompt won't fire later.
+    func recomputeActivePlaySession() {
+        let now = Date()
+        var best: (game: Game, savedAt: Date, startedAt: Date)? = nil
+
+        for club in clubs {
+            guard isClubAdmin(for: club) else { continue }
+            for game in (gamesByClubID[club.id] ?? []) {
+                guard game.status != "cancelled" else { continue }
+                guard let saved = ScheduleSessionManager.load(gameID: game.id) else { continue }
+                let gameEnd = game.dateTime.addingTimeInterval(Double(game.durationMinutes) * 60)
+                let autoCloseAt = gameEnd.addingTimeInterval(15 * 60)
+                if now >= autoCloseAt {
+                    ScheduleSessionManager.clear(gameID: game.id)
+                    continue
+                }
+                // Legacy sessions saved before LiveGameSession.startedAt existed
+                // decode that field as nil; fall back to game.dateTime so the
+                // pill timer still has a stable anchor.
+                let startedAt = saved.startedAt ?? game.dateTime
+                if best == nil || saved.savedAt > best!.savedAt {
+                    best = (game, saved.savedAt, startedAt)
+                }
+            }
+        }
+
+        if activePlaySessionGame?.id != best?.game.id {
+            activePlaySessionGame = best?.game
+        }
+        if activePlaySessionStartedAt != best?.startedAt {
+            activePlaySessionStartedAt = best?.startedAt
+        }
     }
 
     func bookingState(for game: Game) -> BookingState {
@@ -2587,9 +2692,10 @@ final class AppState: ObservableObject {
             return false
         }
 
-        // Gate: fee requires payment eligibility.
+        // Gate: a positive online fee requires payment eligibility.
+        // Free games (draft.isFree=true) and Pay-on-arrival (no fee) skip the gate.
         let draftFeeForCreate = Double(draft.feeAmountText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        if draftFeeForCreate > 0 {
+        if !draft.isFree, draftFeeForCreate > 0 {
             if case .blocked(let reason) = FeatureGateService.canAcceptPayments(entitlementsByClubID[club.id]) {
                 ownerToolsErrorMessage = reason
                 return false
@@ -2687,9 +2793,10 @@ final class AppState: ObservableObject {
             return false
         }
 
-        // Gate: fee requires payment eligibility.
+        // Gate: a positive online fee requires payment eligibility.
+        // Free games (draft.isFree=true) and Pay-on-arrival (no fee) skip the gate.
         let draftFeeForUpdate = Double(draft.feeAmountText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        if draftFeeForUpdate > 0 {
+        if !draft.isFree, draftFeeForUpdate > 0 {
             if case .blocked(let reason) = FeatureGateService.canAcceptPayments(entitlementsByClubID[club.id]) {
                 ownerToolsErrorMessage = reason
                 return false
@@ -2820,6 +2927,9 @@ final class AppState: ObservableObject {
         ownerDeletingGameIDs.insert(game.id)
         defer { ownerDeletingGameIDs.remove(game.id) }
 
+        let startedAt = Date()
+        telemetry("admin_delete_game_start game_id=\(game.id.uuidString) club_id=\(club.id.uuidString) scope=\(scope)")
+
         do {
             let effectiveScope = (game.recurrenceGroupID == nil) ? .singleEvent : scope
 
@@ -2832,10 +2942,20 @@ final class AppState: ObservableObject {
                 )
             }
 
+            // Route deletion through `admin_cancel_game` so paid players are
+            // refunded and booking history is preserved for audit. The hard
+            // DELETE on `games` is intentionally no longer used here — it left
+            // bookings orphaned with a dead game_id and skipped credit issuance
+            // entirely. The RPC is idempotent on already-cancelled games (zeros).
+            var aggregateCredits = 0
+            var aggregatePaidPlayers = 0
+
             if effectiveScope == .singleEvent {
-                try await withAuthRetry {
-                    try await self.dataProvider.deleteGame(gameID: game.id)
+                let result = try await withAuthRetry {
+                    try await self.dataProvider.adminCancelGame(gameID: game.id)
                 }
+                aggregateCredits += result.totalCreditsCents
+                aggregatePaidPlayers += result.paidBookingsCredited
             } else if let recurrenceGroupID = game.recurrenceGroupID {
                 let series = try await withAuthRetry {
                     try await self.dataProvider.fetchGamesInSeries(recurrenceGroupID: recurrenceGroupID)
@@ -2851,13 +2971,22 @@ final class AppState: ObservableObject {
                     }
                 }
                 for target in targets {
-                    try await withAuthRetry {
-                        try await self.dataProvider.deleteGame(gameID: target.id)
+                    let result = try await withAuthRetry {
+                        try await self.dataProvider.adminCancelGame(gameID: target.id)
                     }
+                    aggregateCredits += result.totalCreditsCents
+                    aggregatePaidPlayers += result.paidBookingsCredited
                     attendeesByGameID.removeValue(forKey: target.id)
                     bookings.removeAll { $0.booking.gameID == target.id }
                 }
             }
+
+            // Authoritative credit balance refresh for the current user — they
+            // may have had bookings refunded across one or more series targets.
+            if aggregateCredits > 0 {
+                await refreshCreditBalance(for: club.id)
+            }
+
             if var current = gamesByClubID[club.id] {
                 switch effectiveScope {
                 case .singleEvent:
@@ -2872,15 +3001,35 @@ final class AppState: ObservableObject {
             if effectiveScope == .singleEvent {
                 bookings.removeAll { $0.booking.gameID == game.id }
                 attendeesByGameID.removeValue(forKey: game.id)
-                ownerToolsInfoMessage = "Game deleted."
-            } else {
-                ownerToolsInfoMessage = effectiveScope == .entireSeries ? "Entire series deleted." : "This and future games deleted."
             }
+
+            ownerToolsInfoMessage = deleteGameInfoMessage(
+                scope: effectiveScope,
+                paidPlayersCredited: aggregatePaidPlayers,
+                totalCreditsCents: aggregateCredits
+            )
+            telemetry("admin_delete_game_success game_id=\(game.id.uuidString) scope=\(effectiveScope) paid_credited=\(aggregatePaidPlayers) credits_cents=\(aggregateCredits) duration_ms=\(elapsedMilliseconds(since: startedAt))")
             return true
         } catch {
+            telemetry("admin_delete_game_error game_id=\(game.id.uuidString) duration_ms=\(elapsedMilliseconds(since: startedAt)) message=\(error.localizedDescription)")
             ownerToolsErrorMessage = error.localizedDescription
             return false
         }
+    }
+
+    private func deleteGameInfoMessage(scope: RecurringGameScope, paidPlayersCredited: Int, totalCreditsCents: Int) -> String {
+        let baseMessage: String = {
+            switch scope {
+            case .singleEvent:    return "Game deleted."
+            case .thisAndFuture:  return "This and future games deleted."
+            case .entireSeries:   return "Entire series deleted."
+            }
+        }()
+        guard paidPlayersCredited > 0 else { return baseMessage }
+        let dollars = Double(totalCreditsCents) / 100.0
+        let amount = String(format: "%.2f", dollars)
+        let suffix = paidPlayersCredited == 1 ? "player" : "players"
+        return "\(baseMessage) \(paidPlayersCredited) paid \(suffix) credited A$\(amount)."
     }
 
     func createClub(draft: ClubOwnerEditDraft) async -> Club? {
@@ -3343,6 +3492,11 @@ final class AppState: ObservableObject {
                     : "You must be an approved club member to book this game."
             case .duprRequired:
                 bookingsErrorMessage = "Add and confirm your DUPR ID before booking this game."
+            case .notYetPublished:
+                bookingsErrorMessage = "This game isn't open for bookings yet."
+                if let club = clubs.first(where: { $0.id == game.clubID }) {
+                    await refreshGames(for: club)
+                }
             default:
                 bookingsErrorMessage = serviceError.localizedDescription
             }
@@ -3466,9 +3620,17 @@ final class AppState: ObservableObject {
         cancellingGameIDs.insert(game.id)
         defer { cancellingGameIDs.remove(game.id) }
 
+        let startedAt = Date()
+        telemetry("admin_cancel_game_start game_id=\(game.id.uuidString) club_id=\(game.clubID.uuidString)")
+
         do {
-            try await withAuthRetry {
-                try await self.dataProvider.cancelGame(gameID: game.id)
+            // adminCancelGame is server-authoritative: cancels every active
+            // booking (waitlisted/pending_payment/confirmed) AND issues refund
+            // credits to paid players in a single transaction. The old direct
+            // PATCH on games.status is no longer used here because it left
+            // bookings active and paid players uncredited.
+            let result: AdminGameCancellationResult = try await withAuthRetry {
+                try await self.dataProvider.adminCancelGame(gameID: game.id)
             }
 
             // Update in-memory game status — propagates immediately to all list views
@@ -3478,6 +3640,17 @@ final class AppState: ObservableObject {
                 gamesByClubID[game.clubID] = games
             }
             allUpcomingGames.removeAll { $0.id == game.id }
+
+            // Refresh attendees so each cancelled booking's status flip lands
+            // in the per-game cache. Failure here is non-fatal — server is
+            // authoritative, the next view refresh will reconcile.
+            await refreshAttendees(for: game)
+
+            // If the current user had a refunded booking in this game, their
+            // club credit balance changed. Pull the authoritative value.
+            if result.totalCreditsCents > 0 {
+                await refreshCreditBalance(for: game.clubID)
+            }
 
             // Notify all booked players
             let clubTZ = clubs.first(where: { $0.id == game.clubID })?.timezone ?? "Australia/Perth"
@@ -3489,8 +3662,10 @@ final class AppState: ObservableObject {
                 )
             }
 
-            ownerToolsInfoMessage = "Game cancelled."
+            ownerToolsInfoMessage = adminCancelGameInfoMessage(for: result)
+            telemetry("admin_cancel_game_success game_id=\(game.id.uuidString) bookings_cancelled=\(result.bookingsCancelled) paid_credited=\(result.paidBookingsCredited) credits_cents=\(result.totalCreditsCents) duration_ms=\(elapsedMilliseconds(since: startedAt))")
         } catch let serviceError as SupabaseServiceError {
+            telemetry("admin_cancel_game_error game_id=\(game.id.uuidString) duration_ms=\(elapsedMilliseconds(since: startedAt)) message=\(serviceError.localizedDescription)")
             switch serviceError {
             case .authenticationRequired:
                 authInfoMessage = "Please sign in again to manage games."
@@ -3498,8 +3673,22 @@ final class AppState: ObservableObject {
                 ownerToolsErrorMessage = serviceError.localizedDescription
             }
         } catch {
+            telemetry("admin_cancel_game_error game_id=\(game.id.uuidString) duration_ms=\(elapsedMilliseconds(since: startedAt)) message=\(error.localizedDescription)")
             ownerToolsErrorMessage = error.localizedDescription
         }
+    }
+
+    private func adminCancelGameInfoMessage(for result: AdminGameCancellationResult) -> String {
+        if result.paidBookingsCredited > 0 {
+            let dollars = Double(result.totalCreditsCents) / 100.0
+            let amount = String(format: "%.2f", dollars)
+            let suffix = result.paidBookingsCredited == 1 ? "player" : "players"
+            return "Game cancelled. \(result.paidBookingsCredited) paid \(suffix) credited A$\(amount)."
+        }
+        if result.bookingsCancelled > 0 {
+            return "Game cancelled. \(result.bookingsCancelled) booking\(result.bookingsCancelled == 1 ? "" : "s") released."
+        }
+        return "Game cancelled."
     }
 
     /// Detects players who transitioned from waitlisted → confirmed after a refresh
@@ -3902,6 +4091,24 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Fetches per-member activity for the Club Intelligence Members tab.
+    /// Server-side admin authorization gates the RPC; the call fails closed
+    /// for non-admin callers. The Members tab degrades gracefully (sections
+    /// hidden) when the cache is empty, so failures here are non-fatal.
+    func loadClubMemberActivity(for clubID: UUID, days: Int) async {
+        guard !loadingMemberActivityClubIDs.contains(clubID) else { return }
+        loadingMemberActivityClubIDs.insert(clubID)
+        defer { loadingMemberActivityClubIDs.remove(clubID) }
+        do {
+            let rows = try await withAuthRetry {
+                try await self.dataProvider.fetchClubMemberActivity(clubID: clubID, days: days)
+            }
+            memberActivityByClubID[clubID] = rows
+        } catch {
+            // Non-fatal — Members tab intelligence sections gracefully omit.
+        }
+    }
+
     private func loadNotificationPreferencesIfNeeded() async {
         guard authState == .signedIn, let userID = authUserID else { return }
         do {
@@ -4146,7 +4353,7 @@ final class AppState: ObservableObject {
             // 403 is a permission/eligibility error — a refreshed token cannot fix it.
             // Only 401 (genuine auth expiry) should trigger a session refresh.
             return code == 401
-        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notAuthorized, .invalidPayload, .rateLimited:
+        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notYetPublished, .notAuthorized, .invalidPayload, .rateLimited:
             return false
         }
     }
@@ -4197,7 +4404,7 @@ final class AppState: ObservableObject {
             return true
         case let .httpStatus(code, _):
             return code == 400 || code == 401 || code == 403
-        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notAuthorized, .invalidPayload, .rateLimited:
+        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notYetPublished, .notAuthorized, .invalidPayload, .rateLimited:
             return false
         }
     }

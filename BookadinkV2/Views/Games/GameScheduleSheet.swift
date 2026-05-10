@@ -1185,6 +1185,10 @@ struct LiveGameSession: Codable {
     let persistedRounds: [PersistedRound]
     let courtResults: [String: PersistedCourtResult]
     let savedAt: Date
+    /// Wall-clock moment the session was first started. Optional so that
+    /// pre-existing JSON in UserDefaults (saved before this field existed)
+    /// continues to decode — fallback to game.dateTime is handled at read.
+    let startedAt: Date?
 }
 
 enum ScheduleSessionManager {
@@ -1196,6 +1200,7 @@ enum ScheduleSessionManager {
         if let data = try? JSONEncoder().encode(all) {
             UserDefaults.standard.set(data, forKey: key)
         }
+        NotificationCenter.default.post(name: .bookADinkPlaySessionDidChange, object: nil)
     }
 
     static func load(gameID: UUID) -> LiveGameSession? {
@@ -1208,6 +1213,7 @@ enum ScheduleSessionManager {
         if let data = try? JSONEncoder().encode(all) {
             UserDefaults.standard.set(data, forKey: key)
         }
+        NotificationCenter.default.post(name: .bookADinkPlaySessionDidChange, object: nil)
     }
 
     private static func loadAll() -> [String: LiveGameSession] {
@@ -1215,6 +1221,27 @@ enum ScheduleSessionManager {
               let decoded = try? JSONDecoder().decode([String: LiveGameSession].self, from: data)
         else { return [:] }
         return decoded
+    }
+}
+
+extension Notification.Name {
+    /// Posted whenever a Generate Play session is saved or cleared so the global
+    /// floating active-session bar can react immediately. Decoupled from AppState
+    /// to keep ScheduleSessionManager's existing API surface untouched.
+    static let bookADinkPlaySessionDidChange = Notification.Name("bookADinkPlaySessionDidChange")
+}
+
+/// Applies `presentationSizing(.page)` on iOS 18+, which on iPad expands the
+/// sheet to fill the screen as a page-sized presentation. iPhone presentation
+/// is unaffected (page sizing matches the default full sheet there). Older OS
+/// versions fall through unchanged so deployment-target drift never crashes.
+private struct IPadPagePresentationSizing: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.presentationSizing(.page)
+        } else {
+            content
+        }
     }
 }
 
@@ -1264,6 +1291,12 @@ struct GameScheduleSheet: View {
         if width >= 500 { return .regular }
         return .compact
     }
+
+    /// iPad detection follows the project-wide convention. The wide two-pane
+    /// layout is gated on this AND the live container width (≥ 700pt) so iPad
+    /// split-screen narrow falls back to the existing iPhone-style flow.
+    private let isOnIPad = UIDevice.current.userInterfaceIdiom == .pad
+    private let wideLayoutMinWidth: CGFloat = 700
 
     private func makeShareTaskID() -> String {
         "\(game.id):\(activeRounds.count):\(courtResults.values.filter(\.isConfirmed).count)"
@@ -1384,10 +1417,15 @@ struct GameScheduleSheet: View {
                 winner: r.winner, isConfirmed: r.isConfirmed
             )
         }
+        // Preserve startedAt across re-saves; stamp now on the very first save
+        // so the floating pill timer counts from when Generate Play actually
+        // started, not from the scheduled game start time.
+        let priorStart = ScheduleSessionManager.load(gameID: game.id)?.startedAt
         let session = LiveGameSession(
             gameID: game.id, method: method, courts: courts, roundCount: rounds,
             status: .active, isKotC: method.isKingOfCourt,
-            persistedRounds: pRounds, courtResults: pResults, savedAt: Date()
+            persistedRounds: pRounds, courtResults: pResults, savedAt: Date(),
+            startedAt: priorStart ?? Date()
         )
         ScheduleSessionManager.save(session)
     }
@@ -1522,104 +1560,69 @@ struct GameScheduleSheet: View {
     var body: some View {
         NavigationStack {
             GeometryReader { geo in
-                ZStack {
-                    // Settings page — full width, slides off-screen left when schedule shown
-                    ScrollView {
-                        settingsCard.padding(16)
-                    }
-                    .scrollIndicators(.hidden)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .offset(x: settingsExpanded ? 0 : -geo.size.width)
+                // Wide layout activates only on iPad with enough container width
+                // (≥ 700 pt). Split-screen narrow on iPad falls back to the
+                // existing iPhone slide flow so logic and layout stay consistent.
+                let isWide = isOnIPad && geo.size.width >= wideLayoutMinWidth
 
-                    // Schedule page — full width, slides in from right
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 16) {
-                                scheduleContent
-                            }
-                            .padding(16)
-                        }
-                        .scrollIndicators(.hidden)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .onChange(of: scrollTarget) { _, id in
-                            guard let id else { return }
-                            withAnimation(.easeOut(duration: 0.35)) {
-                                proxy.scrollTo("round-\(id)", anchor: .top)
-                            }
-                            scrollTarget = nil
-                        }
+                Group {
+                    if isWide {
+                        ipadWideBody
+                    } else {
+                        compactSlideBody(width: geo.size.width)
                     }
-                    .offset(x: settingsExpanded ? geo.size.width : 0)
                 }
                 .animation(.spring(response: 0.45, dampingFraction: 0.82), value: settingsExpanded)
-            }
-            .background(Brand.appBackground)
-            .navigationTitle(settingsExpanded ? "Generate Play" : (method.isKingOfCourt ? method.rawValue : "Schedule"))
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    if settingsExpanded {
-                        // Settings page: X dismisses the whole sheet
-                        Button {
-                            saveSession()
-                            dismiss()
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundStyle(Brand.secondaryText)
-                        }
-                        .buttonStyle(.plain)
-                    } else {
-                        // Schedule page: go back to settings to adjust format / courts / rounds
-                        Button {
-                            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                                settingsExpanded = true
+                .background(Brand.appBackground)
+                .navigationTitle(settingsExpanded ? "Generate Play" : (method.isKingOfCourt ? method.rawValue : "Schedule"))
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        if isWide || settingsExpanded {
+                            // iPad always exposes the X here; iPhone settings page
+                            // also routes its dismiss through this slot.
+                            Button {
+                                saveSession()
+                                dismiss()
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(Brand.secondaryText)
                             }
-                        } label: {
-                            Label("Settings", systemImage: "chevron.left")
-                                .labelStyle(.titleAndIcon)
-                                .font(.subheadline.weight(.semibold))
+                            .buttonStyle(.plain)
+                        } else {
+                            // iPhone schedule page: back to settings to reconfigure
+                            Button {
+                                withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                                    settingsExpanded = true
+                                }
+                            } label: {
+                                Label("Settings", systemImage: "chevron.left")
+                                    .labelStyle(.titleAndIcon)
+                                    .font(.subheadline.weight(.semibold))
+                            }
+                            .tint(Brand.primaryText)
                         }
-                        .tint(Brand.primaryText)
+                    }
+                    if !isWide && !settingsExpanded {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button {
+                                saveSession()
+                                dismiss()
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(Brand.secondaryText)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                 }
-                if !settingsExpanded {
-                    // Schedule page: dedicated exit button to leave the generator entirely
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            saveSession()
-                            dismiss()
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundStyle(Brand.secondaryText)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .safeAreaInset(edge: .top, spacing: 0) {
-                if showPrimaryAction {
-                    HStack {
-                        Spacer()
-                        Button { handlePrimaryAction() } label: {
-                            Text(primaryActionLabel)
-                                .font(.subheadline.weight(.bold))
-                                .foregroundStyle(.black)
-                                .lineLimit(1)
-                                .padding(.horizontal, 18)
-                                .padding(.vertical, 8)
-                                .background(Color(hex: "80FF00"), in: Capsule())
-                                .opacity(primaryActionEnabled ? 1.0 : 0.45)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!primaryActionEnabled)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Brand.appBackground)
-                    .overlay(alignment: .bottom) {
-                        Divider()
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    // iPad surfaces the primary action inside the sidebar so
+                    // there's no duplicate button at the top edge.
+                    if !isWide && showPrimaryAction {
+                        topBarPrimaryAction
                     }
                 }
             }
@@ -1647,10 +1650,22 @@ struct GameScheduleSheet: View {
             Text("Results will be posted to \(clubForGame?.name ?? "club") chat and visible to all members.")
         }
         .presentationDetents([.large])
+        // iPad-only: expand the sheet to a page-sized presentation so Generate
+        // Play renders as a full operational workspace instead of a centered
+        // form sheet. iOS 18+ only — older OS versions keep the existing sheet
+        // sizing. iPhone is unaffected (PresentationSizing applies on iPad).
+        .modifier(IPadPagePresentationSizing())
         .task {
             if let saved = ScheduleSessionManager.load(gameID: game.id) {
-                pendingResumeSession = saved
-                showResumePrompt = true
+                // Drop sessions whose game has fully ended so abandoned schedules
+                // don't linger in UserDefaults and can't be reopened past the window.
+                let gameEnd = game.dateTime.addingTimeInterval(Double(game.durationMinutes) * 60)
+                if Date() >= gameEnd {
+                    ScheduleSessionManager.clear(gameID: game.id)
+                } else {
+                    pendingResumeSession = saved
+                    showResumePrompt = true
+                }
             }
         }
         .task(id: makeShareTaskID()) {
@@ -1659,14 +1674,19 @@ struct GameScheduleSheet: View {
                 game: game, rounds: activeRounds, results: courtResults, method: method
             )
         }
-        .alert("Resume Session?", isPresented: $showResumePrompt, presenting: pendingResumeSession) { session in
+        .alert("Live Session Saved", isPresented: $showResumePrompt, presenting: pendingResumeSession) { session in
             Button("Resume") { applyRestoredSession(session); pendingResumeSession = nil }
-            Button("Start Fresh", role: .destructive) {
+            Button("Stop Session", role: .destructive) {
                 ScheduleSessionManager.clear(gameID: game.id)
                 pendingResumeSession = nil
             }
+            // "Dismiss" only closes this prompt — the saved session stays on
+            // disk and the floating bar continues to expose it for re-entry.
+            Button("Dismiss", role: .cancel) {
+                pendingResumeSession = nil
+            }
         } message: { session in
-            Text("A live session was saved on \(session.savedAt.formatted(date: .abbreviated, time: .shortened)). Resume where you left off?")
+            Text("A live session was saved on \(session.savedAt.formatted(date: .abbreviated, time: .shortened)). Resume where you left off, stop the session to discard it, or dismiss this prompt to keep it for later.")
         }
         .overlay {
             if postSucceeded {
@@ -1677,6 +1697,192 @@ struct GameScheduleSheet: View {
             }
         }
         .animation(.easeInOut(duration: 0.25), value: postSucceeded)
+    }
+
+    // MARK: Compact (iPhone) Layout
+
+    /// Existing iPhone behaviour preserved verbatim — settings card slides off
+    /// to the left, schedule slides in from the right based on settingsExpanded.
+    @ViewBuilder
+    private func compactSlideBody(width: CGFloat) -> some View {
+        ZStack {
+            ScrollView {
+                settingsCard.padding(16)
+            }
+            .scrollIndicators(.hidden)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .offset(x: settingsExpanded ? 0 : -width)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        scheduleContent
+                    }
+                    .padding(16)
+                }
+                .scrollIndicators(.hidden)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onChange(of: scrollTarget) { _, id in
+                    guard let id else { return }
+                    withAnimation(.easeOut(duration: 0.35)) {
+                        proxy.scrollTo("round-\(id)", anchor: .top)
+                    }
+                    scrollTarget = nil
+                }
+            }
+            .offset(x: settingsExpanded ? width : 0)
+        }
+    }
+
+    // MARK: iPad Wide Layout
+
+    /// Two-pane operational workspace: persistent left sidebar with game
+    /// context + primary action, right panel renders settings or schedule
+    /// based on settingsExpanded — same flag the compact flow uses, no new
+    /// state, no logic changes.
+    @ViewBuilder
+    private var ipadWideBody: some View {
+        HStack(spacing: 0) {
+            ipadSidebar
+                .frame(width: 320)
+            Divider()
+            ipadMainPanel
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var ipadSidebar: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(game.title)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(Brand.ink)
+                        .lineLimit(2)
+                    Text("\(confirmedPlayers.count) players · \(courts) court\(courts == 1 ? "" : "s")")
+                        .font(.subheadline)
+                        .foregroundStyle(Brand.mutedText)
+                }
+
+                if hasActiveSession {
+                    HStack(spacing: 8) {
+                        Circle().fill(Color(hex: "FF3B30")).frame(width: 8, height: 8)
+                        Text("LIVE SESSION")
+                            .font(.caption.weight(.bold))
+                            .kerning(0.6)
+                            .foregroundStyle(Color(hex: "FF3B30"))
+                    }
+                }
+
+                Divider()
+
+                // Mode toggle — only meaningful once a schedule exists, so
+                // hidden until then to avoid a dead-end "Show Schedule" tap.
+                if hasActiveSession {
+                    Button {
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+                            settingsExpanded.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: settingsExpanded ? "list.bullet.rectangle.portrait" : "slider.horizontal.3")
+                                .font(.system(size: 14, weight: .semibold))
+                            Text(settingsExpanded ? "Show Schedule" : "Show Settings")
+                                .font(.subheadline.weight(.semibold))
+                            Spacer()
+                        }
+                        .foregroundStyle(Brand.primaryText)
+                        .padding(12)
+                        .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(Brand.softOutline, lineWidth: 0.5)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if showPrimaryAction {
+                    Button { handlePrimaryAction() } label: {
+                        Text(primaryActionLabel)
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(.black)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Color(hex: "80FF00"), in: Capsule())
+                            .opacity(primaryActionEnabled ? 1.0 : 0.45)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!primaryActionEnabled)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .scrollIndicators(.hidden)
+        .background(Brand.cardBackground)
+    }
+
+    @ViewBuilder
+    private var ipadMainPanel: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Group {
+                    if settingsExpanded {
+                        settingsCard
+                    } else {
+                        VStack(alignment: .leading, spacing: 16) {
+                            scheduleContent
+                        }
+                    }
+                }
+                // Cap content width on very wide iPads so reading lengths
+                // stay sane while still using far more horizontal space than
+                // the previous form-sheet rendering.
+                .frame(maxWidth: 1100, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 20)
+            }
+            .scrollIndicators(.hidden)
+            .onChange(of: scrollTarget) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.35)) {
+                    proxy.scrollTo("round-\(id)", anchor: .top)
+                }
+                scrollTarget = nil
+            }
+        }
+    }
+
+    // MARK: Top-bar primary action (iPhone only)
+
+    @ViewBuilder
+    private var topBarPrimaryAction: some View {
+        HStack {
+            Spacer()
+            Button { handlePrimaryAction() } label: {
+                Text(primaryActionLabel)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.black)
+                    .lineLimit(1)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 8)
+                    .background(Color(hex: "80FF00"), in: Capsule())
+                    .opacity(primaryActionEnabled ? 1.0 : 0.45)
+            }
+            .buttonStyle(.plain)
+            .disabled(!primaryActionEnabled)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Brand.appBackground)
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
     }
 
     // MARK: Schedule Content (shared between iPhone single-column and iPad right panel)
@@ -2105,100 +2311,59 @@ struct GameScheduleSheet: View {
                 }
             }
             .padding(.horizontal, 2)
-            .padding(.top, 10)
-            .padding(.bottom, 8)
+            .padding(.top, 6)
+            .padding(.bottom, 4)
 
-            // Player matchup row
-            HStack(spacing: 0) {
-                // Team A players
-                HStack(spacing: 8) {
+            // Compact text matchup — names only, "Vs" centered between sides
+            HStack(alignment: .center, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
                     ForEach(court.teamA) { player in
-                        playerAvatarCell(player, isWinner: teamAWins)
+                        CompactPlayerNameLabel(fullName: player.userName)
+                            .font(.subheadline.weight(teamAWins ? .bold : .semibold))
+                            .foregroundStyle(teamAWins ? Brand.emeraldAction : Brand.primaryText)
                     }
                 }
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                // Center: Vs + Record Score
-                VStack(spacing: 8) {
+                VStack(spacing: 6) {
                     Text("Vs")
-                        .font(.system(size: 22, weight: .black, design: .rounded))
+                        .font(.system(size: 15, weight: .black, design: .rounded))
                         .foregroundStyle(Brand.primaryText)
                     if showScoreEntry {
                         Button {
                             scoringCourt = (round: round, court: court)
                         } label: {
                             Text(confirmed ? "Edit Score" : "Enter Score")
-                                .font(.caption.weight(.semibold))
+                                .font(.caption2.weight(.semibold))
                                 .foregroundStyle(Brand.primaryText)
                                 .lineLimit(1)
                                 .fixedSize(horizontal: true, vertical: false)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 7)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
                                 .background(Brand.secondarySurface, in: Capsule())
                                 .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 1))
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                .frame(width: 96)
+                .fixedSize(horizontal: true, vertical: false)
 
-                // Team B players
-                HStack(spacing: 8) {
+                VStack(alignment: .trailing, spacing: 2) {
                     ForEach(court.teamB) { player in
-                        playerAvatarCell(player, isWinner: teamBWins)
+                        CompactPlayerNameLabel(fullName: player.userName)
+                            .font(.subheadline.weight(teamBWins ? .bold : .semibold))
+                            .foregroundStyle(teamBWins ? Brand.emeraldAction : Brand.primaryText)
                     }
                 }
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, alignment: .trailing)
             }
-            .padding(.bottom, 12)
+            .padding(.bottom, 8)
         }
         .padding(.horizontal, 4)
         .background(
             confirmed ? Brand.emeraldAction.opacity(0.04) : Color.clear,
             in: RoundedRectangle(cornerRadius: 10, style: .continuous)
         )
-    }
-
-    private func playerAvatarCell(_ player: GameAttendee, isWinner: Bool) -> some View {
-        let initials: String = {
-            let parts = player.userName.split(separator: " ").prefix(2)
-            return parts.compactMap(\.first).map(String.init).joined()
-        }()
-        let firstName = player.userName.components(separatedBy: " ").first ?? player.userName
-        let dupr = duprRatings[player.booking.userID]
-
-        return VStack(spacing: 5) {
-            ZStack {
-                Circle()
-                    .fill(Brand.secondarySurface)
-                    .frame(width: 50, height: 50)
-                    .overlay(
-                        Circle().stroke(isWinner ? Color(hex: "80FF00") : Brand.softOutline.opacity(0.6), lineWidth: isWinner ? 2 : 0.5)
-                    )
-                Text(initials.isEmpty ? "?" : initials)
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(Brand.ink)
-            }
-            Text(firstName)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(Brand.primaryText)
-                .lineLimit(1)
-            if let dupr {
-                Text(String(format: "%.3f", dupr))
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Brand.mutedText)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(Brand.secondarySurface, in: Capsule())
-                    .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 0.5))
-            }
-        }
-    }
-
-    private func scheduleAvatarColor(for name: String) -> Color {
-        let palette: [Color] = [Brand.pineTeal, Brand.slateBlue, Brand.spicyOrange, Brand.emeraldAction, Brand.brandPrimary]
-        let hash = name.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
-        return palette[abs(hash) % palette.count]
     }
 
     // MARK: Post Results Button
@@ -2318,6 +2483,33 @@ private struct ScoreInputView: View {
             score = 0
             text = ""
         }
+    }
+}
+
+// MARK: - Compact Player Name Label
+
+/// Shared name renderer for generated-play UI. Tries the full name first; if it
+/// doesn't fit on one line, falls back to "FirstName L" before resorting to
+/// tail-truncation. Callers apply font/foregroundStyle as outer modifiers.
+private struct CompactPlayerNameLabel: View {
+    let fullName: String
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            Text(fullName).lineLimit(1).fixedSize()
+            Text(abbreviated).lineLimit(1).fixedSize()
+            Text(fullName).lineLimit(1).truncationMode(.tail)
+        }
+    }
+
+    private var abbreviated: String {
+        let parts = fullName.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2,
+              let first = parts.first,
+              let lastInitial = parts.last?.first else {
+            return fullName
+        }
+        return "\(first) \(lastInitial)"
     }
 }
 
@@ -2467,17 +2659,18 @@ struct CourtScoreEntryView: View {
     }
 
     private func teamColumn(_ label: String, players: [GameAttendee], score: Binding<Int>, isWinner: Bool) -> some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 14) {
             Text(label)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Brand.mutedText)
                 .textCase(.uppercase)
                 .tracking(0.5)
 
-            // Player avatars side by side
-            HStack(spacing: 12) {
+            VStack(spacing: 4) {
                 ForEach(players) { player in
-                    scoreEntryAvatar(player, isWinner: isWinner)
+                    CompactPlayerNameLabel(fullName: player.userName)
+                        .font(.subheadline.weight(isWinner ? .bold : .semibold))
+                        .foregroundStyle(isWinner ? Brand.emeraldAction : Brand.primaryText)
                 }
             }
 
@@ -2485,38 +2678,6 @@ struct CourtScoreEntryView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
-    }
-
-    private func scoreEntryAvatar(_ player: GameAttendee, isWinner: Bool) -> some View {
-        let initials: String = {
-            let parts = player.userName.split(separator: " ").prefix(2)
-            return parts.compactMap(\.first).map(String.init).joined()
-        }()
-        let firstName = player.userName.components(separatedBy: " ").first ?? player.userName
-
-        return VStack(spacing: 6) {
-            ZStack {
-                Circle()
-                    .fill(Brand.secondarySurface)
-                    .frame(width: 54, height: 54)
-                    .overlay(
-                        Circle().stroke(isWinner ? Color(hex: "80FF00") : Brand.softOutline, lineWidth: isWinner ? 2.5 : 1)
-                    )
-                Text(initials.isEmpty ? "?" : initials)
-                    .font(.system(size: 19, weight: .bold))
-                    .foregroundStyle(Brand.ink)
-            }
-            Text(firstName)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(Brand.primaryText)
-                .lineLimit(1)
-        }
-    }
-
-    private func scheduleAvatarColor(for name: String) -> Color {
-        let palette: [Color] = [Brand.pineTeal, Brand.slateBlue, Brand.spicyOrange, Brand.emeraldAction, Brand.brandPrimary]
-        let hash = name.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
-        return palette[abs(hash) % palette.count]
     }
 
     private func winnerButton(_ label: String, side: TeamSide) -> some View {

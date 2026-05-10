@@ -346,35 +346,6 @@ struct CourtResult: Identifiable {
     }
 }
 
-// MARK: - Club Banner Preset
-
-enum ClubBannerPreset: String, CaseIterable {
-    case courts    // sport/court aesthetic
-    case community // social/community feel
-
-    var gradient: LinearGradient {
-        switch self {
-        case .courts:
-            return LinearGradient(
-                colors: [Color(hex: "0F4C5C"), Color(hex: "1A2F4A")],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        case .community:
-            return LinearGradient(
-                colors: [Color(hex: "C4622D"), Color(hex: "1A2544")],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        }
-    }
-
-    var patternSymbol: String {
-        switch self {
-        case .courts:    return "sportscourt.fill"
-        case .community: return "person.3.fill"
-        }
-    }
-}
-
 struct Club: Identifiable, Hashable {
     let id: UUID
     var name: String
@@ -396,7 +367,6 @@ struct Club: Identifiable, Hashable {
     var topMembers: [ClubMember]
     var createdByUserID: UUID? = nil
     var winCondition: WinCondition = .firstTo11By2
-    var bannerPreset: ClubBannerPreset = .courts
     var defaultCourtCount: Int = 1
     // LEGACY: club-level address fields are soft-deprecated as of Stage 4.
     // Primary ClubVenue is now the location source of truth.
@@ -410,8 +380,18 @@ struct Club: Identifiable, Hashable {
     // LEGACY: club-level coordinates. Prefer LocationService.location(for:venues:).
     var latitude: Double? = nil
     var longitude: Double? = nil
+    /// Deprecated: legacy preset banner key. Migration `20260508010000_club_appearance_keys.sql`
+    /// stops reading/writing this from Swift; the column is dropped in a follow-up. Existing
+    /// rows with a value set render as automatic HeroSurface.
     var heroImageKey: String? = nil
     var customBannerURL: URL? = nil
+    /// Pinned `HeroPalette` rawValue. `nil` ⇒ this axis follows automatic rotation
+    /// (deterministic from `club.id`). Persisted in `clubs.appearance_palette_key`.
+    var appearancePaletteKey: String? = nil
+    /// Pinned `HeroPattern` rawValue. `nil` ⇒ this axis follows automatic rotation.
+    /// Persisted in `clubs.appearance_pattern_key`. The `court` pattern is intentionally
+    /// excluded from selection and from automatic rotation.
+    var appearancePatternKey: String? = nil
     var codeOfConduct: String? = nil
     var cancellationPolicy: String? = nil
     /// Denormalised from `club_stripe_accounts`. Non-nil when the club has completed Stripe Connect onboarding.
@@ -828,6 +808,10 @@ struct Game: Identifiable, Hashable {
     var maxSpots: Int
     var feeAmount: Double?
     var feeCurrency: String?
+    /// Server-authoritative free flag. When TRUE the game is explicitly free —
+    /// distinct from Pay-on-arrival (isFree == false && feeAmount == nil).
+    /// Mirrors `games.is_free`. Defaults to false on decode for forward compat.
+    var isFree: Bool = false
     var venueId: UUID? = nil       // FK to club_venues.id
     var venueName: String? = nil   // kept for backward compat + display safety
     var location: String?
@@ -840,6 +824,15 @@ struct Game: Identifiable, Hashable {
     var confirmedCount: Int?
     var waitlistCount: Int?
     var publishAt: Date? = nil
+    /// Pinned `HeroPalette` rawValue for this game's surface. `nil` ⇒ this
+    /// axis follows automatic rotation (deterministic from `game.id`).
+    /// Persisted in `games.appearance_palette_key`.
+    var appearancePaletteKey: String? = nil
+    /// Pinned `HeroPattern` rawValue for this game's surface. `nil` ⇒ this
+    /// axis follows automatic rotation. Persisted in
+    /// `games.appearance_pattern_key`. The `court` pattern is intentionally
+    /// excluded from selection and from automatic rotation.
+    var appearancePatternKey: String? = nil
 
     /// True when the game has a future publish date — it exists in the DB but is not yet visible to members.
     var isScheduled: Bool {
@@ -863,6 +856,35 @@ struct Game: Identifiable, Hashable {
     var isFull: Bool {
         guard let confirmedCount else { return false }
         return confirmedCount >= maxSpots
+    }
+
+    /// True when the game collects an online (Stripe) payment at booking time.
+    /// Free games and Pay-on-arrival games both return false.
+    var isPaidOnline: Bool {
+        if isFree { return false }
+        guard let fee = feeAmount else { return false }
+        return fee > 0
+    }
+
+    /// True when no online payment is required, but the club intends to collect
+    /// payment off-platform (e.g. cash at venue). Distinct from Free.
+    var isPayOnArrival: Bool {
+        if isFree { return false }
+        guard let fee = feeAmount else { return true }
+        return fee <= 0
+    }
+
+    /// Canonical display string used by all game-card / detail surfaces.
+    /// Three states: "Free", "$X" (paid online), "Pay on arrival".
+    var priceLabel: String {
+        if isFree { return "Free" }
+        if let fee = feeAmount, fee > 0 {
+            if fee.truncatingRemainder(dividingBy: 1) == 0 {
+                return "$\(Int(fee))"
+            }
+            return "$\(String(format: "%.2f", fee))"
+        }
+        return "Pay on arrival"
     }
 }
 
@@ -1217,6 +1239,46 @@ struct ClubPeakTime: Identifiable {
     }
 }
 
+/// Per-member operational activity returned by `get_club_member_activity`.
+/// Powers the Club Intelligence Members tab — Most active, Reliability watch,
+/// Previously active. Operator-facing intel only; never surfaced to other
+/// members publicly.
+///
+/// Counts cover the requested current period (default 30 days). The
+/// `priorBookingCount` covers a 3x window immediately preceding the current
+/// period, used to detect "was meaningfully active → now dormant" without
+/// flagging clubs whose member just isn't a regular.
+struct ClubMemberActivity: Identifiable, Hashable {
+    let userID:             UUID
+    let fullName:           String?
+    let avatarColorKey:     String?
+    let bookingCount:       Int
+    let attendanceCount:    Int
+    let cancellationCount:  Int
+    let noShowCount:        Int
+    let lastPlayedAt:       Date?
+    let priorBookingCount:  Int
+
+    var id: UUID { userID }
+
+    var displayName: String {
+        let trimmed = (fullName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Member" : trimmed
+    }
+
+    var initials: String {
+        let parts = displayName.split(separator: " ").prefix(2)
+        let s = parts.compactMap { $0.first.map(String.init) }.joined()
+        return s.isEmpty ? "M" : s
+    }
+
+    /// Whole days since the most recent confirmed past game; nil if none.
+    var daysSinceLastPlayed: Int? {
+        guard let last = lastPlayedAt else { return nil }
+        return max(0, Int(Date().timeIntervalSince(last) / 86400))
+    }
+}
+
 struct GameAttendee: Identifiable, Hashable {
     var id: UUID { booking.id }
     let booking: BookingRecord
@@ -1268,6 +1330,10 @@ struct ClubOwnerGameDraft {
     var courtCount: Int = 1
     var feeAmountText: String = ""
     var feeCurrency: String = "AUD"
+    /// True when the admin has explicitly marked this game as Free. When true,
+    /// `feeAmountText` is forced empty and the price input is disabled. When
+    /// false and `feeAmountText` is empty, the game is Pay on arrival.
+    var isFree: Bool = false
     var selectedVenueID: UUID? = nil   // nil = custom / no saved venue
     var venueName: String = ""
     var venueLatitude: Double? = nil   // copied from venue at selection time
@@ -1285,6 +1351,12 @@ struct ClubOwnerGameDraft {
     /// own publishAt from the same offset (game.startDate - publishAt) applied to
     /// that instance's start time.
     var publishAt: Date? = nil
+    /// Pinned `HeroPalette` rawValue. `nil` ⇒ automatic. Mirrors
+    /// `Game.appearancePaletteKey`; persisted on save.
+    var appearancePaletteKey: String? = nil
+    /// Pinned `HeroPattern` rawValue. `nil` ⇒ automatic. Mirrors
+    /// `Game.appearancePatternKey`; persisted on save.
+    var appearancePatternKey: String? = nil
 
     /// True when a venue is selected from saved venues or a custom name has been entered.
     var hasVenue: Bool {
@@ -1324,12 +1396,15 @@ struct ClubOwnerGameDraft {
             feeAmountText = ""
         }
         feeCurrency = game.feeCurrency ?? "AUD"
+        isFree = game.isFree
         selectedVenueID = game.venueId
         venueName = game.venueName ?? ""
         location = game.location ?? ""
         notes = game.notes ?? ""
         requiresDUPR = game.requiresDUPR
         publishAt = game.publishAt
+        appearancePaletteKey = game.appearancePaletteKey
+        appearancePatternKey = game.appearancePatternKey
         skillLevelRaw = game.skillLevel
         gameTypeRaw = game.gameType
         gameFormatRaw = game.gameFormat
@@ -1350,6 +1425,10 @@ struct ClubOwnerEditDraft: Equatable {
     var uploadedAvatarURL: URL? = nil      // set after a custom avatar is uploaded
     var heroImageKey: String?
     var uploadedBannerURL: URL? = nil      // set after a custom banner is uploaded
+    /// `HeroPalette` rawValue or `nil` for automatic. Mirrors `Club.appearancePaletteKey`.
+    var appearancePaletteKey: String? = nil
+    /// `HeroPattern` rawValue or `nil` for automatic. Mirrors `Club.appearancePatternKey`.
+    var appearancePatternKey: String? = nil
     private var existingImageURLString: String?
     private var existingBannerURLString: String?
 
@@ -1379,6 +1458,8 @@ struct ClubOwnerEditDraft: Equatable {
         membersOnly = false
         avatarBackgroundColor = nil
         heroImageKey = nil
+        appearancePaletteKey = nil
+        appearancePatternKey = nil
         existingImageURLString = nil
         existingBannerURLString = nil
         _originalAddressKey = nil
@@ -1415,6 +1496,8 @@ struct ClubOwnerEditDraft: Equatable {
         country = club.country ?? "Australia"
         avatarBackgroundColor = club.avatarBackgroundColor
         heroImageKey = club.heroImageKey
+        appearancePaletteKey = club.appearancePaletteKey
+        appearancePatternKey = club.appearancePatternKey
         existingImageURLString = club.imageURL?.absoluteString
         existingBannerURLString = club.customBannerURL?.absoluteString
         _originalAddressKey = [club.venueName ?? "", club.streetAddress ?? "", club.suburb ?? "",

@@ -14,6 +14,8 @@ struct MainTabView: View {
     /// Captures the game ID of whichever review prompt is currently being presented,
     /// so onDismiss can dismiss the correct game even if pendingReviewPrompt has changed.
     @State private var presentingReviewGameID: UUID? = nil
+    /// Set when the floating active-session bar is tapped to re-present GameScheduleSheet.
+    @State private var schedulingGame: Game? = nil
 
     var body: some View {
         TabView(selection: $appState.selectedTab) {
@@ -66,6 +68,35 @@ struct MainTabView: View {
         // which defaults to a sidebar/top-bar layout when no explicit style is set.
         .tabViewStyle(DefaultTabViewStyle())
         .toolbarBackground(.visible, for: .tabBar)
+        // Floating active-session bar lives globally above the tab bar so admins
+        // can jump back into Generate Play from anywhere. Visibility is purely
+        // derived from `appState.activePlaySessionGame`; the empty branch occupies
+        // zero height so non-active screens look unchanged.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Group {
+                if let activeGame = appState.activePlaySessionGame {
+                    // startedAt falls back to game.dateTime for sessions persisted
+                    // before LiveGameSession.startedAt existed.
+                    ActivePlaySessionBar(
+                        game: activeGame,
+                        startedAt: appState.activePlaySessionStartedAt ?? activeGame.dateTime
+                    ) {
+                        schedulingGame = activeGame
+                    }
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.spring(duration: 0.3), value: appState.activePlaySessionGame?.id)
+        }
+        .sheet(item: $schedulingGame) { game in
+            // Mirror the existing presentation pattern in OwnerManageGamesView so
+            // the restored session and confirmedPlayers source remain identical.
+            let confirmed = (appState.attendeesByGameID[game.id] ?? []).filter {
+                if case .confirmed = $0.booking.state { return true }; return false
+            }
+            GameScheduleSheet(game: game, confirmedPlayers: confirmed)
+                .environmentObject(appState)
+        }
         .sheet(item: $appState.pendingReviewPrompt, onDismiss: {
             // Use the captured ID rather than appState.pendingReviewPrompt so we dismiss
             // the correct game even if a second pending prompt was queued by submit.
@@ -176,6 +207,74 @@ private struct AppRouteMissingView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Active Generate Play Session Bar
+
+/// Compact floating capsule that signals an in-progress Generate Play session and
+/// re-opens it on tap. Lives above the tab bar via `.safeAreaInset` so it follows
+/// the user across tabs without obstructing primary CTAs.
+///
+/// Elapsed time is anchored to `startedAt` — the moment Generate Play was first
+/// started for this game (LiveGameSession.startedAt). The caller resolves the
+/// fallback to game.dateTime when a legacy session has no startedAt recorded.
+private struct ActivePlaySessionBar: View {
+    let game: Game
+    let startedAt: Date
+    let onTap: () -> Void
+
+    private func elapsedText(_ now: Date) -> String {
+        let elapsed = max(0, Int(now.timeIntervalSince(startedAt)))
+        let h = elapsed / 3600
+        let m = (elapsed % 3600) / 60
+        let s = elapsed % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%02d:%02d", m, s)
+    }
+
+    var body: some View {
+        // TimelineView gives a stable per-second redraw signal — replacing the
+        // earlier Timer.publish/autoconnect pattern that re-subscribed on every
+        // body pass and could miss ticks.
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Button(action: onTap) {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle().fill(Color.red.opacity(0.18)).frame(width: 30, height: 30)
+                        Circle().fill(Color.red).frame(width: 9, height: 9)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Live Session")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.6))
+                        Text(game.title)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    Text(elapsedText(context.date))
+                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.55))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Color.black.opacity(0.92), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.3), radius: 12, x: 0, y: 6)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
     }
 }
 

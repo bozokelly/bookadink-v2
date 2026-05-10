@@ -8,7 +8,6 @@ struct ClubsListView: View {
     @State private var selectedFilter: ClubsFilter = .myClubs
     @State private var isShowingCreateClubSheet = false
     @State private var createdClubNavigationTarget: Club? = nil
-    @State private var favouriteSelectedClub: Club? = nil
     @AppStorage("clubs_tip_dismissed") private var tipDismissed = false
 
     // FIX (Performance): Single-pass filter combining membership + search,
@@ -54,10 +53,18 @@ struct ClubsListView: View {
                     }
 
                     // ── Favourites section ──────────────────────────────
+                    // Tap routes through `appState.navigate(to: .club(...))`
+                    // so the favourite-pushed ClubDetailView lives on the
+                    // same `clubsNavPath` as a regular row tap. Without
+                    // this, tapping a game inside a favourite-pushed
+                    // ClubDetailView would write to `clubsNavPath` and
+                    // displace the item-pushed club view — back from the
+                    // game then skipped past the club detail and landed
+                    // on the clubs list.
                     FavouriteClubsSection(
                         clubs: clubs,
                         pinnedIDs: appState.pinnedClubIDs,
-                        selectedClub: $favouriteSelectedClub,
+                        onSelectClub: { club in appState.navigate(to: .club(club.id)) },
                         onTogglePin: { club in appState.togglePinClub(club) },
                         nextGame: { club in nextUpcomingGame(for: club) }
                     )
@@ -133,12 +140,6 @@ struct ClubsListView: View {
         }
         .navigationDestination(item: $createdClubNavigationTarget) { createdClub in
             ClubDetailView(club: createdClub)
-        }
-        // Lifted out of FavouriteClubsSection so the modifier sits outside the
-        // parent LazyVStack — SwiftUI ignores navigationDestination(item:) attached
-        // inside a lazy container.
-        .navigationDestination(item: $favouriteSelectedClub) { club in
-            ClubDetailView(club: club)
         }
     }
 
@@ -841,7 +842,7 @@ struct ClubRowCard: View {
         if let game = nextGame {
             let day = Self.dayFormatter.string(from: game.dateTime)
             let time = Self.timeFormatter.string(from: game.dateTime)
-            let priceText = (game.feeAmount ?? 0) > 0 ? "$ \(Int(game.feeAmount!))" : "Free"
+            let priceText = game.priceLabel
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Image(systemName: "calendar")
                     .font(.footnote)
@@ -907,6 +908,7 @@ struct ClubImageBadge: View {
                         initialsIcon
                     }
                 }
+                .id(url)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             } else {
                 // Initials-based avatar — subtle border signals "no uploaded logo"
@@ -964,7 +966,12 @@ struct ClubImageBadge: View {
 private struct FavouriteClubsSection: View {
     let clubs: [Club]
     let pinnedIDs: [UUID]
-    @Binding var selectedClub: Club?
+    /// Called when a filled favourite tile is tapped. The parent routes
+    /// this through `appState.navigate(to: .club(...))` so the resulting
+    /// ClubDetailView lives on `clubsNavPath` alongside any subsequent
+    /// game pushes — a back tap then walks Game → Club → List rather
+    /// than skipping the club detail.
+    let onSelectClub: (Club) -> Void
     let onTogglePin: (Club) -> Void
     let nextGame: (Club) -> Game?
 
@@ -1002,7 +1009,7 @@ private struct FavouriteClubsSection: View {
                     onAdd: { showPickerForSlot = 0 },
                     onSwap: { showPickerForSlot = 0 },
                     onRemove: { if let c = pinnedClub(at: 0) { onTogglePin(c) } },
-                    onTap: { if let c = pinnedClub(at: 0) { selectedClub = c } }
+                    onTap: { if let c = pinnedClub(at: 0) { onSelectClub(c) } }
                 )
                 FavouriteSlotCard(
                     slotIndex: 1,
@@ -1011,7 +1018,7 @@ private struct FavouriteClubsSection: View {
                     onAdd: { showPickerForSlot = 1 },
                     onSwap: { showPickerForSlot = 1 },
                     onRemove: { if let c = pinnedClub(at: 1) { onTogglePin(c) } },
-                    onTap: { if let c = pinnedClub(at: 1) { selectedClub = c } }
+                    onTap: { if let c = pinnedClub(at: 1) { onSelectClub(c) } }
                 )
             }
         }
@@ -1113,37 +1120,62 @@ private struct FavouriteSlotCard: View {
 
     private func filledCard(_ club: Club) -> some View {
         VStack(spacing: 0) {
-            // Tonal gradient hero — tapping opens club detail
+            // Hero thumbnail — paints with the same `HeroSurface.forClub`
+            // composition as the club detail page, so the owner's pinned
+            // palette + pattern flow through to the favourite tile.
+            // Falls back to the deterministic auto rotation (seeded from
+            // `club.id`) on whichever axis the owner hasn't pinned.
+            // Previously this used `AvatarGradients.resolveGradient` +
+            // hardcoded `HeroPattern.diagonal`, which ignored both the
+            // pinned palette (avatarBackgroundColor is the legacy avatar
+            // tint, not the appearance palette) and the pinned pattern.
             Button(action: onTap) {
                 ZStack(alignment: .topLeading) {
-                    AvatarGradients.resolveGradient(forKey: club.avatarBackgroundColor)
-                        .overlay(
-                            // Diagonal stripe overlay
-                            Canvas { ctx, size in
-                                var x: CGFloat = -size.height
-                                while x < size.width + size.height {
-                                    var path = Path()
-                                    path.move(to: CGPoint(x: x, y: 0))
-                                    path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                                    ctx.stroke(path, with: .color(.white.opacity(0.05)), lineWidth: 1)
-                                    x += 14
-                                }
+                    if let customURL = club.customBannerURL {
+                        AsyncImage(url: customURL) { phase in
+                            switch phase {
+                            case let .success(image):
+                                image.resizable().scaledToFill()
+                            case .failure:
+                                HeroSurface.forClub(
+                                    club,
+                                    lighting: .topRight,
+                                    vignette: .bottom,
+                                    direction: .diagonal
+                                )
+                                .overlay(
+                                    Text(clubInitials(club.name))
+                                        .font(.system(size: 36, weight: .bold))
+                                        .tracking(-1.5)
+                                        .foregroundStyle(.white.opacity(0.22))
+                                )
+                            default:
+                                HeroSurface.forClub(
+                                    club,
+                                    lighting: .topRight,
+                                    vignette: .bottom,
+                                    direction: .diagonal
+                                )
                             }
+                        }
+                        .id(customURL)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 92)
+                        .clipped()
+                    } else {
+                        HeroSurface.forClub(
+                            club,
+                            lighting: .topRight,
+                            vignette: .bottom,
+                            direction: .diagonal
                         )
                         .overlay(
-                            // Bottom fade
-                            LinearGradient(
-                                colors: [.clear, .black.opacity(0.18)],
-                                startPoint: .top, endPoint: .bottom
-                            )
-                        )
-                        .overlay(
-                            // Watermark initials
                             Text(clubInitials(club.name))
                                 .font(.system(size: 36, weight: .bold))
                                 .tracking(-1.5)
                                 .foregroundStyle(.white.opacity(0.22))
                         )
+                    }
 
                     // Heart badge (top-left)
                     Circle()
@@ -1156,15 +1188,6 @@ private struct FavouriteSlotCard: View {
                         )
                         .padding(10)
 
-                    // Slot badge (top-right)
-                    Text(String(format: "0%d", slotIndex + 1))
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
                 .frame(height: 92)
                 .frame(maxWidth: .infinity)

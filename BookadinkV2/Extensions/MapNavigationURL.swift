@@ -23,4 +23,23 @@ enum MapNavigationURL {
         guard let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return nil }
         return URL(string: "https://maps.apple.com/?q=\(encoded)")
     }
+
+    /// Google Maps directions URL keyed off a coordinate. The universal
+    /// https form opens the Google Maps app if installed, otherwise the
+    /// browser — no LSApplicationQueriesSchemes entry required.
+    static func googleDirections(to coordinate: CLLocationCoordinate2D) -> URL? {
+        guard coordinate.latitude != 0 || coordinate.longitude != 0 else { return nil }
+        let lat = String(format: "%.7f", coordinate.latitude)
+        let lng = String(format: "%.7f", coordinate.longitude)
+        return URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(lat),\(lng)&travelmode=driving")
+    }
+
+    /// String-search Google Maps directions URL.
+    static func googleDirections(to destination: String) -> URL? {
+        let trimmed = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.count <= maxDestinationLength else { return nil }
+        guard let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return nil }
+        return URL(string: "https://www.google.com/maps/dir/?api=1&destination=\(encoded)&travelmode=driving")
+    }
 }
