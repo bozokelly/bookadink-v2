@@ -437,6 +437,10 @@ struct OwnerCreateGameSheet: View {
                     .environmentObject(appState)
             }
         }
+        // iPad-only: present the create-game form as a page-sized sheet so
+        // the form sections have room to breathe instead of presenting as a
+        // small modal card. iPhone is unaffected. iOS 18+ only.
+        .modifier(IPadPagePresentationSizing())
     }
 
     @ViewBuilder
@@ -726,6 +730,10 @@ struct OwnerEditGameSheet: View {
                     .environmentObject(appState)
             }
         }
+        // iPad-only page-sized presentation. Same rationale as
+        // OwnerCreateGameSheet — the edit form has the same density and
+        // benefits equally from the wider canvas. iPhone is unaffected.
+        .modifier(IPadPagePresentationSizing())
     }
 
     @ViewBuilder
@@ -3018,6 +3026,10 @@ struct OwnerEditClubSheet: View {
             .frame(maxWidth: .infinity)
             .animation(.spring(duration: 0.25), value: isSavingAuto || showSavedPill)
         }
+        // iPad: present the club settings sheet at page size so the dense
+        // form has room to breathe instead of presenting as a small modal
+        // card. Auto-save and AutoSavePill behaviour unchanged. iOS 18+ only.
+        .modifier(IPadPagePresentationSizing())
     }
 
     /// Force a save before the sheet goes away, but only when the latest

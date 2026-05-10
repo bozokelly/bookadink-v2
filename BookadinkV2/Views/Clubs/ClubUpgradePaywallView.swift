@@ -346,6 +346,11 @@ struct ClubUpgradePaywallView: View {
                 }
             }
         }
+        // iPad: present the paywall as a page-sized sheet so plan cards,
+        // highlights, and the post-payment polling overlay have room to
+        // render without cramping. Polling window and entitlement-refresh
+        // logic unchanged (see "Club Subscription Upgrade UI" rules).
+        .modifier(IPadPagePresentationSizing())
     }
 
     // MARK: - Processing Overlay

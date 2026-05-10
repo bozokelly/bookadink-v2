@@ -1235,7 +1235,11 @@ extension Notification.Name {
 /// sheet to fill the screen as a page-sized presentation. iPhone presentation
 /// is unaffected (page sizing matches the default full sheet there). Older OS
 /// versions fall through unchanged so deployment-target drift never crashes.
-private struct IPadPagePresentationSizing: ViewModifier {
+///
+/// Internal access so other sheet bodies in this target (owner forms,
+/// paywall, Stripe Connect onboarding) can opt into the same iPad sizing
+/// without redeclaring the modifier.
+struct IPadPagePresentationSizing: ViewModifier {
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
             content.presentationSizing(.page)

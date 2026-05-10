@@ -65,6 +65,11 @@ struct StripeConnectOnboardingView: View {
             ClubUpgradePaywallView(club: club, lockedFeature: feature)
                 .environmentObject(appState)
         }
+        // iPad: present the Connect onboarding flow at page size so the
+        // hero, status panel, and instructions render with comfortable
+        // spacing. Deep-link return path (pendingConnectReturnClubID) and
+        // refresh logic are unaffected. iOS 18+ only.
+        .modifier(IPadPagePresentationSizing())
     }
 
     // MARK: - Hero header
