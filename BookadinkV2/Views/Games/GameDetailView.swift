@@ -71,6 +71,22 @@ struct GameDetailView: View {
     /// keeps the transition feeling continuous rather than jumpy.
     private static let heroHeight: CGFloat = 280
 
+    // MARK: - Adaptive Layout
+
+    /// Drives the iPad two-column layout. Bound to horizontalSizeClass so
+    /// iPad split-screen narrow (1/3) falls back to the iPhone layout, and
+    /// AND-gated on `userInterfaceIdiom == .pad` so iPhone behaviour
+    /// (including iPhone Pro Max landscape, which reports `.regular`) is
+    /// preserved exactly.
+    @Environment(\.horizontalSizeClass) private var hSizeClass
+
+    private var isWideLayout: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad && hSizeClass == .regular
+    }
+
+    /// Width of the persistent right-side booking panel on iPad.
+    private static let iPadBookingPanelWidth: CGFloat = 360
+
     // MARK: - Computed Properties
 
     private var clubName: String? {
@@ -264,78 +280,26 @@ struct GameDetailView: View {
             .ignoresSafeArea(edges: .top)
             .allowsHitTesting(false)
 
-            ScrollView(.vertical) {
-                // Tracks the live ScrollView contentOffset so we can:
-                //   • grow `pullDownAmount` while the user is pulling
-                //     down past rest (drives the hero's stretch)
-                //   • drift `heroParallaxOffset` upward as the user
-                //     scrolls up (keeps the painted hero anchored to
-                //     the in-scroll heroSection placeholder so it
-                //     scrolls out of view together with content)
-                ScrollOffsetReader { offset in
-                    pullDownAmount = max(-offset, 0)
-                    // 1:1 upward follow, capped at heroHeight so once
-                    // the hero is fully off-screen we stop translating
-                    // (no point applying offsets larger than the paint
-                    // itself — keeps the modifier graph stable on long
-                    // scrolls).
-                    let upward = max(offset, 0)
-                    heroParallaxOffset = -min(upward, Self.heroHeight)
-                }
-                .frame(height: 0)
-
-                VStack(spacing: 0) {
-                    heroSection
-
-                    VStack(alignment: .leading, spacing: 20) {
-                        tagsRowSection
-                        infoGridSection
-
-                        let userInfo = currentGame.description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        if !userInfo.isEmpty || hasDisplayableFormat {
-                            aboutSection
-                        }
-
-                        if currentGame.requiresDUPR {
-                            duprRequirementCard
-                        }
-
-                        if canViewAttendees {
-                            adminPlayersSection
-                        }
-
-                        if let policy = clubForGame?.cancellationPolicy, !policy.isEmpty {
-                            clubCancellationPolicyCard(policy: policy)
-                        }
-
-                        if let fee = currentGame.feeAmount, fee > 0 {
-                            priceSummarySection(fee: fee)
-                        }
-
-                        // Error/info banners
-                        if let err = paymentErrorMessage, !err.isEmpty {
-                            inlineBanner(err, color: Brand.errorRed)
-                        }
-                        if let info = appState.bookingInfoMessage, !info.isEmpty {
-                            inlineBanner(info, color: Brand.pineTeal)
-                        }
-                        if let err = appState.bookingsErrorMessage, !err.isEmpty {
-                            inlineBanner(AppCopy.friendlyError(err), color: Brand.errorRed)
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 20)
-                    .padding(.bottom, 110)
-                }
+            // Adaptive content layer — single column on iPhone (sticky
+            // footer), two-column on iPad with a persistent right-side
+            // booking panel. The fixed HeroSurface above is shared by
+            // both, so the painted hero stays continuous across the
+            // iPhone ↔ iPad transition (e.g. Slide Over → full screen).
+            if isWideLayout {
+                iPadWideContentLayer
+            } else {
+                iPhoneContentLayer
             }
-            .scrollIndicators(.hidden)
-            // Hero paints behind the status bar — extends the
-            // HeroSurface to the very top of the screen instead of
-            // leaving an `appBackground`-coloured gap above it.
-            .ignoresSafeArea(edges: .top)
-
-            stickyFooter
         }
+        // Stripe PaymentSheet presentation lives at the body root so it
+        // is attached regardless of which content layer is active. The
+        // previous attachment on `stickyFooter` would have been gone on
+        // iPad two-column where the footer is suppressed.
+        .paymentSheet(
+            isPresented: $isShowingPaymentSheet,
+            paymentSheet: paymentSheet,
+            onCompletion: handlePaymentCompletion
+        )
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         .task(id: game.id) {
@@ -1059,11 +1023,173 @@ struct GameDetailView: View {
         }
         .background(.regularMaterial)
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 0) }
-        .paymentSheet(
-            isPresented: $isShowingPaymentSheet,
-            paymentSheet: paymentSheet,
-            onCompletion: handlePaymentCompletion
-        )
+        // `.paymentSheet(...)` lives on the body's outer ZStack so the
+        // Stripe sheet binding is attached on both iPhone (sticky footer)
+        // and iPad (two-column / no sticky footer) layouts.
+    }
+
+    // MARK: - Adaptive Content Layers
+
+    /// iPhone single-column layout: full-width ScrollView with the
+    /// existing sticky bottom footer overlay. Behaviour is unchanged from
+    /// before iPad support was added — same paddings, same scroll probe,
+    /// same content order.
+    private var iPhoneContentLayer: some View {
+        ZStack(alignment: .bottom) {
+            ScrollView(.vertical) {
+                scrollOffsetProbe
+
+                VStack(spacing: 0) {
+                    heroSection
+
+                    VStack(alignment: .leading, spacing: 20) {
+                        gameDetailContent
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 20)
+                    .padding(.bottom, 110)
+                }
+            }
+            .scrollIndicators(.hidden)
+            .ignoresSafeArea(edges: .top)
+
+            stickyFooter
+        }
+    }
+
+    /// iPad two-column layout: scrolling content on the left, persistent
+    /// booking panel on the right. The painted HeroSurface in the parent
+    /// ZStack remains full-width behind both columns; the right panel
+    /// sits below the hero baseline so the hero stays visually intact
+    /// across the full screen width above it. The sticky bottom footer
+    /// is not rendered here — `iPadBookingSidebar` is its replacement.
+    private var iPadWideContentLayer: some View {
+        HStack(alignment: .top, spacing: 0) {
+            ScrollView(.vertical) {
+                scrollOffsetProbe
+
+                VStack(spacing: 0) {
+                    heroSection
+
+                    VStack(alignment: .leading, spacing: 20) {
+                        gameDetailContent
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 20)
+                    // No sticky footer to clear on iPad — bottom padding
+                    // is just breathing room.
+                    .padding(.bottom, 32)
+                }
+            }
+            .scrollIndicators(.hidden)
+            .ignoresSafeArea(edges: .top)
+            .frame(maxWidth: .infinity)
+
+            iPadBookingSidebar
+                .frame(width: Self.iPadBookingPanelWidth)
+                .frame(maxHeight: .infinity, alignment: .top)
+        }
+    }
+
+    /// Live scroll-offset probe that drives `pullDownAmount` and
+    /// `heroParallaxOffset`. Extracted so iPhone and iPad layers share
+    /// the same parallax / pull-to-refresh feel without duplication.
+    private var scrollOffsetProbe: some View {
+        ScrollOffsetReader { offset in
+            pullDownAmount = max(-offset, 0)
+            let upward = max(offset, 0)
+            heroParallaxOffset = -min(upward, Self.heroHeight)
+        }
+        .frame(height: 0)
+    }
+
+    /// The shared inner content sequence below the hero. Used by both
+    /// iPhone and iPad layers — only the surrounding paddings differ.
+    @ViewBuilder
+    private var gameDetailContent: some View {
+        tagsRowSection
+        infoGridSection
+
+        if shouldShowAboutSection {
+            aboutSection
+        }
+
+        if currentGame.requiresDUPR {
+            duprRequirementCard
+        }
+
+        if canViewAttendees {
+            adminPlayersSection
+        }
+
+        if let policy = clubForGame?.cancellationPolicy, !policy.isEmpty {
+            clubCancellationPolicyCard(policy: policy)
+        }
+
+        if let fee = currentGame.feeAmount, fee > 0 {
+            priceSummarySection(fee: fee)
+        }
+
+        if let err = paymentErrorMessage, !err.isEmpty {
+            inlineBanner(err, color: Brand.errorRed)
+        }
+        if let info = appState.bookingInfoMessage, !info.isEmpty {
+            inlineBanner(info, color: Brand.pineTeal)
+        }
+        if let err = appState.bookingsErrorMessage, !err.isEmpty {
+            inlineBanner(AppCopy.friendlyError(err), color: Brand.errorRed)
+        }
+    }
+
+    private var trimmedUserInfo: String {
+        currentGame.description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private var shouldShowAboutSection: Bool {
+        !trimmedUserInfo.isEmpty || hasDisplayableFormat
+    }
+
+    /// Persistent right-side booking panel for iPad. Wraps the same
+    /// `footerCTAArea` used by `stickyFooter` on iPhone — same booking
+    /// states, same payment flow, no duplicated logic. The panel sits
+    /// below the hero so the painted HeroSurface above it stays intact.
+    private var iPadBookingSidebar: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 12) {
+                    Text("Book this game")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Brand.primaryText)
+                    Spacer(minLength: 0)
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Brand.secondaryText)
+                            .frame(width: 30, height: 30)
+                            .background(Brand.secondarySurface, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                footerCTAArea
+            }
+            .padding(16)
+            .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Brand.softOutline, lineWidth: 1)
+            )
+            .padding(.horizontal, 16)
+            // Push the panel below the hero so the painted hero stays
+            // visually intact across the full screen width above it.
+            // `safeAreaTopPad` cancels the status-bar inset since the
+            // hero ignores safe area; the floor (220) keeps the panel
+            // visible if the safe-area lookup ever returns 0.
+            .padding(.top, max(Self.heroHeight - safeAreaTopPad, 220))
+            .padding(.bottom, 24)
+
+            Spacer(minLength: 0)
+        }
     }
 
     @ViewBuilder
