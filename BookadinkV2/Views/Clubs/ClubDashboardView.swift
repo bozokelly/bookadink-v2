@@ -140,6 +140,10 @@ struct ClubDashboardView: View {
                 .padding(.horizontal, 18)
                 .padding(.top, 8)
                 .padding(.bottom, 40)
+                // iPad / large phone landscape: cap workspace reading width so
+                // cards stay legible instead of stretching edge-to-edge.
+                .frame(maxWidth: 720, alignment: .leading)
+                .frame(maxWidth: .infinity)
             }
             .refreshable { await refreshAll() }
             .background(Brand.appBackground)

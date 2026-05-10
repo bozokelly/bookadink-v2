@@ -141,6 +141,11 @@ struct ClubNewsView: View {
           .padding(.horizontal, 16)
           .padding(.top, 8)
           .padding(.bottom, 32)
+          // iPad: cap chat reading width so post bubbles and comment threads
+          // don't sprawl edge-to-edge. commentDraft state stays inside
+          // ClubNewsPostCard — only the outer column width is constrained.
+          .frame(maxWidth: 720, alignment: .leading)
+          .frame(maxWidth: .infinity)
         }
         .onChange(of: selectedPhotoItems.count) { _, _ in
             Task { await loadPickedPhotos(selectedPhotoItems) }

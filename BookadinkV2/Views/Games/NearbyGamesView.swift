@@ -105,6 +105,10 @@ struct NearbyGamesView: View {
                 .padding(.horizontal, 20)
                 .padding(.top, 12)
                 .padding(.bottom, 32)
+                // Cap grid width so columns don't sprawl on 13" iPad —
+                // each card still gets a comfortable ~470pt of room.
+                .frame(maxWidth: 960)
+                .frame(maxWidth: .infinity)
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     if locationUnavailable {

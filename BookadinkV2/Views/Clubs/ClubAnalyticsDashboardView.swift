@@ -95,6 +95,10 @@ struct ClubAnalyticsDashboardView: View {
                         .padding(.bottom, 32)
                 }
             }
+            // iPad: cap analytics workspace width so charts and stat tiles
+            // stay scannable. KPI grid (4-up on iPad) still has room to breathe.
+            .frame(maxWidth: 960)
+            .frame(maxWidth: .infinity)
         }
         .background(Color(.systemGroupedBackground))
         .task { if !isDemo { await load() } }

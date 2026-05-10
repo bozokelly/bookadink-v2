@@ -215,6 +215,10 @@ struct HomeView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
                 .padding(.bottom, 48)
+                // iPad / large phone landscape: cap reading width so the home
+                // feed stays a single readable column rather than stretching.
+                .frame(maxWidth: 760, alignment: .leading)
+                .frame(maxWidth: .infinity)
             }
             .scrollIndicators(.hidden)
             .onAppear { locationManager.requestPermissionIfNeeded() }
