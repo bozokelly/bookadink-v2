@@ -39,6 +39,38 @@ struct GameDetailView: View {
     @State private var cancellationPolicyExpanded = false
     @State private var showBookingSuccess = false
 
+    /// Drives the "Open in Apple Maps / Google Maps" confirmation dialog
+    /// triggered by tapping the VENUE info card.
+    @State private var showOpenInMapsPrompt = false
+
+    /// Positive distance the user has pulled the ScrollView down past
+    /// rest. Drives the fixed HeroSurface's height so the hero paint
+    /// stretches with the pull instead of detaching from the top of
+    /// the screen — matches the `ClubDetailView` morphing feel.
+    @State private var pullDownAmount: CGFloat = 0
+
+    /// Vertical offset applied to the fixed HeroSurface as the user
+    /// scrolls upward (content rising). Without this, the painted hero
+    /// stays pinned at y=0 even after the in-scroll heroSection has
+    /// scrolled past, so subsequent content (price pills, info cards)
+    /// would render *on top of* the dark hero painting. Tracks scroll
+    /// 1:1 so the hero scrolls out of view together with the in-scroll
+    /// `heroSection` placeholder. (ClubDetailView gets to use a 30%
+    /// parallax because its content sheet has a solid background that
+    /// masks the hero behind it; GameDetailView's content is a
+    /// transparent VStack of individual cards, so any partially-visible
+    /// hero would bleed through the gaps. 1:1 keeps the seam clean.)
+    @State private var heroParallaxOffset: CGFloat = 0
+
+    /// Baseline hero height. The fixed background is at least this
+    /// tall, plus `pullDownAmount` while the user is pulling down.
+    /// **Must stay in sync with `ClubDetailView.heroHeight`** so the
+    /// hero region is the same pixel height when the user navigates
+    /// between Club ↔ Game — the seam between the painted hero and
+    /// the content sheet sits at the same Y in both views, which
+    /// keeps the transition feeling continuous rather than jumpy.
+    private static let heroHeight: CGFloat = 280
+
     // MARK: - Computed Properties
 
     private var clubName: String? {
@@ -215,7 +247,48 @@ struct GameDetailView: View {
         ZStack(alignment: .bottom) {
             Brand.appBackground.ignoresSafeArea()
 
+            // Fixed HeroSurface background — pinned to the top of the
+            // screen behind the ScrollView. Stretches downward by
+            // `pullDownAmount` so the hero paint follows the title
+            // block as the user pulls the page down (no gap at the top
+            // edge during pull-to-refresh).
+            HeroSurface.forGame(
+                currentGame,
+                lighting: .topRight,
+                vignette: .bottomStrong,
+                direction: .diagonal
+            )
+            .frame(height: Self.heroHeight + pullDownAmount)
+            // Drift upward with scroll so the hero scrolls out of view
+            // alongside the in-scroll heroSection placeholder. Without
+            // this offset, content that scrolls into the hero's y-zone
+            // would render on top of the dark painting (price pills on
+            // navy background, etc.).
+            .offset(y: heroParallaxOffset)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
+
             ScrollView(.vertical) {
+                // Tracks the live ScrollView contentOffset so we can:
+                //   • grow `pullDownAmount` while the user is pulling
+                //     down past rest (drives the hero's stretch)
+                //   • drift `heroParallaxOffset` upward as the user
+                //     scrolls up (keeps the painted hero anchored to
+                //     the in-scroll heroSection placeholder so it
+                //     scrolls out of view together with content)
+                ScrollOffsetReader { offset in
+                    pullDownAmount = max(-offset, 0)
+                    // 1:1 upward follow, capped at heroHeight so once
+                    // the hero is fully off-screen we stop translating
+                    // (no point applying offsets larger than the paint
+                    // itself — keeps the modifier graph stable on long
+                    // scrolls).
+                    let upward = max(offset, 0)
+                    heroParallaxOffset = -min(upward, Self.heroHeight)
+                }
+                .frame(height: 0)
+
                 VStack(spacing: 0) {
                     heroSection
 
@@ -261,6 +334,10 @@ struct GameDetailView: View {
                 }
             }
             .scrollIndicators(.hidden)
+            // Hero paints behind the status bar — extends the
+            // HeroSurface to the very top of the screen instead of
+            // leaving an `appBackground`-coloured gap above it.
+            .ignoresSafeArea(edges: .top)
 
             stickyFooter
         }
@@ -314,6 +391,25 @@ struct GameDetailView: View {
             }
         }
         .confirmationDialog(
+            "Open directions in Maps?",
+            isPresented: $showOpenInMapsPrompt,
+            titleVisibility: .visible
+        ) {
+            if let url = venueAppleMapsURL {
+                Button("Open in Apple Maps") { openURL(url) }
+            }
+            if let url = venueGoogleMapsURL {
+                Button("Open in Google Maps") { openURL(url) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if let v = resolvedVenueForGame {
+                Text("Get directions to \(v.venueName).")
+            } else {
+                Text("Get directions to this game's venue.")
+            }
+        }
+        .confirmationDialog(
             "Cancel this game?",
             isPresented: $showCancelGameConfirmation,
             titleVisibility: .visible
@@ -323,7 +419,18 @@ struct GameDetailView: View {
             }
             Button("Keep Game", role: .cancel) {}
         } message: {
-            Text("This will cancel the game and notify all booked players.")
+            // Append the credit warning when paid bookings exist on this game.
+            // Attendees were loaded by GameDetailView's own .task so the cache
+            // is reliable by the time the admin reaches this dialog.
+            let paid = (appState.attendeesByGameID[game.id] ?? []).filter { attendee in
+                guard case .confirmed = attendee.booking.state else { return false }
+                return attendee.booking.feePaid && attendee.booking.paymentMethod == "stripe"
+            }.count
+            if paid > 0 {
+                Text("This will cancel the game and notify all booked players.\nPaid players will be issued club credit.")
+            } else {
+                Text("This will cancel the game and notify all booked players.")
+            }
         }
         .onChange(of: currentGame.status) { _, newStatus in
             if newStatus == "cancelled" { dismiss() }
@@ -359,17 +466,15 @@ struct GameDetailView: View {
 
     // MARK: - Hero Section
 
-    private var heroGradient: LinearGradient {
-        let palettes: [(Color, Color)] = [
-            (Brand.tonalNavyBase,     Brand.tonalNavyDeep),
-            (Brand.tonalCharcoalBase, Brand.tonalCharcoalDeep),
-            (Brand.tonalForestBase,   Brand.tonalForestDeep),
-            (Brand.tonalTanBase,      Brand.tonalTanDeep),
-            (Brand.tonalRoseBase,     Brand.tonalRoseDeep),
-            (Brand.tonalSlateBase,    Brand.tonalSlateDeep),
-        ]
-        let (base, deep) = palettes[abs(game.clubID.hashValue) % palettes.count]
-        return LinearGradient(colors: [base, deep], startPoint: .topLeading, endPoint: .bottomTrailing)
+    /// Top safe-area inset, sourced the same way as `ClubDetailView`.
+    /// Used to push the hero's chrome row (back button + admin/more
+    /// menus) below the status bar now that the ScrollView extends
+    /// through the safe area so the HeroSurface paints all the way to
+    /// the top of the screen.
+    private var safeAreaTopPad: CGFloat {
+        UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.keyWindow?.safeAreaInsets.top }
+            .first ?? 44
     }
 
     private var heroChipText: String {
@@ -384,6 +489,12 @@ struct GameDetailView: View {
         let f = DateFormatter()
         f.dateFormat = "h:mm a"; f.amSymbol = "AM"; f.pmSymbol = "PM"; return f
     }()
+    private static let scheduledPublishFmt: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_AU")
+        f.dateFormat = "EEE d MMM 'at' h:mm a"
+        f.amSymbol = "AM"; f.pmSymbol = "PM"
+        return f
+    }()
 
     private var heroDateText: String {
         "\(Self.heroDateFmt.string(from: currentGame.dateTime).uppercased()) · \(Self.heroTimeFmt.string(from: currentGame.dateTime))"
@@ -391,28 +502,13 @@ struct GameDetailView: View {
 
     private var heroSection: some View {
         ZStack(alignment: .bottom) {
-            heroGradient
-            // Diagonal stripe overlay
-            Canvas { ctx, size in
-                var x: CGFloat = -size.height
-                while x < size.width + size.height {
-                    var path = Path()
-                    path.move(to: CGPoint(x: x, y: 0))
-                    path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                    ctx.stroke(path, with: .color(.white.opacity(0.045)), lineWidth: 1)
-                    x += 14
-                }
-            }
-            .allowsHitTesting(false)
-            // Vignette
-            LinearGradient(
-                stops: [
-                    .init(color: .white.opacity(0.06), location: 0),
-                    .init(color: .clear, location: 0.35),
-                    .init(color: .black.opacity(0.32), location: 1),
-                ],
-                startPoint: .top, endPoint: .bottom
-            )
+            // Transparent placeholder — the actual HeroSurface is
+            // rendered as a fixed background layer in `body` so it
+            // stays pinned to the top of the screen and stretches with
+            // pull-to-refresh. This in-scroll layer just reserves the
+            // hero's vertical space and carries the chrome + title
+            // content on top of the fixed paint behind it.
+            Color.clear
             // Content
             VStack(alignment: .leading, spacing: 0) {
                 // Top bar
@@ -432,7 +528,11 @@ struct GameDetailView: View {
                     heroMoreMenu
                 }
                 .padding(.horizontal, 16)
-                .padding(.top, 10)
+                // ScrollView ignores top safe area so the HeroSurface
+                // paints behind the status bar — the chrome row needs
+                // an explicit safe-area inset added back to keep the
+                // back button + menus clear of the status bar.
+                .padding(.top, safeAreaTopPad + 10)
 
                 Spacer(minLength: 12)
 
@@ -478,7 +578,13 @@ struct GameDetailView: View {
                     .padding(.bottom, 20)
             }
         }
-        .frame(minHeight: 260)
+        // Locked to the same baseline as the fixed HeroSurface in
+        // `body`, so at rest the in-scroll placeholder and the fixed
+        // paint behind it occupy exactly the same vertical region.
+        // (Was `minHeight: 260` previously; `.frame(minHeight:)` lets
+        // long titles push the hero taller than the fixed background,
+        // which would expose `appBackground` below the paint.)
+        .frame(minHeight: Self.heroHeight)
         .frame(maxWidth: .infinity)
     }
 
@@ -678,10 +784,25 @@ struct GameDetailView: View {
         let timeSub = "\(Self.heroTimeFmt.string(from: currentGame.dateTime)) – \(Self.heroTimeFmt.string(from: endTime))"
 
         let confirmedCount = !confirmedAttendees.isEmpty ? confirmedAttendees.count : (currentGame.confirmedCount ?? 0)
+        let venueIsTappable = canOpenVenueInMaps
 
         return LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
-            infoCard(icon: "mappin.and.ellipse", label: "VENUE",
-                     main: venueName, sub: venueSubLine)
+            Group {
+                if venueIsTappable {
+                    Button {
+                        showOpenInMapsPrompt = true
+                    } label: {
+                        infoCard(icon: "mappin.and.ellipse", label: "VENUE",
+                                 main: venueName, sub: venueSubLine,
+                                 trailingChevron: true)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Opens directions to the venue")
+                } else {
+                    infoCard(icon: "mappin.and.ellipse", label: "VENUE",
+                             main: venueName, sub: venueSubLine)
+                }
+            }
             infoCard(icon: "calendar", label: "WHEN",
                      main: dateMain, sub: timeSub)
             infoCard(icon: "person.2", label: "FORMAT",
@@ -695,7 +816,34 @@ struct GameDetailView: View {
         }
     }
 
-    private func infoCard(icon: String, label: String, main: String, sub: String?) -> some View {
+    /// True when we have either resolved coordinates or a non-empty
+    /// search query for the venue — enough to hand off to a maps app.
+    private var canOpenVenueInMaps: Bool {
+        if let v = resolvedVenueForGame, v.latitude != nil, v.longitude != nil {
+            return true
+        }
+        return !gameLocationNavigationQuery.isEmpty
+    }
+
+    /// Apple Maps URL for the resolved venue, or nil when nothing routable.
+    private var venueAppleMapsURL: URL? {
+        if let v = resolvedVenueForGame, let lat = v.latitude, let lng = v.longitude {
+            return MapNavigationURL.directions(
+                to: CLLocationCoordinate2D(latitude: lat, longitude: lng))
+        }
+        return MapNavigationURL.directions(to: gameLocationNavigationQuery)
+    }
+
+    /// Google Maps URL for the resolved venue, or nil when nothing routable.
+    private var venueGoogleMapsURL: URL? {
+        if let v = resolvedVenueForGame, let lat = v.latitude, let lng = v.longitude {
+            return MapNavigationURL.googleDirections(
+                to: CLLocationCoordinate2D(latitude: lat, longitude: lng))
+        }
+        return MapNavigationURL.googleDirections(to: gameLocationNavigationQuery)
+    }
+
+    private func infoCard(icon: String, label: String, main: String, sub: String?, trailingChevron: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 5) {
                 Image(systemName: icon)
@@ -705,6 +853,12 @@ struct GameDetailView: View {
                     .font(.system(size: 10.5, weight: .semibold))
                     .tracking(0.6)
                     .foregroundStyle(Brand.secondaryText)
+                if trailingChevron {
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Brand.secondaryText)
+                }
             }
             VStack(alignment: .leading, spacing: 3) {
                 Text(main)
@@ -990,6 +1144,25 @@ struct GameDetailView: View {
                 .buttonStyle(.plain)
             }
 
+        } else if currentGame.isScheduled && !currentGame.startsInPast {
+            // Delayed-publish: bookings open at publish_at. Server-side gates in
+            // book_game() and create-payment-intent enforce this; the disabled
+            // CTA + caption surface the same rule in the UI so the user sees
+            // why their action is blocked without having to attempt it first.
+            VStack(spacing: 6) {
+                Text("Bookings open soon")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Brand.secondaryText)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 52)
+                    .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                if let pa = currentGame.publishAt {
+                    Text("Publishes \(Self.scheduledPublishFmt.string(from: pa))")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.secondaryText)
+                }
+            }
+
         } else if state.canBook && !currentGame.startsInPast {
             let enabled = canBookGameByClubMembership && !clubPaymentBlocked
             Button {
@@ -1080,107 +1253,18 @@ struct GameDetailView: View {
     // MARK: - Booking Success Sheet
 
     private var bookingSuccessSheet: some View {
-        VStack(spacing: 0) {
-            Capsule()
-                .fill(Color(.systemGray4))
-                .frame(width: 36, height: 4)
-                .padding(.top, 12)
-                .padding(.bottom, 28)
-
-            VStack(alignment: .leading, spacing: 20) {
-                // Green check circle
-                ZStack {
-                    Circle()
-                        .fill(Brand.accentGreen)
-                        .frame(width: 52, height: 52)
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(Brand.primaryText)
-                }
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("You're in.")
-                        .font(.system(size: 28, weight: .bold))
-                        .foregroundStyle(Brand.primaryText)
-                    Text("We've held your spot. Calendar invite sent. Court info drops 24h before.")
-                        .font(.system(size: 15))
-                        .foregroundStyle(Brand.secondaryText)
-                        .lineSpacing(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                // Mini game card
-                HStack(spacing: 14) {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(heroGradient)
-                        .frame(width: 52, height: 52)
-                        .overlay(
-                            Canvas { ctx, size in
-                                var x: CGFloat = -size.height
-                                while x < size.width + size.height {
-                                    var path = Path()
-                                    path.move(to: CGPoint(x: x, y: 0))
-                                    path.addLine(to: CGPoint(x: x + size.height, y: size.height))
-                                    ctx.stroke(path, with: .color(.white.opacity(0.06)), lineWidth: 1)
-                                    x += 14
-                                }
-                            }
-                            .allowsHitTesting(false)
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("\(Self.heroDateFmt.string(from: currentGame.dateTime)) · \(Self.heroTimeFmt.string(from: currentGame.dateTime))")
-                            .font(.system(size: 12))
-                            .foregroundStyle(Brand.secondaryText)
-                        Text(currentGame.title)
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(Brand.primaryText)
-                            .lineLimit(1)
-                    }
-                }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Brand.softOutline, lineWidth: 1))
-
-                // Action buttons
-                HStack(spacing: 12) {
-                    Button {
-                        Task { await appState.toggleCalendarExport(for: game) }
-                        showBookingSuccess = false
-                    } label: {
-                        Text("Add to calendar")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(Brand.primaryText)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 52)
-                            .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Brand.softOutline, lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        showBookingSuccess = false
-                    } label: {
-                        Text("Done")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 52)
-                            .background(Brand.primaryText, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.bottom, 36)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Brand.appBackground)
-        .presentationDetents([.height(460)])
-        .presentationDragIndicator(.hidden)
-        .presentationCornerRadius(28)
+        let venueName = resolvedVenueForGame?.venueName ?? currentGame.venueName
+        let dateTimeText = "\(Self.heroDateFmt.string(from: currentGame.dateTime)) · \(Self.heroTimeFmt.string(from: currentGame.dateTime))"
+        return BookingSuccessSheetContent(
+            title: currentGame.title,
+            dateTimeText: dateTimeText,
+            venueText: venueName,
+            onAddToCalendar: {
+                Task { await appState.toggleCalendarExport(for: game) }
+                showBookingSuccess = false
+            },
+            onDone: { showBookingSuccess = false }
+        )
     }
 
     // MARK: - Inline Banner
@@ -2816,6 +2900,163 @@ struct CleanDetailLine: View {
                 .font(.subheadline)
                 .foregroundStyle(Brand.ink)
             Spacer(minLength: 0)
+        }
+    }
+}
+
+// MARK: - Booking Success Sheet Content
+
+private struct BookingSuccessSheetContent: View {
+    let title: String
+    let dateTimeText: String
+    let venueText: String?
+    let onAddToCalendar: () -> Void
+    let onDone: () -> Void
+
+    @State private var iconShown = false
+    @State private var textShown = false
+    @State private var cardShown = false
+    @State private var actionsShown = false
+    @State private var didFireHaptic = false
+
+    var body: some View {
+        VStack(spacing: 18) {
+            successIcon
+                .padding(.top, 22)
+
+            VStack(spacing: 4) {
+                Text("You're in.")
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundStyle(Brand.primaryText)
+                    .minimumScaleFactor(0.85)
+                    .lineLimit(1)
+                Text("See you on court.")
+                    .font(.system(size: 16))
+                    .foregroundStyle(Brand.secondaryText)
+                    .minimumScaleFactor(0.9)
+                    .lineLimit(1)
+            }
+            .multilineTextAlignment(.center)
+            .opacity(textShown ? 1 : 0)
+            .offset(y: textShown ? 0 : 6)
+
+            ticketCard
+                .opacity(cardShown ? 1 : 0)
+                .offset(y: cardShown ? 0 : 8)
+
+            actionRow
+                .opacity(actionsShown ? 1 : 0)
+                .offset(y: actionsShown ? 0 : 8)
+        }
+        .padding(.horizontal, 24)
+        .padding(.bottom, 24)
+        .frame(maxWidth: .infinity)
+        .background(Brand.appBackground)
+        .presentationDetents([.height(400)])
+        .presentationDragIndicator(.hidden)
+        .presentationCornerRadius(28)
+        .onAppear { runEntranceSequence() }
+    }
+
+    private var successIcon: some View {
+        ZStack {
+            Circle()
+                .fill(Brand.accentGreen.opacity(0.28))
+                .frame(width: 100, height: 100)
+                .blur(radius: 18)
+                .opacity(iconShown ? 1 : 0)
+                .allowsHitTesting(false)
+            Circle()
+                .fill(Brand.accentGreen)
+                .frame(width: 76, height: 76)
+            Image(systemName: "checkmark")
+                .font(.system(size: 32, weight: .bold))
+                .foregroundStyle(Brand.primaryText)
+        }
+        .frame(width: 76, height: 76)
+        .scaleEffect(iconShown ? 1.0 : 0.55)
+        .opacity(iconShown ? 1 : 0)
+    }
+
+    private var ticketCard: some View {
+        VStack(spacing: 6) {
+            Text(dateTimeText.uppercased())
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.8)
+                .foregroundStyle(Brand.secondaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            Text(title)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Brand.primaryText)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.85)
+            if let venueText, !venueText.isEmpty {
+                Text(venueText)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Brand.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.9)
+            }
+        }
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity)
+        .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Brand.softOutline, lineWidth: 1)
+        )
+    }
+
+    private var actionRow: some View {
+        HStack(spacing: 10) {
+            Button(action: onAddToCalendar) {
+                Text("Add to Calendar")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Brand.secondaryText)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 50)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Brand.softOutline, lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+
+            Button(action: onDone) {
+                Text("Done")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 50)
+                    .background(Brand.primaryText, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func runEntranceSequence() {
+        if !didFireHaptic {
+            let generator = UINotificationFeedbackGenerator()
+            generator.prepare()
+            generator.notificationOccurred(.success)
+            didFireHaptic = true
+        }
+        withAnimation(.spring(response: 0.46, dampingFraction: 0.62)) {
+            iconShown = true
+        }
+        withAnimation(.easeOut(duration: 0.28).delay(0.10)) {
+            textShown = true
+        }
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.85).delay(0.18)) {
+            cardShown = true
+        }
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.85).delay(0.26)) {
+            actionsShown = true
         }
     }
 }
