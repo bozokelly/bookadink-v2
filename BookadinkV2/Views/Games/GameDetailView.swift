@@ -1371,39 +1371,32 @@ struct GameDetailView: View {
     /// iPhone and iPad layers — only the surrounding paddings differ.
     @ViewBuilder
     private var gameDetailContent: some View {
-        tagsRowSection
-        infoGridSection
-
-        if shouldShowAboutSection {
-            aboutSection
+        // Wrapped in two Groups to keep each ViewBuilder tuple shallow.
+        // The previous flat list of 11 top-level branches blew the stack
+        // during SwiftUI body evaluation on real devices (EXC_BAD_ACCESS
+        // code=2 on `gameDetailContent`). Group<TupleView<...>> collapses
+        // the variadic tuple so diffing stays linear.
+        Group {
+            tagsRowSection
+            infoGridSection
+            if shouldShowAboutSection { aboutSection }
+            if currentGame.requiresDUPR { duprRequirementCard }
+            if canViewAttendees { adminPlayersSection }
         }
 
-        if currentGame.requiresDUPR {
-            duprRequirementCard
-        }
-
-        if canViewAttendees {
-            adminPlayersSection
-        }
-
-        if let club = clubForGame {
-            clubCancellationPolicyCard(club: club)
-        }
-
-        if let fee = currentGame.feeAmount, fee > 0 {
-            priceSummarySection(fee: fee)
-        }
-
-        partnerChoiceSection
-
-        if let err = paymentErrorMessage, !err.isEmpty {
-            inlineBanner(err, color: Brand.errorRed)
-        }
-        if let info = appState.bookingInfoMessage, !info.isEmpty {
-            inlineBanner(info, color: Brand.pineTeal)
-        }
-        if let err = appState.bookingsErrorMessage, !err.isEmpty {
-            inlineBanner(AppCopy.friendlyError(err), color: Brand.errorRed)
+        Group {
+            if let club = clubForGame { clubCancellationPolicyCard(club: club) }
+            if let fee = currentGame.feeAmount, fee > 0 { priceSummarySection(fee: fee) }
+            partnerChoiceSection
+            if let err = paymentErrorMessage, !err.isEmpty {
+                inlineBanner(err, color: Brand.errorRed)
+            }
+            if let info = appState.bookingInfoMessage, !info.isEmpty {
+                inlineBanner(info, color: Brand.pineTeal)
+            }
+            if let err = appState.bookingsErrorMessage, !err.isEmpty {
+                inlineBanner(AppCopy.friendlyError(err), color: Brand.errorRed)
+            }
         }
     }
 
