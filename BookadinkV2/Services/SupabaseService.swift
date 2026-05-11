@@ -91,7 +91,7 @@ protocol ClubDataProviding {
     /// Atomically books a game, letting the server determine confirmed vs waitlisted status.
     /// Pass `holdForPayment: true` for paid fresh bookings — creates a `pending_payment`
     /// booking with a 30-min hold so `create-payment-intent` can scope the PI to this booking_id.
-    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord
+    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?, partnerUserID: UUID?, allocatePartner: Bool) async throws -> BookingRecord
     /// Transitions a `pending_payment` booking to `confirmed` after successful Stripe payment.
     func confirmPendingBooking(bookingID: UUID, stripePaymentIntentID: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord
     func ownerCreateBooking(gameID: UUID, userID: UUID, status: String, waitlistPosition: Int?) async throws -> BookingRecord
@@ -231,6 +231,18 @@ enum SupabaseServiceError: LocalizedError {
     case membershipRequired
     case duprRequired
     case notYetPublished
+    // ── Partnered booking (P2 / P2.1 / P3) ────────────────────────────────
+    // Raised by book_game() and pair_partnered_booking() when partnered
+    // gating fails. iOS maps each to a friendly message in AppState.
+    case partnerRequired
+    case partnerChoiceConflict
+    case partnerIsSelf
+    case partnerNotFound
+    case partnerDUPRRequired
+    case partnerAlreadyInGame
+    case partnerAlreadyInCompletePartnership
+    case partnerIntentAlreadyReserved
+    case partnerNotSupportedForSoloGame
     case missingSession
     case notAuthorized
     case invalidPayload
@@ -259,6 +271,24 @@ enum SupabaseServiceError: LocalizedError {
             return "A valid DUPR ID is required to book this game."
         case .notYetPublished:
             return "This game isn't open for bookings yet."
+        case .partnerRequired:
+            return "Choose a partner or select allocate me a partner."
+        case .partnerChoiceConflict:
+            return "Choose one partner option only."
+        case .partnerIsSelf:
+            return "You can't select yourself as your partner."
+        case .partnerNotFound:
+            return "We couldn't find that partner's profile."
+        case .partnerDUPRRequired:
+            return "Your selected partner needs a DUPR ID before joining this game."
+        case .partnerAlreadyInGame:
+            return "That player is already registered for this game."
+        case .partnerAlreadyInCompletePartnership:
+            return "That player is already paired for this game."
+        case .partnerIntentAlreadyReserved:
+            return "That player has already been requested as a partner."
+        case .partnerNotSupportedForSoloGame:
+            return "Partner selection is not supported for this game."
         case .missingSession:
             return "No authenticated session is available."
         case .notAuthorized:
@@ -273,6 +303,22 @@ enum SupabaseServiceError: LocalizedError {
             return "Failed to decode Supabase response: \(message)"
         case let .network(message):
             return "Network error: \(message)"
+        }
+    }
+
+    /// True when `self` is one of the partnered-flow errors raised by
+    /// book_game() / pair_partnered_booking(). Lets callers route ALL
+    /// partner errors through the user-friendly `errorDescription` copy
+    /// without re-enumerating the cases at every catch site.
+    var isPartneredError: Bool {
+        switch self {
+        case .partnerRequired, .partnerChoiceConflict, .partnerIsSelf,
+             .partnerNotFound, .partnerDUPRRequired, .partnerAlreadyInGame,
+             .partnerAlreadyInCompletePartnership, .partnerIntentAlreadyReserved,
+             .partnerNotSupportedForSoloGame:
+            return true
+        default:
+            return false
         }
     }
 }
@@ -2325,7 +2371,7 @@ final class SupabaseService: ClubDataProviding {
         }
     }
 
-    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool = false, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord {
+    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool = false, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?, partnerUserID: UUID? = nil, allocatePartner: Bool = false) async throws -> BookingRecord {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
@@ -2341,6 +2387,8 @@ final class SupabaseService: ClubDataProviding {
             let pPlatformFeeCents: Int?
             let pClubPayoutCents: Int?
             let pCreditsAppliedCents: Int?
+            let pPartnerUserId: UUID?
+            let pAllocatePartner: Bool
             enum CodingKeys: String, CodingKey {
                 case pGameId = "p_game_id"
                 case pUserId = "p_user_id"
@@ -2351,6 +2399,8 @@ final class SupabaseService: ClubDataProviding {
                 case pPlatformFeeCents = "p_platform_fee_cents"
                 case pClubPayoutCents = "p_club_payout_cents"
                 case pCreditsAppliedCents = "p_credits_applied_cents"
+                case pPartnerUserId = "p_partner_user_id"
+                case pAllocatePartner = "p_allocate_partner"
             }
             func encode(to encoder: Encoder) throws {
                 var c = encoder.container(keyedBy: CodingKeys.self)
@@ -2363,6 +2413,8 @@ final class SupabaseService: ClubDataProviding {
                 try c.encodeIfPresent(pPlatformFeeCents,     forKey: .pPlatformFeeCents)
                 try c.encodeIfPresent(pClubPayoutCents,      forKey: .pClubPayoutCents)
                 try c.encodeIfPresent(pCreditsAppliedCents,  forKey: .pCreditsAppliedCents)
+                try c.encodeIfPresent(pPartnerUserId,        forKey: .pPartnerUserId)
+                try c.encode(pAllocatePartner, forKey: .pAllocatePartner)
             }
         }
 
@@ -2375,7 +2427,9 @@ final class SupabaseService: ClubDataProviding {
             pPaymentMethod: paymentMethod,
             pPlatformFeeCents: platformFeeCents,
             pClubPayoutCents: clubPayoutCents,
-            pCreditsAppliedCents: creditsAppliedCents
+            pCreditsAppliedCents: creditsAppliedCents,
+            pPartnerUserId: partnerUserID,
+            pAllocatePartner: allocatePartner
         )
 
         do {
@@ -2395,6 +2449,18 @@ final class SupabaseService: ClubDataProviding {
                 if code == 409 { throw SupabaseServiceError.duplicateMembership }
                 if body.contains("game_not_found") { throw SupabaseServiceError.notFound }
                 if body.contains("membership_required") { throw SupabaseServiceError.membershipRequired }
+                // Partnered error mapping (P2 / P2.1). Order matters: longer / more
+                // specific substrings must be checked before shorter ones so
+                // "partner_dupr_required" doesn't get caught by "dupr_required".
+                if body.contains("partner_dupr_required") { throw SupabaseServiceError.partnerDUPRRequired }
+                if body.contains("partner_already_in_complete_partnership") { throw SupabaseServiceError.partnerAlreadyInCompletePartnership }
+                if body.contains("partner_intent_already_reserved") { throw SupabaseServiceError.partnerIntentAlreadyReserved }
+                if body.contains("partner_already_in_game") { throw SupabaseServiceError.partnerAlreadyInGame }
+                if body.contains("partner_not_supported_for_solo_game") { throw SupabaseServiceError.partnerNotSupportedForSoloGame }
+                if body.contains("partner_choice_conflict") { throw SupabaseServiceError.partnerChoiceConflict }
+                if body.contains("partner_is_self") { throw SupabaseServiceError.partnerIsSelf }
+                if body.contains("partner_not_found") { throw SupabaseServiceError.partnerNotFound }
+                if body.contains("partner_required") { throw SupabaseServiceError.partnerRequired }
                 if body.contains("dupr_required") { throw SupabaseServiceError.duprRequired }
                 if body.contains("not_yet_published") { throw SupabaseServiceError.notYetPublished }
             }
