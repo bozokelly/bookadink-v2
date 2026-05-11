@@ -443,12 +443,12 @@ struct OwnerCreateGameSheet: View {
         // iPad-only: present the create-game form as a page-sized sheet so
         // the form sections have room to breathe instead of presenting as a
         // small modal card. iPhone is unaffected. iOS 18+ only.
+        //
+        // NOTE: `.formStyle(.columns)` was tried here but broke the section
+        // header hierarchy on iPad — section labels floated mid-row and
+        // label/value alignment lost the grouped-style visual anchoring.
+        // Keep the default grouped Form style on both iPad and iPhone.
         .modifier(IPadPagePresentationSizing())
-        // iPad-only: switch the Form's style to columns so labels and
-        // editors sit side-by-side on the wide canvas instead of stacking
-        // as a phone-first grouped column. iPhone & iPad split-screen
-        // narrow keep the default grouped style.
-        .modifier(IPadColumnsFormStyle())
     }
 
     @ViewBuilder
@@ -742,9 +742,9 @@ struct OwnerEditGameSheet: View {
         // OwnerCreateGameSheet — the edit form has the same density and
         // benefits equally from the wider canvas. iPhone is unaffected.
         .modifier(IPadPagePresentationSizing())
-        // iPad-only columns form style — matches OwnerCreateGameSheet so
-        // Create / Edit feel unified on iPad. iPhone unchanged.
-        .modifier(IPadColumnsFormStyle())
+        // NOTE: Edit / Create game sheets intentionally stay on the default
+        // grouped Form style on both iPad and iPhone — see
+        // OwnerCreateGameSheet for the rationale.
     }
 
     @ViewBuilder
