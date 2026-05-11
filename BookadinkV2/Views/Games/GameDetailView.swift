@@ -55,6 +55,17 @@ struct GameDetailView: View {
     @State private var cancellationPolicyExpanded = false
     @State private var showBookingSuccess = false
 
+    // ── Partnered booking choice (P5B) ─────────────────────────────────────
+    // Tri-state choice the user must make before booking a partnered game.
+    // `unset`     → CTA stays disabled
+    // `choose`    → must also have selectedPartnerUserID before CTA enables
+    // `allocate`  → CTA enables immediately (server picks partner later)
+    enum PartnerMode { case unset, choose, allocate }
+    @State private var partnerMode: PartnerMode = .unset
+    @State private var selectedPartnerUserID: UUID? = nil
+    @State private var selectedPartnerName: String? = nil
+    @State private var showPartnerPicker = false
+
     /// Drives the "Open in Apple Maps / Google Maps" confirmation dialog
     /// triggered by tapping the VENUE info card.
     @State private var showOpenInMapsPrompt = false
@@ -168,6 +179,48 @@ struct GameDetailView: View {
         case .approved, .unknown: return true
         case .none, .pending, .rejected: return false
         }
+    }
+
+    // ── Partnered booking helpers (P5B) ────────────────────────────────────
+
+    private var isPartneredGame: Bool {
+        currentGame.partnershipMode == "partnered"
+    }
+
+    /// True when the partnered choice is ready (or the game is solo). Solo
+    /// games always return true so the existing solo flow is unaffected.
+    /// Partnered: requires either `.allocate` mode OR `.choose` mode with a
+    /// selected partner.
+    private var partneredChoiceIsValid: Bool {
+        guard isPartneredGame else { return true }
+        switch partnerMode {
+        case .unset:    return false
+        case .allocate: return true
+        case .choose:   return selectedPartnerUserID != nil
+        }
+    }
+
+    /// Partner user id to pass to bookGame(). Nil for solo games or when the
+    /// user picked allocate. Set only when partnerMode == .choose and a
+    /// member has been selected.
+    private var partnerUserIDForCall: UUID? {
+        guard isPartneredGame, partnerMode == .choose else { return nil }
+        return selectedPartnerUserID
+    }
+
+    /// True when the user picked "Allocate me a partner" on a partnered game.
+    /// Always false for solo games and for the choose-partner path.
+    private var allocatePartnerForCall: Bool {
+        isPartneredGame && partnerMode == .allocate
+    }
+
+    /// Members the user can pick as a partner — the game's club directory
+    /// minus the current user. The directory is loaded by `.task` once the
+    /// view appears for a partnered game.
+    private var partnerPickerCandidates: [ClubDirectoryMember] {
+        let pool = appState.clubDirectoryMembersByClubID[game.clubID] ?? []
+        guard let me = appState.authUserID else { return pool }
+        return pool.filter { $0.id != me }
     }
 
     private var bookingMembershipRequirementMessage: String? {
@@ -365,6 +418,15 @@ struct GameDetailView: View {
             // P5A: load partnership rows for partnered games so the BOOKED
             // section can render pairs. No-op on solo games.
             await appState.refreshGamePartnerships(for: currentGame)
+            // P5B: pre-load the club directory so the partner picker has
+            // members ready when the user opens it. Only for partnered games
+            // and only when the cache is empty — refresh is otherwise managed
+            // by the existing membership flows.
+            if currentGame.partnershipMode == "partnered",
+               let club = clubForGame,
+               (appState.clubDirectoryMembersByClubID[club.id] ?? []).isEmpty {
+                await appState.refreshClubDirectoryMembers(for: club)
+            }
             if let club = clubForGame, appState.authState == .signedIn {
                 if appState.gamesByClubID[club.id]?.contains(where: { $0.id == game.id }) != true {
                     await appState.refreshGames(for: club)
@@ -402,6 +464,18 @@ struct GameDetailView: View {
         }
         .sheet(isPresented: $showDUPRBookingSheet) { duprBookingSheet }
         .sheet(isPresented: $showDUPRRecoverySheet) { duprRecoverySheet }
+        .sheet(isPresented: $showPartnerPicker) {
+            PartnerPickerSheet(
+                members: partnerPickerCandidates,
+                requiresDUPR: currentGame.requiresDUPR,
+                preselectedID: selectedPartnerUserID,
+                onSelect: { member in
+                    selectedPartnerUserID = member.id
+                    selectedPartnerName   = member.name
+                    partnerMode           = .choose
+                }
+            )
+        }
         .onChange(of: appState.bookingDUPRRequiredForGameID) { _, newValue in
             guard newValue == currentGame.id else { return }
             duprRecoveryDraft = appState.duprID ?? ""
@@ -1232,6 +1306,8 @@ struct GameDetailView: View {
             priceSummarySection(fee: fee)
         }
 
+        partnerChoiceSection
+
         if let err = paymentErrorMessage, !err.isEmpty {
             inlineBanner(err, color: Brand.errorRed)
         }
@@ -1241,6 +1317,166 @@ struct GameDetailView: View {
         if let err = appState.bookingsErrorMessage, !err.isEmpty {
             inlineBanner(AppCopy.friendlyError(err), color: Brand.errorRed)
         }
+    }
+
+    // MARK: - Partner Choice Section (P5B)
+
+    /// Required partner choice for partnered games. Shown only when the user
+    /// can actually act on it — i.e. the game is partnered, not in the past,
+    /// and they're not already booked. Solo games render nothing.
+    @ViewBuilder
+    private var partnerChoiceSection: some View {
+        let state = appState.bookingState(for: game)
+        if isPartneredGame, state.canBook, !currentGame.startsInPast {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("PARTNER")
+                        .font(.system(size: 11, weight: .semibold))
+                        .tracking(0.8)
+                        .foregroundStyle(Brand.secondaryText)
+                    Spacer()
+                    Text("Required")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Brand.spicyOrange)
+                }
+
+                HStack(spacing: 8) {
+                    partnerChoiceSegment(
+                        title: "Choose partner",
+                        icon: "person.crop.circle.badge.plus",
+                        isSelected: partnerMode == .choose
+                    ) {
+                        partnerMode = .choose
+                        showPartnerPicker = true
+                    }
+                    partnerChoiceSegment(
+                        title: "Allocate me",
+                        icon: "shuffle",
+                        isSelected: partnerMode == .allocate
+                    ) {
+                        // Switching to allocate clears any previously-chosen
+                        // partner so the next booking call carries the right
+                        // flags. Stale state would otherwise pass both.
+                        partnerMode = .allocate
+                        selectedPartnerUserID = nil
+                        selectedPartnerName = nil
+                    }
+                }
+
+                if partnerMode == .choose {
+                    selectedPartnerCard
+                }
+
+                Text(partnerChoiceHint)
+                    .font(.caption)
+                    .foregroundStyle(partnerChoiceHintColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Brand.softOutline, lineWidth: 1)
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func partnerChoiceSegment(
+        title: String,
+        icon: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .foregroundStyle(isSelected ? .white : Brand.primaryText)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(
+                isSelected ? Brand.primaryText : Brand.secondarySurface,
+                in: RoundedRectangle(cornerRadius: 12)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var selectedPartnerCard: some View {
+        if let name = selectedPartnerName {
+            HStack(spacing: 10) {
+                Image(systemName: "person.crop.circle.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Brand.pineTeal)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(name)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Brand.primaryText)
+                        .lineLimit(1)
+                    Text("Selected partner")
+                        .font(.caption2)
+                        .foregroundStyle(Brand.mutedText)
+                }
+                Spacer()
+                Button {
+                    showPartnerPicker = true
+                } label: {
+                    Text("Change")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.pineTeal)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10))
+        } else {
+            // Mode = .choose but no partner yet — invite the user to pick.
+            Button {
+                showPartnerPicker = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("Select a partner")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.mutedText)
+                }
+                .foregroundStyle(Brand.primaryText)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 12)
+                .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var partnerChoiceHint: String {
+        switch partnerMode {
+        case .unset:
+            return "Partnered games require a partner. Choose someone you know or let us pair you with another player."
+        case .choose:
+            return selectedPartnerUserID == nil
+                ? "Tap Select a partner to pick a player."
+                : "We'll create a pending pair. Your partner can complete it by booking with you back."
+        case .allocate:
+            return "We'll pair you with another player who's also opted in."
+        }
+    }
+
+    private var partnerChoiceHintColor: Color {
+        if partnerMode == .choose && selectedPartnerUserID == nil { return Brand.spicyOrange }
+        return Brand.secondaryText
     }
 
     private var trimmedUserInfo: String {
@@ -1408,7 +1644,8 @@ struct GameDetailView: View {
             }
 
         } else if state.canBook && !currentGame.startsInPast {
-            let enabled = canBookGameByClubMembership && !clubPaymentBlocked
+            // P5B: partnered games gate the CTA on a complete partner choice.
+            let enabled = canBookGameByClubMembership && !clubPaymentBlocked && partneredChoiceIsValid
             Button {
                 handlePrimaryBookingTap(state: state)
             } label: {
@@ -1462,12 +1699,17 @@ struct GameDetailView: View {
                         clubID: game.clubID
                     )
                 } else {
+                    // P5B: rare path — reservation never ran (legacy/recovery).
+                    // Pass partner params so a partnered fresh booking still
+                    // creates the partnership row server-side.
                     await appState.requestBooking(
                         for: game,
                         stripePaymentIntentID: piID,
                         platformFeeCents: feeCents,
                         clubPayoutCents: payoutCents,
-                        creditsAppliedCents: credits
+                        creditsAppliedCents: credits,
+                        partnerUserID: partnerUserIDForCall,
+                        allocatePartner: allocatePartnerForCall
                     )
                 }
                 isConfirmingPayment = false
@@ -1671,7 +1913,8 @@ struct GameDetailView: View {
         let state = currentBookingState
         let isRequesting = appState.isRequestingBooking(for: game)
         let isCancelling = appState.isCancellingBooking(for: game)
-        let enabled = state.canBook && canBookGameByClubMembership && !currentGame.startsInPast
+        // P5B: partnered games gate the iPad CTA on a complete partner choice.
+        let enabled = state.canBook && canBookGameByClubMembership && !currentGame.startsInPast && partneredChoiceIsValid
 
         if (state.canBook || isPreparingPayment || isShowingPaymentSheet || isConfirmingPayment) && !currentGame.startsInPast {
             // "Book Your Spot • $15.00" or "Join Waitlist"
@@ -2906,6 +3149,16 @@ struct GameDetailView: View {
     }
 
     private func handlePrimaryBookingTap(state: BookingState) {
+        // P5B: partnered games must have a complete choice. The button is
+        // also disabled in this state — this is the belt-and-braces guard
+        // for any code path that bypasses the disabled check.
+        if isPartneredGame && !partneredChoiceIsValid {
+            if partnerMode == .choose && selectedPartnerUserID == nil {
+                showPartnerPicker = true
+            }
+            return
+        }
+
         if currentGame.requiresDUPR && state.canBook && canBookGameByClubMembership {
             duprIDDraft = appState.duprID ?? ""
             duprRatingText = appState.duprDoublesRating.map { String(format: "%.3f", $0) } ?? ""
@@ -2922,7 +3175,13 @@ struct GameDetailView: View {
             return
         }
 
-        Task { await appState.requestBooking(for: game) }
+        Task {
+            await appState.requestBooking(
+                for: game,
+                partnerUserID: partnerUserIDForCall,
+                allocatePartner: allocatePartnerForCall
+            )
+        }
     }
 
     private func preparePaymentSheet(fee: Double, currency: String) async {
@@ -2966,7 +3225,9 @@ struct GameDetailView: View {
             } else {
                 await appState.requestBooking(
                     for: game,
-                    creditsAppliedCents: creditsToApply > 0 ? creditsToApply : nil
+                    creditsAppliedCents: creditsToApply > 0 ? creditsToApply : nil,
+                    partnerUserID: partnerUserIDForCall,
+                    allocatePartner: allocatePartnerForCall
                 )
             }
             return
@@ -2984,7 +3245,9 @@ struct GameDetailView: View {
             do {
                 let reserved = try await appState.reservePaidBooking(
                     for: game,
-                    creditsAppliedCents: creditsToApply > 0 ? creditsToApply : nil
+                    creditsAppliedCents: creditsToApply > 0 ? creditsToApply : nil,
+                    partnerUserID: partnerUserIDForCall,
+                    allocatePartner: allocatePartnerForCall
                 )
                 if case .waitlisted = reserved.state {
                     // Game became full server-side between client check and lock acquisition.
@@ -3024,6 +3287,13 @@ struct GameDetailView: View {
                 if let club = appState.clubs.first(where: { $0.id == game.clubID }) {
                     await appState.refreshGames(for: club)
                 }
+                return
+            } catch let partnerErr as SupabaseServiceError where partnerErr.isPartneredError {
+                // P5B: surface the friendly partner-error copy from
+                // SupabaseServiceError instead of the generic "Could not
+                // reserve" message so the user knows which gate fired.
+                paymentErrorMessage = partnerErr.errorDescription
+                    ?? "Couldn't complete partnered booking."
                 return
             } catch {
                 paymentErrorMessage = "Could not reserve your spot. Please try again."
@@ -3116,7 +3386,13 @@ struct GameDetailView: View {
         if let fee = currentGame.feeAmount, fee > 0, !isGameFull {
             await preparePaymentSheet(fee: fee, currency: currentGame.feeCurrency ?? "aud")
         } else {
-            await appState.requestBooking(for: game)
+            // P5B: DUPR auto-book carries through partner params for partnered
+            // DUPR games so the partnership row is created on the same RPC call.
+            await appState.requestBooking(
+                for: game,
+                partnerUserID: partnerUserIDForCall,
+                allocatePartner: allocatePartnerForCall
+            )
         }
     }
 }
@@ -3462,5 +3738,144 @@ private struct BookingSuccessSheetContent: View {
         withAnimation(.spring(response: 0.42, dampingFraction: 0.85).delay(0.26)) {
             actionsShown = true
         }
+    }
+}
+
+// MARK: - Partner Picker Sheet (P5B)
+
+/// Lightweight partner picker presented from the `partnerChoiceSection`
+/// when the user taps "Choose partner". Renders the game's club directory
+/// (already loaded by `.task`), filtered against a search field, with DUPR
+/// status visible. The current user is excluded by the caller; this view
+/// just renders + selects.
+private struct PartnerPickerSheet: View {
+    let members: [ClubDirectoryMember]
+    let requiresDUPR: Bool
+    let preselectedID: UUID?
+    let onSelect: (ClubDirectoryMember) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var search: String = ""
+
+    private var filteredMembers: [ClubDirectoryMember] {
+        let sorted = members.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        guard !search.isEmpty else { return sorted }
+        let needle = search.lowercased()
+        return sorted.filter { $0.name.lowercased().contains(needle) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if members.isEmpty {
+                    emptyState
+                } else {
+                    List {
+                        ForEach(filteredMembers, id: \.id) { member in
+                            partnerRow(member)
+                        }
+                    }
+                    .listStyle(.plain)
+                    .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search players")
+                }
+            }
+            .navigationTitle("Select Partner")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+
+    @ViewBuilder
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "person.2.slash")
+                .font(.system(size: 36, weight: .light))
+                .foregroundStyle(Brand.secondaryText)
+            Text("No players available")
+                .font(.headline)
+                .foregroundStyle(Brand.primaryText)
+            Text("The club directory is still loading. Try again in a moment.")
+                .font(.subheadline)
+                .foregroundStyle(Brand.secondaryText)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private func partnerRow(_ member: ClubDirectoryMember) -> some View {
+        let isSelected = (preselectedID == member.id)
+        Button {
+            onSelect(member)
+            dismiss()
+        } label: {
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(AvatarGradients.resolveGradient(forKey: member.avatarColorKey))
+                    .overlay(
+                        Text(initials(member.name))
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                    )
+                    .frame(width: 38, height: 38)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(member.name)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Brand.primaryText)
+                        .lineLimit(1)
+                    duprLine(for: member)
+                }
+
+                Spacer(minLength: 0)
+
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Brand.pineTeal)
+                }
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func duprLine(for member: ClubDirectoryMember) -> some View {
+        if let dupr = member.duprRating {
+            Text("DUPR \(String(format: "%.3f", dupr))")
+                .font(.caption)
+                .foregroundStyle(Brand.mutedText)
+        } else if requiresDUPR {
+            // DUPR is required and this member has no rating — surface as
+            // a clear status line. The server is authoritative and will
+            // reject the booking with `partner_dupr_required` if the user
+            // selects them anyway; we don't disable the row to preserve
+            // discoverability ("why can't I pick them?").
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.caption2)
+                Text("No DUPR ID (required)")
+                    .font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(Brand.errorRed)
+        } else {
+            EmptyView()
+        }
+    }
+
+    private func initials(_ name: String) -> String {
+        let parts = name.split(separator: " ").prefix(2)
+        return parts.compactMap { $0.first }
+            .map { String($0).uppercased() }
+            .joined()
     }
 }
