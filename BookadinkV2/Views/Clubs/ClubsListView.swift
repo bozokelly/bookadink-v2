@@ -97,7 +97,10 @@ struct ClubsListView: View {
                                     isAdmin: appState.isClubAdmin(for: club),
                                     isOwner: appState.isClubOwner(for: club),
                                     primaryVenue: appState.clubVenuesByClubID[club.id]?.first(where: { $0.isPrimary }),
-                                    nextGame: nextUpcomingGame(for: club)
+                                    nextGame: nextUpcomingGame(for: club),
+                                    pendingJoinRequestCount: appState.isClubAdmin(for: club)
+                                        ? appState.ownerJoinRequests(for: club).count
+                                        : 0
                                 )
                             }
                             .buttonStyle(.plain)
@@ -738,6 +741,11 @@ struct ClubRowCard: View {
     var primaryVenue: ClubVenue? = nil
     /// Next upcoming game for this club.
     var nextGame: Game? = nil
+    /// Phase 2A.3: count of pending join requests for this club, surfaced as a
+    /// small red pill next to the role badge so an owner/admin can see new
+    /// requests even before opening the dashboard. Zero hides the pill.
+    /// Caller is responsible for only passing non-zero when `isAdmin == true`.
+    var pendingJoinRequestCount: Int = 0
 
     // Static formatters — created once, not per-render.
     private static let dayFormatter: DateFormatter = {
@@ -780,6 +788,20 @@ struct ClubRowCard: View {
                         .lineLimit(1)
 
                     Spacer(minLength: 0)
+
+                    if isAdmin && pendingJoinRequestCount > 0 {
+                        HStack(spacing: 4) {
+                            Image(systemName: "person.crop.circle.badge.exclamationmark.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("\(pendingJoinRequestCount) pending")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Brand.errorRed, in: Capsule())
+                        .accessibilityLabel("\(pendingJoinRequestCount) pending join request\(pendingJoinRequestCount == 1 ? "" : "s")")
+                    }
 
                     if isAdmin {
                         badgeView(title: isOwner ? "Owner" : "Admin", fill: Brand.primaryText, text: .white)

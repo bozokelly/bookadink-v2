@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var locationManager: LocationManager
     @State private var hasCompletedOnboarding: Bool = false
     @State private var splashComplete: Bool = false
 
@@ -20,7 +21,11 @@ struct RootView: View {
             Brand.pageGradient
                 .ignoresSafeArea()
 
-            if isBootstrapping {
+            if appState.isVerifyingAuthCallback {
+                AuthVerifyingStage()
+                    .transition(.opacity)
+                    .zIndex(3)
+            } else if isBootstrapping {
                 LoadingScreenView()
                     .transition(.opacity)
                     .zIndex(2)
@@ -45,8 +50,33 @@ struct RootView: View {
                 MainTabView()
                     .transition(.opacity)
                     .zIndex(1)
+                    .sheet(isPresented: Binding(
+                        get: { appState.shouldShowPushPrimer },
+                        set: { newValue in
+                            // Any dismissal — gesture, programmatic, or via CTA — locks the
+                            // primer for the rest of this session so it cannot re-fire from
+                            // other entry points (opening club chat, un-muting a club).
+                            if !newValue { appState.skipPushPermissionPrimer() }
+                        }
+                    )) {
+                        PushPermissionPrimerView()
+                            .environmentObject(appState)
+                    }
+                    .sheet(isPresented: Binding(
+                        get: { locationManager.shouldShowLocationPrimer },
+                        set: { newValue in
+                            // Any dismissal — gesture, programmatic, or via CTA — locks the
+                            // primer for the rest of this session so it cannot re-fire when
+                            // HomeView re-appears (e.g. after a sheet dismiss).
+                            if !newValue { locationManager.skipLocationPermissionPrimer() }
+                        }
+                    )) {
+                        LocationPermissionPrimerView()
+                            .environmentObject(locationManager)
+                    }
             }
         }
+        .animation(.easeInOut(duration: 0.55), value: appState.isVerifyingAuthCallback)
         .animation(.easeInOut(duration: 0.55), value: isBootstrapping)
         .animation(.easeInOut(duration: 0.55), value: appState.authState == .signedOut)
         .animation(.easeInOut(duration: 0.55), value: appState.profile == nil)
@@ -88,4 +118,38 @@ struct RootView: View {
 #Preview {
     RootView()
         .environmentObject(AppState())
+}
+
+// MARK: - Auth Verifying Stage (Phase 2A.1)
+
+/// Transient stage shown while a Supabase email-verification deep link is being
+/// consumed. Auto-dismisses when `AppState.isVerifyingAuthCallback` flips back
+/// to false (either bootstrap completes → routes naturally, or callback fails
+/// → AuthWelcomeView with the error message).
+private struct AuthVerifyingStage: View {
+    var body: some View {
+        VStack(spacing: Brand.Spacing.s20) {
+            ZStack {
+                Circle()
+                    .fill(Brand.emeraldAction.opacity(0.14))
+                    .frame(width: 84, height: 84)
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 38, weight: .semibold))
+                    .foregroundStyle(Brand.emeraldAction)
+            }
+            VStack(spacing: Brand.Spacing.s8) {
+                Text("Verified")
+                    .font(Brand.Typography.title)
+                    .foregroundStyle(Brand.primaryText)
+                Text("Setting up your account…")
+                    .font(Brand.Typography.body)
+                    .foregroundStyle(Brand.secondaryText)
+            }
+            ProgressView()
+                .tint(Brand.secondaryText)
+                .padding(.top, Brand.Spacing.s4)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Brand.appBackground.ignoresSafeArea())
+    }
 }

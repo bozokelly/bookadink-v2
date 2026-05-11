@@ -4,13 +4,30 @@ import os
 import UIKit
 import UserNotifications
 
-/// The result of a successful cancellation credit issued to a user.
-/// Published by `cancelBooking` when the server confirms a credit was issued.
+/// The result of a booking cancellation, published by `cancelBooking` whenever a
+/// cancel call completes successfully — regardless of whether credit was issued.
+/// Drives the post-cancellation half-sheet (`CancellationResultSheet`) which
+/// branches on these signals to render the correct outcome copy:
+///   - `gameWasFree == true`     → "Free game cancelled. No credit applies."
+///   - `creditedCents > 0`       → "Credit issued at {club}: $X.XX"
+///   - `wasEligible == false`    → "If a replacement books your spot, we'll credit you."
+///   - (managed policy fallback) → "Booking cancelled."
+/// Club-managed-policy clubs (looked up by `clubID` at render time) bypass all
+/// of the above and show off-platform-refund copy.
 struct CancellationCreditResult: Equatable {
     let clubID: UUID
     let clubName: String?
     let creditedCents: Int
     let newBalanceCents: Int
+    /// From the server's `cancel_booking_with_credit` return — `true` when the
+    /// cancellation was outside the cutoff window (immediately eligible). When
+    /// `false`, the user is inside the cutoff and may still receive credit
+    /// later if a replacement player confirms (deferred-credit trigger).
+    let wasEligible: Bool
+    /// Derived client-side from `game.feeAmount` at cancel time. `true` for any
+    /// game with no fee (free play / admin-comped). Credit is never issued on
+    /// free games regardless of cutoff or replacement.
+    let gameWasFree: Bool
 }
 
 /// Routes that may be pushed onto the Clubs-tab `NavigationStack`.
@@ -50,6 +67,13 @@ final class AppState: ObservableObject {
     /// Mutated only via `navigate(to:)` so push de-duplication is centralised.
     @Published var clubsNavPath: [AppRoute] = []
     @Published var authState: AuthState = .signedOut
+    /// Phase 2A.1: true while a Supabase email-verification deep link is being
+    /// consumed (verify OTP → apply session → post-auth bootstrap). RootView
+    /// renders a transient "Verified, continuing…" stage so the user never sees
+    /// a stale signed-out screen between tapping the email link and landing
+    /// in the app. Auto-flips back to false when the work completes (success
+    /// or failure).
+    @Published var isVerifyingAuthCallback: Bool = false
     @Published var authUserID: UUID? = nil
     @Published var authEmail: String? = nil
     @Published var authAccessToken: String? = nil
@@ -137,6 +161,21 @@ final class AppState: ObservableObject {
     @Published var isLoadingNotifications = false
     @Published var isLoadingBookings = false
     @Published var bookingsErrorMessage: String? = nil
+    /// Drives the soft-ask push permission primer (Phase 1.2). True when the system status is
+    /// `.notDetermined` and we have not yet shown the primer this session. The primer view
+    /// (`PushPermissionPrimerView`) presents itself via this flag and calls
+    /// `confirmPushPermissionFromPrimer()` (system prompt) or `skipPushPermissionPrimer()`.
+    /// We never set this to true if the user has skipped during the same app session.
+    @Published var shouldShowPushPrimer: Bool = false
+    /// Session-only lock — flipped true on Skip / dismiss. Prevents the primer from
+    /// re-appearing within the same launch even if `prepareClubChatPushNotificationsIfNeeded`
+    /// is called again (e.g. user opens club chat or un-mutes a club).
+    private var pushPrimerDismissedThisSession: Bool = false
+    /// Set to a game's id when a booking attempt failed because the user has no valid DUPR ID
+    /// (either the client pre-flight in `requestBooking` or the server `book_game` 'dupr_required'
+    /// error). Views observe this to surface an in-flow recovery sheet instead of the dead-end
+    /// banner. Cleared at the start of every fresh `requestBooking` and via `clearBookingDUPRRequired`.
+    @Published var bookingDUPRRequiredForGameID: UUID? = nil
     // Stripe Connect
     @Published var isCreatingConnectOnboarding = false
     @Published var connectOnboardingError: String? = nil
@@ -779,6 +818,13 @@ final class AppState: ObservableObject {
         scheduleStore.isExportingCalendar(for: game)
     }
 
+    /// Clears the in-flow DUPR recovery signal once a view has presented its recovery sheet.
+    /// Called by `GameDetailView` after `bookingDUPRRequiredForGameID` triggers the sheet so
+    /// the flag does not refire on the next view re-render.
+    func clearBookingDUPRRequired() {
+        bookingDUPRRequiredForGameID = nil
+    }
+
     func saveCurrentUserDUPRID(_ raw: String) -> String? {
         guard let userID = authUserID else { return "Sign in to save your DUPR ID." }
         let normalized = normalizeDUPRID(raw)
@@ -1361,6 +1407,29 @@ final class AppState: ObservableObject {
         case .authorized, .provisional, .ephemeral:
             UIApplication.shared.registerForRemoteNotifications()
         case .notDetermined:
+            // Phase 1.2: defer the cold system permission prompt. Show the soft-ask primer
+            // (`PushPermissionPrimerView`) via `shouldShowPushPrimer`. The primer's CTA calls
+            // `confirmPushPermissionFromPrimer()` which fires the actual system prompt.
+            // If the user has already skipped within this session, do not re-show.
+            if !pushPrimerDismissedThisSession {
+                shouldShowPushPrimer = true
+            }
+        case .denied:
+            remotePushRegistrationErrorMessage = "Notifications are disabled. Enable them in Settings to receive chat alerts."
+        @unknown default:
+            remotePushRegistrationErrorMessage = "Notification permissions are unavailable."
+        }
+    }
+
+    /// Called by `PushPermissionPrimerView` when the user taps the primary CTA.
+    /// Triggers the iOS system permission prompt (the call we deferred from
+    /// `prepareClubChatPushNotificationsIfNeeded`) and registers for remote notifications
+    /// if granted. Idempotent against late status changes.
+    func confirmPushPermissionFromPrimer() async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await loadNotificationSettings(center)
+        switch settings.authorizationStatus {
+        case .notDetermined:
             do {
                 let granted = try await requestNotificationAuthorization(center)
                 guard granted else {
@@ -1371,11 +1440,22 @@ final class AppState: ObservableObject {
             } catch {
                 remotePushRegistrationErrorMessage = error.localizedDescription
             }
+        case .authorized, .provisional, .ephemeral:
+            UIApplication.shared.registerForRemoteNotifications()
         case .denied:
-            remotePushRegistrationErrorMessage = "Notifications are disabled. Enable them in Settings to receive chat alerts."
+            // Already denied at the system level — no cold prompt; existing flow.
+            break
         @unknown default:
-            remotePushRegistrationErrorMessage = "Notification permissions are unavailable."
+            break
         }
+    }
+
+    /// Called when the user taps Skip / dismisses the primer. Locks the primer for the
+    /// rest of this app session so it does not re-appear if `prepareClubChatPushNotificationsIfNeeded`
+    /// is called again from another path (e.g. opening club chat).
+    func skipPushPermissionPrimer() {
+        pushPrimerDismissedThisSession = true
+        shouldShowPushPrimer = false
     }
 
     /// Idempotent re-registration for APNs. Does NOT prompt the user — only fires
@@ -1448,6 +1528,16 @@ final class AppState: ObservableObject {
 
     func handleDeepLink(_ url: URL) {
         guard let link = DeepLink(url: url) else { return }
+
+        // Phase 2A.1: auth callback runs BEFORE the signed-in gate — it IS the
+        // path that signs the user in. Buffer-and-replay (the standard
+        // pendingDeepLink pattern below) would never fire because the link is
+        // self-consuming.
+        if case .authCallback(let callback) = link {
+            Task { await handleAuthCallback(callback) }
+            return
+        }
+
         // If not yet authenticated, store and re-fire after sign-in
         guard authState == .signedIn else {
             pendingDeepLink = link
@@ -1462,6 +1552,43 @@ final class AppState: ObservableObject {
             return
         }
         pendingDeepLink = link
+    }
+
+    /// Consumes a Supabase email-verification (or password-recovery) callback and
+    /// drives the post-auth bootstrap. Three input variants are handled:
+    ///   - `.tokenHash`  — modern Supabase OTP verify flow → calls `verifyEmailOTP`.
+    ///   - `.session`    — implicit/legacy token grant → calls `refreshSession`
+    ///                     with the embedded refresh token to fetch a server-fresh
+    ///                     user record (avoids parsing the access token JWT client-side).
+    ///   - `.failure`    — surfaces a recoverable error on the auth welcome screen.
+    ///
+    /// On success the user lands in the normal route — Profile setup if first-run,
+    /// MainTabView otherwise — exactly the same as a manual sign-in.
+    func handleAuthCallback(_ callback: AuthCallback) async {
+        isVerifyingAuthCallback = true
+        authErrorMessage = nil
+        authInfoMessage = nil
+        defer { isVerifyingAuthCallback = false }
+
+        do {
+            let session: AuthSessionInfo
+            switch callback {
+            case .tokenHash(let hash, let type):
+                session = try await dataProvider.verifyEmailOTP(tokenHash: hash, type: type)
+            case .session(_, let refresh):
+                // Tokens were delivered directly in the URL. Calling refreshSession
+                // gives us a server-fresh session (user_id, email) without trusting
+                // an unvalidated JWT payload and locks in a brand-new refresh token.
+                session = try await dataProvider.refreshSession(refreshToken: refresh)
+            case .failure(let message):
+                authErrorMessage = message
+                return
+            }
+            applyAuthFlowResult(.signedIn(session))
+            await postAuthenticationBootstrap()
+        } catch {
+            authErrorMessage = AppCopy.friendlyError(error.localizedDescription)
+        }
     }
 
     /// Idempotent push onto the Clubs-tab navigation stack.
@@ -1633,6 +1760,32 @@ final class AppState: ObservableObject {
 
     func ownerJoinRequests(for club: Club) -> [ClubJoinRequest] {
         ownerJoinRequestsByClubID[club.id] ?? []
+    }
+
+    /// Total pending join-request count across every club the current user owns
+    /// or admins. Drives the Clubs-tab badge in `MainTabView` and serves as the
+    /// missed-push fallback (cache is populated proactively on
+    /// `postAuthenticationBootstrap` and every `scenePhase == .active` foreground).
+    /// Returns 0 for member-only users — their `ownerJoinRequestsByClubID` cache
+    /// stays empty.
+    var totalPendingJoinRequestCount: Int {
+        ownerJoinRequestsByClubID.values.reduce(0) { $0 + $1.count }
+    }
+
+    /// Phase 2A.3 fan-out: refreshes pending join-request counts for every club
+    /// the current user owns or admins. Used by `postAuthenticationBootstrap`
+    /// and the `scenePhase == .active` foreground hook so the Clubs-tab badge
+    /// stays accurate even when an APNs push didn't land. Skipped for member
+    /// users (no admin clubs → empty loop). Bounded by the user's owned/admin
+    /// club count — typically 1-5 — so the parallel fetch is cheap.
+    func refreshOwnerJoinRequestsForAllAdminClubs() async {
+        let adminClubs = clubs.filter { isClubAdmin(for: $0) }
+        guard !adminClubs.isEmpty else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for club in adminClubs {
+                group.addTask { await self.refreshOwnerJoinRequests(for: club) }
+            }
+        }
     }
 
     func isLoadingOwnerJoinRequests(for club: Club) -> Bool {
@@ -2029,6 +2182,41 @@ final class AppState: ObservableObject {
         } catch {
             connectOnboardingError = error.localizedDescription
             return nil
+        }
+    }
+
+    /// Throttle for the foreground "catch-up" refresh of Stripe Connect status across
+    /// known incomplete accounts. Reset by `refreshIncompleteStripeAccountsIfNeeded`
+    /// each time it fires; subsequent foreground events within the window are ignored.
+    private var lastStripeForegroundRefresh: Date? = nil
+
+    /// Foreground catch-up: refresh Stripe Connect status for every club currently in the
+    /// in-memory cache that is **not** fully ready. Called from `BookADinkApp` on
+    /// `scenePhase == .active` so an owner who returned from Safari without the deep link
+    /// (or whose status changed while the app was backgrounded) sees fresh state.
+    ///
+    /// Invariants:
+    /// - Only clubs already in `stripeAccountByClubID` are inspected; non-owner / member
+    ///   users have an empty cache and trigger zero requests.
+    /// - Clubs with `onboardingComplete && payoutsEnabled` are skipped.
+    /// - Throttled by `lastStripeForegroundRefresh` so rapid bg/fg bounces (Control Centre,
+    ///   app switcher) do not spam the backend.
+    /// - Reuses the canonical `refreshStripeAccountStatus(for:)` path; deep-link return
+    ///   and manual "Check Status" taps are unaffected.
+    func refreshIncompleteStripeAccountsIfNeeded() async {
+        let candidates: [UUID] = stripeAccountByClubID.compactMap { clubID, account in
+            (account.onboardingComplete && account.payoutsEnabled) ? nil : clubID
+        }
+        guard !candidates.isEmpty else { return }
+
+        let now = Date()
+        if let last = lastStripeForegroundRefresh, now.timeIntervalSince(last) < 30 {
+            return
+        }
+        lastStripeForegroundRefresh = now
+
+        for clubID in candidates {
+            await refreshStripeAccountStatus(for: clubID)
         }
     }
 
@@ -2759,11 +2947,7 @@ final class AppState: ObservableObject {
             await refreshGames(for: club)
             return true
         } catch {
-            if let sub = subscriptionsByClubID[club.id], sub.isPastDue {
-                ownerToolsErrorMessage = "Your subscription payment failed. Update your payment method in Plan & Billing to restore access."
-            } else {
-                ownerToolsErrorMessage = error.localizedDescription
-            }
+            ownerToolsErrorMessage = error.localizedDescription
             return false
         }
     }
@@ -3318,6 +3502,7 @@ final class AppState: ObservableObject {
     func requestBooking(for game: Game, stripePaymentIntentID: String? = nil, platformFeeCents: Int? = nil, clubPayoutCents: Int? = nil, creditsAppliedCents: Int? = nil) async {
         bookingsErrorMessage = nil
         bookingInfoMessage = nil
+        bookingDUPRRequiredForGameID = nil
         guard !game.startsInPast else {
             bookingsErrorMessage = "This game has already taken place."
             return
@@ -3352,10 +3537,12 @@ final class AppState: ObservableObject {
             let currentDUPRID = normalizeDUPRID(duprID ?? "")
             guard !currentDUPRID.isEmpty else {
                 bookingsErrorMessage = "Add and confirm your DUPR ID before booking this game."
+                bookingDUPRRequiredForGameID = game.id
                 return
             }
             guard isLikelyDUPRID(currentDUPRID) else {
                 bookingsErrorMessage = "Update your DUPR ID before booking this game."
+                bookingDUPRRequiredForGameID = game.id
                 return
             }
         }
@@ -3492,6 +3679,7 @@ final class AppState: ObservableObject {
                     : "You must be an approved club member to book this game."
             case .duprRequired:
                 bookingsErrorMessage = "Add and confirm your DUPR ID before booking this game."
+                bookingDUPRRequiredForGameID = game.id
             case .notYetPublished:
                 bookingsErrorMessage = "This game isn't open for bookings yet."
                 if let club = clubs.first(where: { $0.id == game.clubID }) {
@@ -3573,15 +3761,20 @@ final class AppState: ObservableObject {
             // Apply server-returned credit result — no fetch required.
             let clubID = game.clubID
             creditBalanceByClubID[clubID] = result.newBalanceCents
-            if result.creditIssuedCents > 0 {
-                let clubName = clubs.first(where: { $0.id == clubID })?.name
-                lastCancellationCredit = CancellationCreditResult(
-                    clubID: clubID,
-                    clubName: clubName,
-                    creditedCents: result.creditIssuedCents,
-                    newBalanceCents: result.newBalanceCents
-                )
-            }
+            // Phase 2A.2: publish for EVERY cancellation, not just credit > 0.
+            // The result sheet handles outcome branching (free / club-managed /
+            // credit issued / pending replacement) so the user always lands on
+            // an explanatory screen instead of a silent toast.
+            let clubName = clubs.first(where: { $0.id == clubID })?.name
+            let gameWasFree = (game.feeAmount ?? 0) <= 0
+            lastCancellationCredit = CancellationCreditResult(
+                clubID: clubID,
+                clubName: clubName,
+                creditedCents: result.creditIssuedCents,
+                newBalanceCents: result.newBalanceCents,
+                wasEligible: result.wasEligible,
+                gameWasFree: gameWasFree
+            )
 
             bookingInfoMessage = "Booking cancelled."
 
@@ -3860,7 +4053,7 @@ final class AppState: ObservableObject {
             persistSession()
         case let .requiresEmailConfirmation(email):
             authState = .signedOut
-            authInfoMessage = "Check \(email) to confirm your account, then sign in."
+            authInfoMessage = "We sent a verification link to \(email). Open it from your email to continue — the app will take it from there."
         }
     }
 
@@ -3874,6 +4067,11 @@ final class AppState: ObservableObject {
         await refreshBookings(silent: true)
         await refreshUpcomingGames()
         await refreshNotifications()
+        // Phase 2A.3: pre-populate the pending join-request cache so the Clubs
+        // tab badge is accurate from the moment the user lands in the app.
+        // Depends on refreshClubs + refreshMemberships having populated the
+        // owner/admin role cache first.
+        await refreshOwnerJoinRequestsForAllAdminClubs()
         await prepareClubChatPushNotificationsIfNeeded()
         // Flush any push token that arrived before auth was ready (common on first launch / session restore).
         await flushPendingPushTokenIfNeeded()

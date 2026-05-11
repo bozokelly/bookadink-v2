@@ -15,8 +15,24 @@ struct GameDetailView: View {
     @State private var duprRatingText = ""
     @State private var duprBookingConfirmed = false
     @State private var duprSheetErrorMessage: String? = nil
+
+    // In-flow DUPR recovery sheet — fires when AppState signals a booking attempt
+    // failed because the user lacks a valid DUPR ID. Distinct from the proactive
+    // duprBookingSheet above (which captures DUPR ID + rating + a confirmation
+    // toggle and auto-books). This recovery sheet is intentionally minimal:
+    // a single field, server-min length validation, no auto-book — the user
+    // taps Book again so the server-authoritative path runs unchanged.
+    @State private var showDUPRRecoverySheet = false
+    @State private var duprRecoveryDraft = ""
+    @State private var duprRecoveryError: String? = nil
+    @State private var isSavingDUPRRecovery = false
     @State private var isPlayersExpanded = false
     @State private var showCancelGameConfirmation = false
+    /// Phase 2A.2: secondary confirmation before firing `appState.cancelBooking`.
+    /// Both player-side Cancel CTAs in this view route through this flag instead
+    /// of calling cancel directly — matches the existing pattern used by
+    /// `BookingsListView` and the admin "Cancel this game?" dialog above.
+    @State private var showCancelBookingConfirmation = false
 
     // Stripe PaymentSheet
     @State private var paymentSheet: PaymentSheet = PaymentSheet(paymentIntentClientSecret: "", configuration: .init())
@@ -382,6 +398,15 @@ struct GameDetailView: View {
             updateHoldCountdown()
         }
         .sheet(isPresented: $showDUPRBookingSheet) { duprBookingSheet }
+        .sheet(isPresented: $showDUPRRecoverySheet) { duprRecoverySheet }
+        .onChange(of: appState.bookingDUPRRequiredForGameID) { _, newValue in
+            guard newValue == currentGame.id else { return }
+            duprRecoveryDraft = appState.duprID ?? ""
+            duprRecoveryError = nil
+            showDUPRRecoverySheet = true
+            // Clear immediately so re-renders / scenePhase changes don't refire the sheet.
+            appState.clearBookingDUPRRequired()
+        }
         .sheet(isPresented: $isEditingGame) {
             if let club = clubForGame {
                 OwnerEditGameSheet(club: club, game: currentGame, initialVenues: appState.venues(for: club))
@@ -406,6 +431,18 @@ struct GameDetailView: View {
             } else {
                 Text("Get directions to this game's venue.")
             }
+        }
+        .confirmationDialog(
+            "Cancel Booking",
+            isPresented: $showCancelBookingConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Cancel Booking", role: .destructive) {
+                Task { await appState.cancelBooking(for: game) }
+            }
+            Button("Keep Booking", role: .cancel) {}
+        } message: {
+            Text("This will remove you from \(currentGame.title). You may not be able to rebook if the session fills up.")
         }
         .confirmationDialog(
             "Cancel this game?",
@@ -671,7 +708,7 @@ struct GameDetailView: View {
                     }
                     Divider()
                     Button(role: .destructive) {
-                        Task { await appState.cancelBooking(for: game) }
+                        showCancelBookingConfirmation = true
                     } label: {
                         Label(isCancelling ? "Cancelling…" : "Cancel Booking", systemImage: "xmark.circle")
                     }
@@ -1184,8 +1221,8 @@ struct GameDetailView: View {
             adminPlayersSection
         }
 
-        if let policy = clubForGame?.cancellationPolicy, !policy.isEmpty {
-            clubCancellationPolicyCard(policy: policy)
+        if let club = clubForGame {
+            clubCancellationPolicyCard(club: club)
         }
 
         if let fee = currentGame.feeAmount, fee > 0 {
@@ -1861,7 +1898,7 @@ struct GameDetailView: View {
                     Divider()
 
                     Button(role: .destructive) {
-                        Task { await appState.cancelBooking(for: game) }
+                        showCancelBookingConfirmation = true
                     } label: {
                         Label(
                             isCancelling ? "Cancelling…" : "Cancel Booking",
@@ -2445,8 +2482,22 @@ struct GameDetailView: View {
         .shadow(color: .black.opacity(0.03), radius: 4, y: 1)
     }
 
+    /// Body text shown inside the expandable "Club Cancellation Policy" card.
+    /// Display-only — the actual refund eligibility is decided server-side by
+    /// `cancel_booking_with_credit` and the deferred-credit trigger.
+    private func cancellationPolicyBody(for club: Club) -> String {
+        switch club.cancellationPolicyType {
+        case .managed:
+            return "Cancel at least \(club.cancellationCutoffHours) hours before the game to receive club credit. If you cancel after that, you’ll only receive credit if your spot is filled by another confirmed paid player."
+        case .clubManaged:
+            let manual = (club.cancellationPolicy ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !manual.isEmpty { return manual }
+            return "This club manages cancellations manually. Please contact the club for their cancellation policy."
+        }
+    }
+
     @ViewBuilder
-    private func clubCancellationPolicyCard(policy: String) -> some View {
+    private func clubCancellationPolicyCard(club: Club) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -2471,7 +2522,7 @@ struct GameDetailView: View {
             if cancellationPolicyExpanded {
                 Divider()
                     .padding(.horizontal, 16)
-                Text(policy)
+                Text(cancellationPolicyBody(for: club))
                     .font(.system(size: 14))
                     .foregroundStyle(Brand.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2488,87 +2539,19 @@ struct GameDetailView: View {
 
     // MARK: - Cancellation Credit Sheet
 
+    /// Routes through the shared `CancellationResultSheet` so the user sees the
+    /// same explanatory copy regardless of where the cancellation originated
+    /// (this view OR `BookingsListView`). Outcome branching lives in the shared
+    /// view, not here.
+    @ViewBuilder
     private var cancellationCreditSheet: some View {
-        VStack(spacing: 0) {
-            Spacer()
-            VStack(spacing: 24) {
-                // Icon
-                ZStack {
-                    Circle()
-                        .fill(Brand.slateBlue.opacity(0.12))
-                        .frame(width: 72, height: 72)
-                    Image(systemName: "creditcard.fill")
-                        .font(.system(size: 30, weight: .medium))
-                        .foregroundStyle(Brand.slateBlue)
-                }
-
-                VStack(spacing: 8) {
-                    Text("Booking Cancelled")
-                        .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(Brand.primaryText)
-
-                    if let result = displayedCancellationCredit {
-                        let clubName = result.clubName ?? "this club"
-                        let credited = String(format: "$%.2f", Double(result.creditedCents) / 100)
-                        let newBal   = String(format: "$%.2f", Double(result.newBalanceCents) / 100)
-
-                        Text("\(credited) credit added at \(clubName)")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(Brand.slateBlue)
-                            .multilineTextAlignment(.center)
-
-                        Text("Your credit balance at \(clubName) is now **\(newBal)**. Credits can only be used at the club that issued them.")
-                            .font(.system(size: 14))
-                            .foregroundStyle(Brand.secondaryText)
-                            .multilineTextAlignment(.center)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .padding(.horizontal, 24)
-
-                // New balance pill
-                if let result = displayedCancellationCredit {
-                    HStack(spacing: 10) {
-                        Image(systemName: "creditcard.fill")
-                            .font(.system(size: 14))
-                            .foregroundStyle(Brand.slateBlue)
-                        Text("Balance: \(String(format: "$%.2f", Double(result.newBalanceCents) / 100))")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(Brand.primaryText)
-                        if let name = result.clubName {
-                            Text("· \(name)")
-                                .font(.system(size: 13))
-                                .foregroundStyle(Brand.secondaryText)
-                                .lineLimit(1)
-                        }
-                        Spacer()
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
-                    .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Brand.softOutline, lineWidth: 1))
-                    .padding(.horizontal, 24)
-                }
-
-                Button {
-                    showCancellationCreditSheet = false
-                } label: {
-                    Text("Got it")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(Brand.slateBlue, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                }
-                .padding(.horizontal, 24)
-            }
-            .padding(.vertical, 40)
-            .background(Brand.appBackground)
-            Spacer()
+        if let result = displayedCancellationCredit {
+            CancellationResultSheet(
+                result: result,
+                club: appState.clubs.first(where: { $0.id == result.clubID }),
+                onDismiss: { showCancellationCreditSheet = false }
+            )
         }
-        .presentationDetents([.medium])
-        .presentationDragIndicator(.visible)
-        .background(Brand.appBackground.ignoresSafeArea())
     }
 
     // MARK: - DUPR Booking Sheet
@@ -2653,6 +2636,110 @@ struct GameDetailView: View {
                 duprSheetErrorMessage = nil
             }
         }
+    }
+
+    // MARK: - DUPR Recovery Sheet
+
+    /// In-flow recovery sheet shown when a booking attempt failed because the
+    /// user lacks a valid DUPR ID. Single-field, server-min length validation,
+    /// no auto-book — the user dismisses, then re-taps Book so the
+    /// server-authoritative `book_game` gate runs unchanged.
+    private var duprRecoverySheet: some View {
+        NavigationStack {
+            VStack(spacing: Brand.Spacing.s24) {
+                ZStack {
+                    Circle()
+                        .fill(Brand.pineTeal.opacity(0.12))
+                        .frame(width: 72, height: 72)
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 32, weight: .medium))
+                        .foregroundStyle(Brand.pineTeal)
+                }
+                .padding(.top, Brand.Spacing.s8)
+
+                VStack(spacing: Brand.Spacing.s8) {
+                    Text("DUPR ID required")
+                        .font(Brand.Typography.title)
+                        .foregroundStyle(Brand.primaryText)
+                    Text("This game requires a DUPR ID. Add yours to book — you can update it any time in your profile.")
+                        .font(Brand.Typography.body)
+                        .foregroundStyle(Brand.secondaryText)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: Brand.Spacing.s8) {
+                    Text("DUPR ID")
+                        .font(Brand.Typography.caption)
+                        .foregroundStyle(Brand.secondaryText)
+                    HStack(spacing: Brand.Spacing.s12) {
+                        Image(systemName: "person.text.rectangle")
+                            .foregroundStyle(Brand.pineTeal)
+                        TextField("e.g. XKXR74", text: $duprRecoveryDraft)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                            .submitLabel(.done)
+                            .onSubmit {
+                                guard isDUPRRecoveryValid && !isSavingDUPRRecovery else { return }
+                                Task { await saveDUPRRecovery() }
+                            }
+                    }
+                    .padding(Brand.Spacing.s12)
+                    .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: Brand.Radius.r14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Brand.Radius.r14, style: .continuous)
+                            .strokeBorder(Brand.softOutline, lineWidth: 1)
+                    )
+                    if let error = duprRecoveryError, !error.isEmpty {
+                        HStack(spacing: Brand.Spacing.s4) {
+                            Image(systemName: "exclamationmark.circle")
+                            Text(error)
+                        }
+                        .font(.footnote)
+                        .foregroundStyle(Brand.errorRed)
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                OnboardingPrimaryButton(
+                    "Save DUPR ID",
+                    isLoading: isSavingDUPRRecovery,
+                    isDisabled: !isDUPRRecoveryValid
+                ) {
+                    Task { await saveDUPRRecovery() }
+                }
+            }
+            .onboardingContentShell()
+            .navigationTitle("DUPR ID")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { showDUPRRecoverySheet = false }
+                }
+            }
+        }
+        .presentationDetents([.height(420)])
+        .onboardingSheetShell()
+    }
+
+    private var isDUPRRecoveryValid: Bool {
+        duprRecoveryDraft.trimmingCharacters(in: .whitespacesAndNewlines).count >= 6
+    }
+
+    private func saveDUPRRecovery() async {
+        guard isDUPRRecoveryValid else { return }
+        isSavingDUPRRecovery = true
+        defer { isSavingDUPRRecovery = false }
+        let trimmed = duprRecoveryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let error = appState.saveCurrentUserDUPRID(trimmed) {
+            duprRecoveryError = error
+            return
+        }
+        duprRecoveryError = nil
+        // Clear the dead-end banner so the user can retry Book without stale guidance.
+        appState.bookingsErrorMessage = nil
+        showDUPRRecoverySheet = false
     }
 
     // MARK: - Helper Functions

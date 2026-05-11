@@ -163,6 +163,9 @@ struct NotificationsView: View {
         case .connectReturn:
             // Not a notification destination — connect return is only triggered by URL scheme.
             return nil
+        case .authCallback:
+            // Not a notification destination — auth callback is only triggered by URL scheme.
+            return nil
         }
     }
 

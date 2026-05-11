@@ -89,6 +89,47 @@ enum Brand {
     static let sportStatement = Color(hex: "1B1A17")   // dark statement surface (hero card)
     static let sportWarn      = Color(hex: "C44545")   // destructive / paused state
     static let sportCream     = Color(hex: "F4F1EA")   // text on dark sport surfaces
+
+    // ── Onboarding tokens (Phase 1.4) ─────────────────────────────────────────
+    // Scoped to onboarding-adjacent surfaces (push/location primers, DUPR recovery).
+    // Legacy screens keep their existing inline values until a future refactor.
+
+    /// Vertical / horizontal spacing scale used by onboarding shells, primer cards, button stacks.
+    enum Spacing {
+        static let s4: CGFloat = 4
+        static let s8: CGFloat = 8
+        static let s12: CGFloat = 12
+        static let s16: CGFloat = 16
+        static let s20: CGFloat = 20
+        static let s24: CGFloat = 24
+        static let s32: CGFloat = 32
+        static let s48: CGFloat = 48
+    }
+
+    /// Corner-radius scale used by onboarding shells, primer cards, fields, and CTAs.
+    enum Radius {
+        static let r10: CGFloat = 10
+        static let r14: CGFloat = 14
+        static let r18: CGFloat = 18
+        static let r24: CGFloat = 24
+        static let r28: CGFloat = 28
+    }
+
+    /// Font helpers for onboarding-adjacent surfaces. Wrap `Font.system(...)` so a future
+    /// switch to a custom font is a single-file change. Keep semantic names — call sites
+    /// should never reference raw point sizes.
+    enum Typography {
+        /// Hero / display headline. Reserved for celebratory moments and landing screens.
+        static var display: Font { .title.weight(.bold) }
+        /// Primary CTA / strong button label.
+        static var headline: Font { .headline }
+        /// Sheet / step title.
+        static var title: Font { .title3.weight(.semibold) }
+        /// Body copy and bullet rows.
+        static var body: Font { .subheadline }
+        /// Small labels, field captions, secondary CTA text.
+        static var caption: Font { .footnote.weight(.semibold) }
+    }
 }
 
 enum AppCopy {

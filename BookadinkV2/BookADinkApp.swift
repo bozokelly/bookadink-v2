@@ -277,6 +277,18 @@ struct BookADinkApp: App {
                             for clubID in appState.entitlementsByClubID.keys {
                                 await appState.fetchClubEntitlements(for: clubID)
                             }
+                            // Phase 1.5: catch up on Stripe Connect status when an owner
+                            // returns from the Stripe-hosted flow without a deep link
+                            // (or status changed while backgrounded). Throttled internally
+                            // and skips clubs already onboardingComplete + payoutsEnabled,
+                            // so Control Centre / app-switcher bounces do not spam.
+                            await appState.refreshIncompleteStripeAccountsIfNeeded()
+                            // Phase 2A.3: missed-push fallback — refresh pending join
+                            // requests for every owned/admin club so the Clubs-tab badge
+                            // reflects new requests even when a push was missed (DND,
+                            // backgrounded too long, stale token, etc.). Bounded fan-out
+                            // over the user's admin clubs; no-op for member users.
+                            await appState.refreshOwnerJoinRequestsForAllAdminClubs()
                             // Re-fire APNs registration on every foreground when authenticated +
                             // already authorized. Idempotent — Apple returns the same token if
                             // unchanged. This guarantees iPad / second-device tokens land in

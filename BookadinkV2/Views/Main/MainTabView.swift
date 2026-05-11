@@ -93,6 +93,10 @@ struct MainTabView: View {
 
             destinationView(for: .clubs)
                 .tabItem { Label("Clubs", systemImage: "building.2") }
+                // Phase 2A.3: pending join-request count across all owned/admin
+                // clubs. Zero for member-only users. Missed-push fallback —
+                // refreshed on bootstrap + every scenePhase active.
+                .badge(appState.totalPendingJoinRequestCount > 0 ? appState.totalPendingJoinRequestCount : 0)
                 .tag(AppTab.clubs)
 
             destinationView(for: .bookings)

@@ -8,6 +8,12 @@ struct BookingsListView: View {
     @State private var selectedGame: Game? = nil
     @State private var localUpcomingBookings: [BookingWithGame] = []
     @State private var removingBookingIDs: Set<UUID> = []
+    /// Phase 2A.2: mirror of GameDetailView — when AppState publishes a
+    /// cancellation result, capture it locally and present the half-sheet so
+    /// users cancelling from this list see the same outcome explanation they
+    /// would see if they'd cancelled from GameDetailView.
+    @State private var showCancellationResultSheet = false
+    @State private var displayedCancellationResult: CancellationCreditResult? = nil
 
     // MARK: - Filtered Lists
 
@@ -159,8 +165,24 @@ struct BookingsListView: View {
             }
         }
         .onChange(of: appState.lastCancellationCredit) { _, result in
-            guard let clubID = result?.clubID else { return }
-            Task { await appState.refreshCreditBalance(for: clubID) }
+            guard let result else { return }
+            // Refresh the credit balance for the affected club, then present the
+            // outcome sheet. AppState's value is consumed (set back to nil) so
+            // only the first observer to fire wins — preventing dual-presentation
+            // when both BookingsListView and an active GameDetailView observe.
+            Task { await appState.refreshCreditBalance(for: result.clubID) }
+            displayedCancellationResult = result
+            showCancellationResultSheet = true
+            appState.lastCancellationCredit = nil
+        }
+        .sheet(isPresented: $showCancellationResultSheet) {
+            if let result = displayedCancellationResult {
+                CancellationResultSheet(
+                    result: result,
+                    club: appState.clubs.first(where: { $0.id == result.clubID }),
+                    onDismiss: { showCancellationResultSheet = false }
+                )
+            }
         }
     }
 
@@ -508,5 +530,167 @@ private struct BookingCompactCard: View {
             topTrailingRadius: 0,
             style: .continuous
         ))
+    }
+}
+
+// MARK: - Cancellation Result Sheet (Phase 2A.2)
+
+/// Post-cancellation half-sheet that surfaces the credit/refund outcome.
+/// Renders one of four states depending on the published `CancellationCreditResult`:
+///   - Free game             → no credit ever applies.
+///   - Club-managed policy   → refunds handled off-platform.
+///   - Credit issued         → exact amount and new club balance.
+///   - Inside cutoff, no credit yet → eligible if a replacement player books.
+///
+/// Used by both `BookingsListView` and `GameDetailView` to keep the user-facing
+/// explanation identical regardless of where the cancellation originates.
+struct CancellationResultSheet: View {
+    let result: CancellationCreditResult
+    let club: Club?
+    let onDismiss: () -> Void
+
+    private enum Outcome {
+        case freeGame
+        case clubManaged
+        case creditIssued
+        case pendingReplacement
+        case cancelled
+    }
+
+    private var outcome: Outcome {
+        if result.gameWasFree { return .freeGame }
+        if club?.cancellationPolicyType == .clubManaged { return .clubManaged }
+        if result.creditedCents > 0 { return .creditIssued }
+        if !result.wasEligible { return .pendingReplacement }
+        return .cancelled
+    }
+
+    private var iconName: String {
+        switch outcome {
+        case .freeGame:            return "checkmark.circle.fill"
+        case .clubManaged:         return "envelope.fill"
+        case .creditIssued:        return "creditcard.fill"
+        case .pendingReplacement:  return "clock.badge.checkmark.fill"
+        case .cancelled:           return "checkmark.circle.fill"
+        }
+    }
+
+    private var iconColor: Color {
+        switch outcome {
+        case .creditIssued:        return Brand.slateBlue
+        case .pendingReplacement:  return Brand.softOrangeAccent
+        default:                   return Brand.emeraldAction
+        }
+    }
+
+    private var clubLabel: String { result.clubName ?? club?.name ?? "this club" }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer()
+            VStack(spacing: 24) {
+                ZStack {
+                    Circle()
+                        .fill(iconColor.opacity(0.14))
+                        .frame(width: 72, height: 72)
+                    Image(systemName: iconName)
+                        .font(.system(size: 30, weight: .medium))
+                        .foregroundStyle(iconColor)
+                }
+
+                VStack(spacing: 8) {
+                    Text("Booking Cancelled")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(Brand.primaryText)
+
+                    Group {
+                        switch outcome {
+                        case .freeGame:
+                            Text("Free game — no credit applies.")
+                                .font(.system(size: 15))
+                                .foregroundStyle(Brand.secondaryText)
+                                .multilineTextAlignment(.center)
+                        case .clubManaged:
+                            Text("\(clubLabel) handles refunds off-platform. Contact the club if you have any questions.")
+                                .font(.system(size: 15))
+                                .foregroundStyle(Brand.secondaryText)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                        case .creditIssued:
+                            let credited = String(format: "$%.2f", Double(result.creditedCents) / 100)
+                            let newBal   = String(format: "$%.2f", Double(result.newBalanceCents) / 100)
+                            Text("\(credited) credit added at \(clubLabel)")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(Brand.slateBlue)
+                                .multilineTextAlignment(.center)
+                            Text("Your credit balance at \(clubLabel) is now **\(newBal)**. Credits can only be used at the club that issued them.")
+                                .font(.system(size: 14))
+                                .foregroundStyle(Brand.secondaryText)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                        case .pendingReplacement:
+                            Text("If a replacement player books your spot, we'll credit you automatically.")
+                                .font(.system(size: 15))
+                                .foregroundStyle(Brand.secondaryText)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("You'll get a notification if that happens.")
+                                .font(.system(size: 13))
+                                .foregroundStyle(Brand.tertiaryText)
+                                .multilineTextAlignment(.center)
+                        case .cancelled:
+                            Text("Your booking has been cancelled.")
+                                .font(.system(size: 15))
+                                .foregroundStyle(Brand.secondaryText)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+
+                // Balance pill — only when credit was actually issued.
+                if outcome == .creditIssued {
+                    HStack(spacing: 10) {
+                        Image(systemName: "creditcard.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(Brand.slateBlue)
+                        Text("Balance: \(String(format: "$%.2f", Double(result.newBalanceCents) / 100))")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Brand.primaryText)
+                        Text("· \(clubLabel)")
+                            .font(.system(size: 13))
+                            .foregroundStyle(Brand.secondaryText)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                    .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Brand.softOutline, lineWidth: 1))
+                    .padding(.horizontal, 24)
+                }
+
+                Button(action: onDismiss) {
+                    Text("Got it")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Brand.primaryText, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 24)
+            }
+            .padding(.vertical, 28)
+            .background(Brand.appBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .padding(.horizontal, 0)
+            Spacer().frame(height: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .presentationDetents([.height(420)])
+        .presentationBackground(Brand.appBackground)
+        .presentationCornerRadius(28)
+        .presentationDragIndicator(.hidden)
     }
 }

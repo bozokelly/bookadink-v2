@@ -346,6 +346,16 @@ struct CourtResult: Identifiable {
     }
 }
 
+/// Mirrors `clubs.cancellation_policy_type`. Display-only — the actual refund
+/// behaviour is decided server-side in `cancel_booking_with_credit` and the
+/// deferred-credit trigger.
+enum CancellationPolicyType: String, CaseIterable, Identifiable, Codable {
+    case managed
+    case clubManaged = "club_managed"
+
+    var id: String { rawValue }
+}
+
 struct Club: Identifiable, Hashable {
     let id: UUID
     var name: String
@@ -394,6 +404,14 @@ struct Club: Identifiable, Hashable {
     var appearancePatternKey: String? = nil
     var codeOfConduct: String? = nil
     var cancellationPolicy: String? = nil
+    /// Server-authoritative cancellation policy type. Mirrors `clubs.cancellation_policy_type`.
+    /// Drives display only — the cancellation/credit RPCs and triggers are the source of truth
+    /// for refund eligibility. Defaults to `.managed` to match the DB default.
+    var cancellationPolicyType: CancellationPolicyType = .managed
+    /// Hours before game start that count as inside the cutoff. Mirrors
+    /// `clubs.cancellation_cutoff_hours`. DB CHECK constraint clamps to 1...48.
+    /// Display-only on the client.
+    var cancellationCutoffHours: Int = 12
     /// Denormalised from `club_stripe_accounts`. Non-nil when the club has completed Stripe Connect onboarding.
     var stripeConnectID: String? = nil
     /// Hex colour string (e.g. "#2E7D5B") for the initials-based avatar background.
@@ -453,6 +471,17 @@ struct Club: Identifiable, Hashable {
             parts.append(st)
         }
         return parts.isEmpty ? nil : parts.joined(separator: ", ")
+    }
+
+    /// Concise plain-English summary of the active cancellation policy. Display-only —
+    /// the cancellation/credit RPCs and triggers remain authoritative for refund eligibility.
+    var cancellationPolicySummary: String {
+        switch cancellationPolicyType {
+        case .managed:
+            return "Cancel at least \(cancellationCutoffHours)h before for credit. Late cancels get credit only if your spot is filled."
+        case .clubManaged:
+            return "Cancellation policy managed by club."
+        }
     }
 }
 
@@ -1469,6 +1498,11 @@ struct ClubOwnerEditDraft: Equatable {
     var defaultCourtCount: Int = 1
     var codeOfConduct: String = ""
     var cancellationPolicy: String = ""
+    /// Server-authoritative cancellation policy type. Defaults to `.managed`
+    /// for new clubs to match the DB column default.
+    var cancellationPolicyType: CancellationPolicyType = .managed
+    /// Cutoff hours used by the managed policy. DB constraint: 1...48.
+    var cancellationCutoffHours: Int = 12
     var venueName: String = ""
     var streetAddress: String = ""
     var suburb: String = ""
@@ -1488,6 +1522,8 @@ struct ClubOwnerEditDraft: Equatable {
         defaultCourtCount = club.defaultCourtCount
         codeOfConduct = club.codeOfConduct ?? ""
         cancellationPolicy = club.cancellationPolicy ?? ""
+        cancellationPolicyType = club.cancellationPolicyType
+        cancellationCutoffHours = club.cancellationCutoffHours
         venueName = club.venueName ?? ""
         streetAddress = club.streetAddress ?? ""
         suburb = club.suburb ?? ""

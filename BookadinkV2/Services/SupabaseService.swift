@@ -33,6 +33,10 @@ protocol ClubDataProviding {
     func signIn(email: String, password: String) async throws -> AuthFlowResult
     func signUp(email: String, password: String) async throws -> AuthFlowResult
     func refreshSession(refreshToken: String) async throws -> AuthSessionInfo
+    /// Exchanges a Supabase email-verification token-hash for a session.
+    /// Called when the app receives a `bookadink://auth-callback?token_hash=...&type=signup`
+    /// deep link from the user tapping the verification link in their email.
+    func verifyEmailOTP(tokenHash: String, type: String) async throws -> AuthSessionInfo
     func fetchClubs() async throws -> [Club]
     func fetchClubDetail(id: UUID) async throws -> Club
     func fetchGames(clubID: UUID) async throws -> [Game]
@@ -367,6 +371,36 @@ final class SupabaseService: ClubDataProviding {
         )
     }
 
+    /// Consumes a Supabase email-verification token-hash via `POST /auth/v1/verify`
+    /// and returns the resulting session. `type` is typically "signup" for new-account
+    /// confirmation; Supabase also supports "recovery", "invite", "email_change",
+    /// "magiclink", and "email" — pass through whatever Supabase emitted in the
+    /// callback URL's `type` parameter unchanged.
+    func verifyEmailOTP(tokenHash: String, type: String) async throws -> AuthSessionInfo {
+        let response: SupabaseAuthResponse = try await sendAuth(
+            path: "verify",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(SupabaseVerifyOtpRequest(tokenHash: tokenHash, type: type))
+        )
+
+        guard
+            let accessToken = response.accessToken,
+            let user = response.user,
+            let userID = UUID(uuidString: user.id)
+        else {
+            throw SupabaseServiceError.missingSession
+        }
+
+        storedAccessToken = accessToken
+        return AuthSessionInfo(
+            accessToken: accessToken,
+            refreshToken: response.refreshToken,
+            userID: userID,
+            email: user.email
+        )
+    }
+
     func fetchClubs() async throws -> [Club] {
         guard SupabaseConfig.isConfigured else {
             return MockData.clubs
@@ -378,7 +412,7 @@ final class SupabaseService: ClubDataProviding {
         let clubRows: [ClubRow] = try await send(
             path: "clubs",
             queryItems: [
-                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,appearance_palette_key,appearance_pattern_key,code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone")
+                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,appearance_palette_key,appearance_pattern_key,code_of_conduct,cancellation_policy,cancellation_policy_type,cancellation_cutoff_hours,stripe_connect_id,avatar_background_color,timezone")
             ],
             method: "GET",
             body: nil,
@@ -417,7 +451,7 @@ final class SupabaseService: ClubDataProviding {
         let clubs: [ClubRow] = try await send(
             path: "clubs",
             queryItems: [
-                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,appearance_palette_key,appearance_pattern_key,code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone"),
+                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,appearance_palette_key,appearance_pattern_key,code_of_conduct,cancellation_policy,cancellation_policy_type,cancellation_cutoff_hours,stripe_connect_id,avatar_background_color,timezone"),
                 .init(name: "id", value: "eq.\(id.uuidString)")
             ],
             method: "GET",
@@ -1896,6 +1930,8 @@ final class SupabaseService: ClubDataProviding {
             customBannerURL: draft.customBannerURLStringForSave,
             appearancePaletteKey: draft.appearancePaletteKey,
             appearancePatternKey: draft.appearancePatternKey,
+            cancellationPolicyType: draft.cancellationPolicyType.rawValue,
+            cancellationCutoffHours: max(1, min(48, draft.cancellationCutoffHours)),
             avatarBackgroundColor: draft.avatarBackgroundColor,
             timezone: TimeZone.current.identifier
         )
@@ -1903,7 +1939,7 @@ final class SupabaseService: ClubDataProviding {
         let createdRows: [ClubRow] = try await send(
             path: "clubs",
             queryItems: [
-                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,appearance_palette_key,appearance_pattern_key,code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone")
+                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,appearance_palette_key,appearance_pattern_key,code_of_conduct,cancellation_policy,cancellation_policy_type,cancellation_cutoff_hours,stripe_connect_id,avatar_background_color,timezone")
             ],
             method: "POST",
             body: try JSONEncoder().encode([payload]),
@@ -2184,6 +2220,8 @@ final class SupabaseService: ClubDataProviding {
             appearancePatternKey: draft.appearancePatternKey,
             codeOfConduct: nilIfEmpty(draft.codeOfConduct),
             cancellationPolicy: nilIfEmpty(draft.cancellationPolicy),
+            cancellationPolicyType: draft.cancellationPolicyType.rawValue,
+            cancellationCutoffHours: max(1, min(48, draft.cancellationCutoffHours)),
             avatarBackgroundColor: draft.avatarBackgroundColor
         )
 
@@ -2191,7 +2229,7 @@ final class SupabaseService: ClubDataProviding {
             path: "clubs",
             queryItems: [
                 .init(name: "id", value: "eq.\(clubID.uuidString)"),
-                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,appearance_palette_key,appearance_pattern_key,code_of_conduct,cancellation_policy,stripe_connect_id,avatar_background_color,timezone")
+                .init(name: "select", value: "id,name,description,image_url,contact_email,contact_phone,website,manager_name,members_only,created_by,win_condition,default_court_count,venue_name,street_address,suburb,state,postcode,country,latitude,longitude,hero_image_key,custom_banner_url,appearance_palette_key,appearance_pattern_key,code_of_conduct,cancellation_policy,cancellation_policy_type,cancellation_cutoff_hours,stripe_connect_id,avatar_background_color,timezone")
             ],
             method: "PATCH",
             body: try JSONEncoder().encode(payload),
@@ -5113,6 +5151,16 @@ private struct SupabaseRefreshTokenRequest: Encodable {
     }
 }
 
+private struct SupabaseVerifyOtpRequest: Encodable {
+    let tokenHash: String
+    let type: String
+
+    enum CodingKeys: String, CodingKey {
+        case tokenHash = "token_hash"
+        case type
+    }
+}
+
 private struct SupabaseAuthResponse: Decodable {
     let accessToken: String?
     let refreshToken: String?
@@ -5157,6 +5205,8 @@ private struct ClubRow: Decodable {
     let appearancePatternKey: String?
     let codeOfConduct: String?
     let cancellationPolicy: String?
+    let cancellationPolicyTypeRaw: String?
+    let cancellationCutoffHours: Int?
     let stripeConnectID: String?
     let avatarBackgroundColorHex: String?
     let timezone: String?
@@ -5188,6 +5238,8 @@ private struct ClubRow: Decodable {
         case appearancePatternKey = "appearance_pattern_key"
         case codeOfConduct = "code_of_conduct"
         case cancellationPolicy = "cancellation_policy"
+        case cancellationPolicyTypeRaw = "cancellation_policy_type"
+        case cancellationCutoffHours = "cancellation_cutoff_hours"
         case stripeConnectID = "stripe_connect_id"
         case avatarBackgroundColorHex = "avatar_background_color"
         case timezone
@@ -5247,6 +5299,8 @@ private struct ClubRow: Decodable {
             appearancePatternKey: appearancePatternKey,
             codeOfConduct: codeOfConduct,
             cancellationPolicy: cancellationPolicy,
+            cancellationPolicyType: CancellationPolicyType(rawValue: cancellationPolicyTypeRaw ?? "") ?? .managed,
+            cancellationCutoffHours: Self.clampedCutoff(cancellationCutoffHours ?? 12),
             stripeConnectID: stripeConnectID,
             avatarBackgroundColor: avatarBackgroundColorHex,
             timezone: timezone ?? "Australia/Perth"
@@ -5283,6 +5337,14 @@ private struct ClubRow: Decodable {
         guard let scheme = url.scheme?.lowercased() else { return nil }
         let isAllowed = scheme == "http" || scheme == "https"
         return isAllowed ? url : nil
+    }
+
+    /// Mirrors the DB CHECK constraint `cancellation_cutoff_hours BETWEEN 1 AND 48`.
+    /// Falls back to the column default when the value is out of range so a stale
+    /// row never produces a nonsense display label.
+    private static func clampedCutoff(_ raw: Int) -> Int {
+        guard raw >= 1 && raw <= 48 else { return 12 }
+        return raw
     }
 }
 
@@ -5924,6 +5986,8 @@ private struct ClubOwnerUpdateRow: Encodable {
     let appearancePatternKey: String?
     let codeOfConduct: String?
     let cancellationPolicy: String?
+    let cancellationPolicyType: String
+    let cancellationCutoffHours: Int
     let avatarBackgroundColor: String?
 
     enum CodingKeys: String, CodingKey {
@@ -5946,6 +6010,8 @@ private struct ClubOwnerUpdateRow: Encodable {
         case appearancePatternKey = "appearance_pattern_key"
         case codeOfConduct = "code_of_conduct"
         case cancellationPolicy = "cancellation_policy"
+        case cancellationPolicyType = "cancellation_policy_type"
+        case cancellationCutoffHours = "cancellation_cutoff_hours"
         case avatarBackgroundColor = "avatar_background_color"
     }
 
@@ -5973,6 +6039,8 @@ private struct ClubOwnerUpdateRow: Encodable {
         try c.encode(appearancePatternKey,  forKey: .appearancePatternKey)
         try c.encode(codeOfConduct,         forKey: .codeOfConduct)
         try c.encode(cancellationPolicy,    forKey: .cancellationPolicy)
+        try c.encode(cancellationPolicyType,    forKey: .cancellationPolicyType)
+        try c.encode(cancellationCutoffHours,   forKey: .cancellationCutoffHours)
         try c.encode(avatarBackgroundColor, forKey: .avatarBackgroundColor)
         if clearCoordinates {
             try c.encodeNil(forKey: .latitude)
@@ -6002,6 +6070,8 @@ private struct ClubInsertRow: Encodable {
     let customBannerURL: String?
     let appearancePaletteKey: String?
     let appearancePatternKey: String?
+    let cancellationPolicyType: String
+    let cancellationCutoffHours: Int
     let avatarBackgroundColor: String?
     let timezone: String
 
@@ -6026,6 +6096,8 @@ private struct ClubInsertRow: Encodable {
         case customBannerURL = "custom_banner_url"
         case appearancePaletteKey = "appearance_palette_key"
         case appearancePatternKey = "appearance_pattern_key"
+        case cancellationPolicyType = "cancellation_policy_type"
+        case cancellationCutoffHours = "cancellation_cutoff_hours"
         case avatarBackgroundColor = "avatar_background_color"
         case timezone
     }
