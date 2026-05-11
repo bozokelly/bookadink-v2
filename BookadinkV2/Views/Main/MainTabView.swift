@@ -11,63 +11,30 @@ enum AppTab: Hashable {
 
 struct MainTabView: View {
     @EnvironmentObject private var appState: AppState
+    /// Drives the iPad-only left-rail navigation. Bound to horizontalSizeClass
+    /// so iPad split-screen narrow (1/3) falls back to the iPhone-style
+    /// bottom TabView. iPhone (any model, any orientation) is preserved
+    /// exactly because `userInterfaceIdiom != .pad`.
+    @Environment(\.horizontalSizeClass) private var hSizeClass
     /// Captures the game ID of whichever review prompt is currently being presented,
     /// so onDismiss can dismiss the correct game even if pendingReviewPrompt has changed.
     @State private var presentingReviewGameID: UUID? = nil
     /// Set when the floating active-session bar is tapped to re-present GameScheduleSheet.
     @State private var schedulingGame: Game? = nil
 
+    private var isWideLayout: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad && hSizeClass == .regular
+    }
+
     var body: some View {
-        TabView(selection: $appState.selectedTab) {
-            NavigationStack {
-                HomeView(selectedTab: $appState.selectedTab)
+        Group {
+            if isWideLayout {
+                iPadSidebarLayout
+            } else {
+                tabViewLayout
             }
-            .tabItem {
-                Label("Home", systemImage: "house.fill")
-            }
-            .tag(AppTab.home)
-
-            NavigationStack(path: $appState.clubsNavPath) {
-                ClubsListView(clubs: appState.clubs)
-                    .navigationDestination(for: AppRoute.self) { route in
-                        AppRouteDestinationView(route: route)
-                    }
-            }
-            .tabItem {
-                Label("Clubs", systemImage: "building.2")
-            }
-            .tag(AppTab.clubs)
-
-            NavigationStack {
-                BookingsListView()
-            }
-            .tabItem {
-                Label("Bookings", systemImage: "calendar")
-            }
-            .tag(AppTab.bookings)
-
-            NavigationStack {
-                NotificationsView()
-            }
-            .tabItem {
-                Label("Notifications", systemImage: "bell")
-            }
-            .badge(appState.unreadNotificationCount > 0 ? appState.unreadNotificationCount : 0)
-            .tag(AppTab.notifications)
-
-            NavigationStack {
-                ProfileDashboardView()
-            }
-            .tabItem {
-                Label("Profile", systemImage: "person.crop.circle")
-            }
-            .tag(AppTab.profile)
         }
         .tint(Brand.primaryText)
-        // Force traditional bottom tab bar on all devices including iPad iOS 18+,
-        // which defaults to a sidebar/top-bar layout when no explicit style is set.
-        .tabViewStyle(DefaultTabViewStyle())
-        .toolbarBackground(.visible, for: .tabBar)
         // Floating active-session bar lives globally above the tab bar so admins
         // can jump back into Generate Play from anywhere. Visibility is purely
         // derived from `appState.activePlaySessionGame`; the empty branch occupies
@@ -128,6 +95,158 @@ struct MainTabView: View {
         }
     }
 
+    // MARK: - Layouts
+
+    /// iPhone + iPad split-screen narrow: traditional bottom tab bar.
+    /// `.tabViewStyle(.automatic)` falls back to the platform default;
+    /// `DefaultTabViewStyle` is forced so iPad iOS 18+ doesn't replace this
+    /// with its built-in sidebar layout (we have our own — see `iPadSidebarLayout`).
+    private var tabViewLayout: some View {
+        TabView(selection: $appState.selectedTab) {
+            destinationView(for: .home)
+                .tabItem { Label("Home", systemImage: "house.fill") }
+                .tag(AppTab.home)
+
+            destinationView(for: .clubs)
+                .tabItem { Label("Clubs", systemImage: "building.2") }
+                .tag(AppTab.clubs)
+
+            destinationView(for: .bookings)
+                .tabItem { Label("Bookings", systemImage: "calendar") }
+                .tag(AppTab.bookings)
+
+            destinationView(for: .notifications)
+                .tabItem { Label("Notifications", systemImage: "bell") }
+                .badge(appState.unreadNotificationCount > 0 ? appState.unreadNotificationCount : 0)
+                .tag(AppTab.notifications)
+
+            destinationView(for: .profile)
+                .tabItem { Label("Profile", systemImage: "person.crop.circle") }
+                .tag(AppTab.profile)
+        }
+        .tabViewStyle(DefaultTabViewStyle())
+        .toolbarBackground(.visible, for: .tabBar)
+    }
+
+    /// iPad regular-width: a left-hand floating glass rail replaces the
+    /// bottom TabView. Selection state is the same `appState.selectedTab`
+    /// binding, so deep links / programmatic tab switches continue to
+    /// work unchanged. The rail sits near the top safe area; below it the
+    /// space is intentionally empty — no full-height desktop sidebar feel.
+    private var iPadSidebarLayout: some View {
+        HStack(alignment: .top, spacing: 0) {
+            iPadSidebarRail
+                .padding(.leading, 16)
+                .padding(.top, 16)
+                .padding(.trailing, 8)
+
+            destinationView(for: appState.selectedTab)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// Tab destinations factored out so both `tabViewLayout` and
+    /// `iPadSidebarLayout` build the same view tree. Selection state
+    /// drives which destination is visible.
+    @ViewBuilder
+    private func destinationView(for tab: AppTab) -> some View {
+        switch tab {
+        case .home:
+            NavigationStack {
+                HomeView(selectedTab: $appState.selectedTab)
+            }
+        case .clubs:
+            NavigationStack(path: $appState.clubsNavPath) {
+                ClubsListView(clubs: appState.clubs)
+                    .navigationDestination(for: AppRoute.self) { route in
+                        AppRouteDestinationView(route: route)
+                    }
+            }
+        case .bookings:
+            NavigationStack {
+                BookingsListView()
+            }
+        case .notifications:
+            NavigationStack {
+                NotificationsView()
+            }
+        case .profile:
+            NavigationStack {
+                ProfileDashboardView()
+            }
+        }
+    }
+
+    // MARK: - iPad Sidebar Rail
+
+    /// Floating glass card with five tab buttons, each a compact icon +
+    /// label with a pill highlight on selection. Notifications carries
+    /// the unread-count badge. Layout is intentionally short — not a
+    /// full-height column — so it reads as a rail, not a desktop sidebar.
+    ///
+    /// TODO(ipad-nav): a "Manage Club" shortcut here would need either a
+    /// new club picker (when the user owns/admins multiple clubs) or
+    /// new selected-club state. Both require routing decisions beyond a
+    /// layout pass — skipped per scope guidance.
+    private var iPadSidebarRail: some View {
+        VStack(spacing: 6) {
+            railButton(.home, label: "Home", icon: "house.fill")
+            railButton(.clubs, label: "Clubs", icon: "building.2")
+            railButton(.bookings, label: "Bookings", icon: "calendar")
+            railButton(.notifications, label: "Inbox", icon: "bell",
+                       badgeCount: appState.unreadNotificationCount)
+            railButton(.profile, label: "Profile", icon: "person.crop.circle")
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Brand.softOutline, lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.06), radius: 14, x: 0, y: 4)
+    }
+
+    @ViewBuilder
+    private func railButton(_ tab: AppTab, label: String, icon: String, badgeCount: Int = 0) -> some View {
+        let isSelected = appState.selectedTab == tab
+        Button {
+            appState.selectedTab = tab
+        } label: {
+            VStack(spacing: 4) {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: icon)
+                        .font(.system(size: 17, weight: .semibold))
+                        .frame(width: 24, height: 22)
+                    if badgeCount > 0 {
+                        Text(badgeCount > 99 ? "99+" : "\(badgeCount)")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.red, in: Capsule())
+                            .offset(x: 10, y: -4)
+                            .accessibilityHidden(true)
+                    }
+                }
+                Text(label)
+                    .font(.system(size: 10, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .foregroundStyle(isSelected ? Brand.primaryText : Brand.secondaryText)
+            .frame(width: 68, height: 58)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(isSelected ? Brand.secondarySurface : Color.clear)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(badgeCount > 0 ? "\(label), \(badgeCount) unread" : label)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
     private func handleDeepLink(_ link: DeepLink) {
         switch link {
         case .club(let id):
@@ -145,6 +264,10 @@ struct MainTabView: View {
             appState.pendingDeepLink = nil
         case .connectReturn:
             // Handled in AppState.handleDeepLink — never reaches pendingDeepLink
+            appState.pendingDeepLink = nil
+        case .authCallback:
+            // Handled in AppState.handleDeepLink — never reaches pendingDeepLink.
+            // No navigation needed; the verifying stage in RootView handles the UX.
             appState.pendingDeepLink = nil
         }
     }
