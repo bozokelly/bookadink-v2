@@ -62,7 +62,6 @@ struct ClubPulseView: View {
 
     @State private var selectedTab: PulseTab = .overview
     @State private var period: AnalyticsPeriod = .last30
-    @State private var stripeStatusLoaded = false
     @State private var isRefreshing = false
     @State private var lastRefreshAt: Date?
     @State private var childSheet: OwnerToolSheet?
@@ -87,57 +86,6 @@ struct ClubPulseView: View {
         return false
     }
 
-    // MARK: Setup banner state
-
-    private var paidUpcomingGamesCount: Int {
-        appState.games(for: club)
-            .filter { $0.status != "cancelled" && $0.dateTime >= Date() }
-            .filter { ($0.feeAmount ?? 0) > 0 }
-            .count
-    }
-
-    private enum SetupIssue {
-        case planRequired
-        case stripeNotConfigured
-        case stripeVerificationPending
-
-        var icon: String {
-            switch self {
-            case .planRequired:              return "lock.fill"
-            case .stripeNotConfigured:       return "creditcard.trianglebadge.exclamationmark"
-            case .stripeVerificationPending: return "clock.badge.exclamationmark"
-            }
-        }
-        var title: String {
-            switch self {
-            case .planRequired:              return "Payment processing disabled"
-            case .stripeNotConfigured:       return "Stripe not connected"
-            case .stripeVerificationPending: return "Stripe verification pending"
-            }
-        }
-        var detail: String {
-            switch self {
-            case .planRequired:              return "Upgrade to Starter or Pro to accept booking fees."
-            case .stripeNotConfigured:       return "Connect Stripe in Club Settings → Payments."
-            case .stripeVerificationPending: return "Stripe is reviewing your account."
-            }
-        }
-        var isCritical: Bool {
-            switch self {
-            case .planRequired, .stripeNotConfigured: return true
-            case .stripeVerificationPending:          return false
-            }
-        }
-    }
-
-    private var activeSetupIssue: SetupIssue? {
-        guard paidUpcomingGamesCount > 0, let e = entitlements, stripeStatusLoaded else { return nil }
-        if !e.canAcceptPayments          { return .planRequired }
-        if stripeAccount == nil          { return .stripeNotConfigured }
-        if stripeAccount?.payoutsEnabled == false { return .stripeVerificationPending }
-        return nil
-    }
-
     // MARK: Body
 
     var body: some View {
@@ -145,8 +93,6 @@ struct ClubPulseView: View {
             VStack(alignment: .leading, spacing: 20) {
                 tabBar
                 metaStrip
-                pastDueBanner
-                setupBanner
 
                 Group {
                     switch selectedTab {
@@ -221,8 +167,6 @@ struct ClubPulseView: View {
         async let fetchStripe: Void = appState.refreshStripeAccountStatus(for: club.id)
         _ = await (fetchEntitlements, fetchMembers, fetchSummary, fetchStripe)
 
-        stripeStatusLoaded = true
-
         if !analyticsLocked {
             async let advanced: Void = appState.fetchClubAdvancedAnalytics(for: club.id, days: period.rawValue)
             async let memberActivity: Void = appState.loadClubMemberActivity(for: club.id, days: period.rawValue)
@@ -241,68 +185,6 @@ struct ClubPulseView: View {
         async let memberActivity: Void = appState.loadClubMemberActivity(for: club.id, days: period.rawValue)
         _ = await (advanced, memberActivity)
         lastRefreshAt = Date()
-    }
-
-    // MARK: Banners
-
-    @ViewBuilder
-    private var pastDueBanner: some View {
-        if let sub = appState.subscriptionsByClubID[club.id], sub.isPastDue {
-            Label("Payment failed — update billing in Plan & Billing to restore access.", systemImage: "exclamationmark.triangle.fill")
-                .font(.footnote)
-                .foregroundStyle(.white)
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.red, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-    }
-
-    @ViewBuilder
-    private var setupBanner: some View {
-        if let issue = activeSetupIssue {
-            Button { childSheet = .editClub } label: {
-                HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: issue.icon)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(issue.isCritical ? Brand.errorRed : Brand.spicyOrange)
-                        .frame(width: 22)
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(issue.title)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(Brand.primaryText)
-                            .lineLimit(2)
-                        Text(issue.detail)
-                            .font(.caption)
-                            .foregroundStyle(Brand.secondaryText)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .lineLimit(3)
-                    }
-                    Spacer(minLength: 0)
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Brand.mutedText)
-                        .accessibilityHidden(true)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(
-                    (issue.isCritical ? Brand.errorRed : Brand.spicyOrange).opacity(0.06),
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(
-                            (issue.isCritical ? Brand.errorRed : Brand.spicyOrange).opacity(0.22),
-                            lineWidth: 1
-                        )
-                )
-            }
-            .buttonStyle(.plain)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("\(issue.title). \(issue.detail)")
-            .accessibilityHint("Opens club settings to resolve.")
-        }
     }
 
     // MARK: Tier pill (toolbar)

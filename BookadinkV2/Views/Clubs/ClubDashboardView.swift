@@ -22,6 +22,9 @@ struct ClubDashboardView: View {
     @State private var stripeStatusLoaded = false
     // Prevents concurrent refreshAll() calls (task + scenePhase can both fire on appear).
     @State private var isRefreshingDashboard = false
+    // Phase 1.7: drives the Plan card CTA. Identical pattern to ClubOwnerSheets — the
+    // paywall is the single source of truth for plan management; we just open it.
+    @State private var paywallFeature: LockedFeature? = nil
 
     // MARK: - Derived state
 
@@ -111,11 +114,11 @@ struct ClubDashboardView: View {
         return e.canAcceptPayments && (stripeAccount?.payoutsEnabled == true)
     }
 
-    // The section is shown when there is a confirmed issue OR setup is incomplete (checklist needed).
+    // Shown only when there is a confirmed actionable issue.
     // stripeStatusLoaded prevents the section from flashing on open while cached stripe data is nil.
     private var shouldShowSetupSection: Bool {
         guard stripeStatusLoaded, entitlements != nil else { return false }
-        return activeSetupIssue != nil || !paymentSetupComplete
+        return activeSetupIssue != nil
     }
 
     // MARK: - Body
@@ -135,6 +138,7 @@ struct ClubDashboardView: View {
                     }
                     setupAndIssuesSection
                     primaryActionsRow
+                    dashboardPlanCard
                     navCardsSection
                 }
                 .padding(.horizontal, 18)
@@ -189,6 +193,12 @@ struct ClubDashboardView: View {
                 get: { isOnIPad ? childSheet : nil },
                 set: { childSheet = $0 }
             )) { sheet in childSheetContent(sheet) }
+            // Phase 1.7: Plan card CTA → existing paywall. Single source of truth for
+            // plan management — same call shape as ClubOwnerSheets / ClubFormBody.
+            .sheet(item: $paywallFeature) { feature in
+                ClubUpgradePaywallView(club: club, lockedFeature: feature)
+                    .environmentObject(appState)
+            }
         }
         .task { await refreshAll() }
         .onChange(of: scenePhase) { phase in
@@ -262,125 +272,183 @@ struct ClubDashboardView: View {
 
     @ViewBuilder
     private var setupAndIssuesSection: some View {
-        if shouldShowSetupSection {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Setup & Issues")
+        if shouldShowSetupSection, let issue = activeSetupIssue {
+            let n = paidUpcomingGamesCount
+            Button { childSheet = .editClub } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: issue.icon)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(issue.isCritical ? Brand.errorRed : Brand.spicyOrange)
+                        .frame(width: 20)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(issue.title)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Brand.primaryText)
+                            Text("\(n) game\(n == 1 ? "" : "s") affected")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(
+                                    (issue.isCritical ? Brand.errorRed : Brand.spicyOrange).opacity(0.9),
+                                    in: Capsule()
+                                )
+                        }
+                        Text(issue.detail)
+                            .font(.system(size: 12))
+                            .foregroundStyle(Brand.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Brand.mutedText)
+                }
+                .padding(14)
+                .background(
+                    (issue.isCritical ? Brand.errorRed : Brand.spicyOrange).opacity(0.06),
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(
+                            (issue.isCritical ? Brand.errorRed : Brand.spicyOrange).opacity(0.25),
+                            lineWidth: 1
+                        )
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    // MARK: - Plan Card (Phase 1.7)
+
+    /// Compact, glance-able plan card. Shows the current tier, two limit lines, and a
+    /// row of feature badges drawn from existing entitlement data — no hardcoded
+    /// pricing, no plan-tier branching beyond label/icon. CTA opens the canonical
+    /// `ClubUpgradePaywallView(.managePlan)`. Hidden until entitlements load so we
+    /// never flash a stale "Free Plan" default during fetch.
+    @ViewBuilder
+    private var dashboardPlanCard: some View {
+        if let e = entitlements {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Your Plan")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(Brand.tertiaryText)
                     .textCase(.uppercase)
                     .tracking(0.5)
 
-                // Critical / warning issue card
-                if let issue = activeSetupIssue {
-                    let n = paidUpcomingGamesCount
-                    Button { childSheet = .editClub } label: {
-                        HStack(alignment: .top, spacing: 12) {
-                            Image(systemName: issue.icon)
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(issue.isCritical ? Brand.errorRed : Brand.spicyOrange)
-                                .frame(width: 20)
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack(spacing: 6) {
-                                    Text(issue.title)
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundStyle(Brand.primaryText)
-                                    Text("\(n) game\(n == 1 ? "" : "s") affected")
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(
-                                            (issue.isCritical ? Brand.errorRed : Brand.spicyOrange).opacity(0.9),
-                                            in: Capsule()
-                                        )
-                                }
-                                Text(issue.detail)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(Brand.secondaryText)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 8) {
+                        Image(systemName: planCardIcon(for: e.planTier))
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(planCardAccent(for: e.planTier))
+                        Text(planCardName(for: e.planTier))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Brand.primaryText)
+                        Spacer(minLength: 0)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(activeGamesLimitText(for: e))
+                            .font(.caption)
+                            .foregroundStyle(Brand.secondaryText)
+                        Text(memberLimitText(for: e))
+                            .font(.caption)
+                            .foregroundStyle(Brand.secondaryText)
+                    }
+
+                    HStack(spacing: 10) {
+                        planFeatureBadge(label: "Payments",  enabled: e.canAcceptPayments)
+                        planFeatureBadge(label: "Analytics", enabled: e.analyticsAccess)
+                        planFeatureBadge(label: "Recurring", enabled: e.canUseRecurringGames)
+                        planFeatureBadge(label: "Schedule",  enabled: e.canUseDelayedPublishing)
+                        Spacer(minLength: 0)
+                    }
+
+                    Button {
+                        paywallFeature = .managePlan
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(planCardCTALabel(for: e.planTier))
+                                .font(.subheadline.weight(.semibold))
                             Image(systemName: "chevron.right")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(Brand.mutedText)
+                                .font(.caption.weight(.semibold))
                         }
-                        .padding(14)
-                        .background(
-                            (issue.isCritical ? Brand.errorRed : Brand.spicyOrange).opacity(0.06),
-                            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .strokeBorder(
-                                    (issue.isCritical ? Brand.errorRed : Brand.spicyOrange).opacity(0.25),
-                                    lineWidth: 1
-                                )
-                        )
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Brand.primaryText, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     .buttonStyle(.plain)
+                    .padding(.top, 2)
                 }
-
-                // Payment readiness checklist — shown until all items are complete
-                if !paymentSetupComplete {
-                    paymentChecklistCard
-                }
+                .padding(14)
+                .background(Brand.cardBackground)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Brand.dividerColor, lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
         }
     }
 
-    private var paymentChecklistCard: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            checklistRow(
-                label: "Plan supports paid bookings",
-                done: entitlements?.canAcceptPayments == true,
-                action: entitlements?.canAcceptPayments == true ? nil : { childSheet = .editClub }
-            )
-            Divider().padding(.leading, 44)
-            checklistRow(
-                label: "Stripe account connected",
-                done: stripeAccount != nil,
-                action: stripeAccount != nil ? nil : { childSheet = .editClub }
-            )
-            Divider().padding(.leading, 44)
-            checklistRow(
-                label: "Payouts enabled",
-                done: stripeAccount?.payoutsEnabled == true,
-                action: stripeAccount?.payoutsEnabled == true ? nil : { childSheet = .editClub }
-            )
+    private func planCardName(for tier: String) -> String {
+        switch tier.lowercased() {
+        case "pro":     return "Pro Plan"
+        case "starter": return "Starter Plan"
+        default:        return "Free Plan"
         }
-        .background(Brand.cardBackground)
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Brand.dividerColor, lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func planCardIcon(for tier: String) -> String {
+        switch tier.lowercased() {
+        case "pro":     return "bolt.fill"
+        case "starter": return "star.fill"
+        default:        return "circle.dashed"
+        }
+    }
+
+    private func planCardAccent(for tier: String) -> Color {
+        switch tier.lowercased() {
+        case "pro":     return Color(hex: "3D6B00")
+        case "starter": return Brand.primaryText
+        default:        return Brand.secondaryText
+        }
+    }
+
+    private func planCardCTALabel(for tier: String) -> String {
+        switch tier.lowercased() {
+        case "pro", "starter": return "Manage plan"
+        default:               return "View plans"
+        }
+    }
+
+    private func activeGamesLimitText(for e: ClubEntitlements) -> String {
+        if e.maxActiveGames < 0 {
+            return "Unlimited active games"
+        }
+        return "\(upcomingGamesCount) of \(e.maxActiveGames) active games"
+    }
+
+    private func memberLimitText(for e: ClubEntitlements) -> String {
+        if e.maxMembers < 0 {
+            return "Unlimited members"
+        }
+        return "Up to \(e.maxMembers) members"
     }
 
     @ViewBuilder
-    private func checklistRow(label: String, done: Bool, action: (() -> Void)?) -> some View {
-        let content = HStack(spacing: 12) {
-            Image(systemName: done ? "checkmark.circle.fill" : "circle")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(done ? Brand.emeraldAction : Brand.tertiaryText)
-                .frame(width: 20)
+    private func planFeatureBadge(label: String, enabled: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: enabled ? "checkmark.circle.fill" : "lock.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(enabled ? Brand.emeraldAction : Brand.tertiaryText)
             Text(label)
-                .font(.subheadline)
-                .foregroundStyle(done ? Brand.primaryText : Brand.secondaryText)
-            Spacer(minLength: 0)
-            if !done {
-                Text("Fix →")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Brand.slateBlue)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-
-        if let action, !done {
-            Button(action: action) { content }
-                .buttonStyle(.plain)
-        } else {
-            content
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(enabled ? Brand.primaryText : Brand.tertiaryText)
         }
     }
 

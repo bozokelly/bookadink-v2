@@ -204,17 +204,40 @@ struct OwnerCreateGameSheet: View {
 
     // MARK: - Gate checks
 
-    /// Active game limit — mirrors AppState.createGameForClub logic.
-    private var gameLimitGateResult: GateResult {
+    private var entitlements: ClubEntitlements? {
+        appState.entitlementsByClubID[club.id]
+    }
+
+    /// Live count of upcoming non-cancelled games for this club. Shared by the hard-stop
+    /// gate (`gameLimitGateResult`) and the proactive Phase 1.8 pre-limit banner so both
+    /// read identical data — never drift.
+    private var currentActiveGameCount: Int {
         let now = Date()
-        let repeatCount = draft.repeatWeekly ? max(draft.repeatCount, 1) : 1
-        let currentActiveCount = (appState.gamesByClubID[club.id] ?? [])
+        return (appState.gamesByClubID[club.id] ?? [])
             .filter { $0.status != "cancelled" && $0.dateTime > now }
             .count
+    }
+
+    /// Active game limit — mirrors AppState.createGameForClub logic. Hard-stop check.
+    private var gameLimitGateResult: GateResult {
+        let repeatCount = draft.repeatWeekly ? max(draft.repeatCount, 1) : 1
         return FeatureGateService.canCreateGame(
-            appState.entitlementsByClubID[club.id],
-            currentActiveGameCount: currentActiveCount + repeatCount - 1
+            entitlements,
+            currentActiveGameCount: currentActiveGameCount + repeatCount - 1
         )
+    }
+
+    /// Phase 1.8: proactive pre-limit banner. Fires when:
+    ///  - the club is on a finite plan (`maxActiveGames > 0`)
+    ///  - usage is below cap (so we never collide with the existing hard-stop paywall)
+    ///  - usage is at `cap - 1` (small caps) or `>= 75%` (larger caps)
+    /// Reads only existing entitlement + games-cache data — no new entitlement logic.
+    private var isApproachingGameLimit: Bool {
+        guard let e = entitlements, e.maxActiveGames > 0 else { return false }
+        let count = currentActiveGameCount
+        let cap = e.maxActiveGames
+        guard count < cap else { return false }
+        return count == cap - 1 || count * 4 >= cap * 3
     }
 
     private var recurringGamesGate: GateResult {
@@ -265,6 +288,40 @@ struct OwnerCreateGameSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                // Phase 1.8: proactive pre-limit banner. Shown when usage is near the
+                // active-game cap. Tap routes to the existing paywall via .gameLimit.
+                // Hard-stop enforcement (Create button + .task on sheet open) is
+                // unchanged — banner is purely informational.
+                if isApproachingGameLimit, let e = entitlements {
+                    Section {
+                        Button {
+                            paywallFeature = .gameLimit
+                        } label: {
+                            HStack(alignment: .top, spacing: 12) {
+                                Image(systemName: "chart.bar.xaxis")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(Brand.spicyOrange)
+                                    .frame(width: 20)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("\(currentActiveGameCount) of \(e.maxActiveGames) games used")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(Brand.primaryText)
+                                    Text("Upgrade your plan for higher limits.")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(Brand.secondaryText)
+                                }
+                                Spacer(minLength: 0)
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(Brand.mutedText)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .listRowBackground(Brand.spicyOrange.opacity(0.06))
+                }
+
                 Section("Basics") {
                     TextField("Game title", text: $draft.title)
                     TextField("Information (optional)", text: $draft.description, axis: .vertical)
@@ -3120,6 +3177,13 @@ struct ClubInfoSettingsView: View {
     @State private var emailError: String?
     @State private var websiteError: String?
 
+    private var cancellationHandlingSubtitle: String {
+        switch draft.cancellationPolicyType {
+        case .managed:    return "Managed · \(draft.cancellationCutoffHours)h cutoff"
+        case .clubManaged: return "Club managed"
+        }
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
@@ -3172,13 +3236,27 @@ struct ClubInfoSettingsView: View {
                     .buttonStyle(.plain)
 
                     NavigationLink {
-                        CancellationPolicyEditView(text: $draft.cancellationPolicy)
+                        ClubCancellationHandlingView(
+                            policyType: $draft.cancellationPolicyType,
+                            cutoffHours: $draft.cancellationCutoffHours
+                        )
                     } label: {
                         CSNavRow(
                             icon: "calendar.badge.clock",
-                            label: "Cancellation Policy",
+                            label: "Cancellation policy",
+                            sub: cancellationHandlingSubtitle
+                        )
+                    }
+                    .buttonStyle(.plain)
+
+                    NavigationLink {
+                        CancellationPolicyEditView(text: $draft.cancellationPolicy)
+                    } label: {
+                        CSNavRow(
+                            icon: "doc.plaintext",
+                            label: "Custom policy text",
                             sub: draft.cancellationPolicy.isEmpty
-                                ? "Not set" : "\(draft.cancellationPolicy.count) characters",
+                                ? "Optional" : "\(draft.cancellationPolicy.count) characters",
                             trailingPill: draft.cancellationPolicy.isEmpty ? nil : ("Done", .ok),
                             divider: false
                         )
@@ -3188,7 +3266,7 @@ struct ClubInfoSettingsView: View {
                 .background(Brand.cardBackground,
                             in: RoundedRectangle(cornerRadius: 18, style: .continuous))
 
-                Text("Members must read and accept these before their join request is submitted. Cancellation policy displays at the bottom of every game.")
+                Text("Members read and accept these before their join request is submitted. The active cancellation policy is shown on every game.")
                     .font(.system(size: 12.5))
                     .foregroundStyle(Brand.secondaryText)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -6387,6 +6465,149 @@ struct ConductAcceptanceSheet: View {
 }
 
 // MARK: - Cancellation Policy Edit View
+
+/// Owner-facing cancellation handling picker. Display-only — the
+/// `cancel_booking_with_credit` RPC and the deferred-credit trigger remain the
+/// authoritative source for refund eligibility. This view writes the chosen
+/// `cancellation_policy_type` and `cancellation_cutoff_hours` into the draft
+/// so the existing save pipeline (auto-save in OwnerEditClubSheet, explicit
+/// save in StartClubSheet) persists them.
+struct ClubCancellationHandlingView: View {
+    @Binding var policyType: CancellationPolicyType
+    @Binding var cutoffHours: Int
+
+    /// Recommended cutoff range shown as quick-pick chips. The DB CHECK
+    /// constraint allows 1...48, so values outside this list are still legal
+    /// — just not surfaced as one-tap options.
+    private static let cutoffOptions: [Int] = [8, 10, 12, 24]
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                // MARK: Option cards
+                VStack(spacing: 12) {
+                    optionCard(
+                        type: .managed,
+                        title: "Book A Dink managed policy",
+                        body: "We handle cancellations, credits, waitlist replacement and member notifications automatically.",
+                        explanation: "Members receive club credit if they cancel before your cutoff. If they cancel after the cutoff, they only receive credit if their spot is filled by another confirmed paid player."
+                    )
+                    optionCard(
+                        type: .clubManaged,
+                        title: "Club managed policy",
+                        body: "Your club handles cancellation and refunds manually. The app cancels bookings but does not issue automatic credits.",
+                        explanation: nil
+                    )
+                }
+
+                // MARK: Cutoff selector — managed only
+                if policyType == .managed {
+                    VStack(alignment: .leading, spacing: 8) {
+                        CSSectionLabel(text: "Minimum cancellation notice")
+
+                        HStack(spacing: 8) {
+                            ForEach(Self.cutoffOptions, id: \.self) { hours in
+                                cutoffChip(hours: hours)
+                            }
+                        }
+
+                        Text("We recommend 8–12 hours for most clubs.")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(Brand.secondaryText)
+                            .padding(.horizontal, 6)
+                            .padding(.top, 2)
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 40)
+            .animation(.easeInOut(duration: 0.18), value: policyType)
+        }
+        .background(Brand.appBackground)
+        .navigationTitle("Cancellation policy")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder
+    private func optionCard(
+        type: CancellationPolicyType,
+        title: String,
+        body: String,
+        explanation: String?
+    ) -> some View {
+        let selected = policyType == type
+        Button {
+            policyType = type
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                ZStack {
+                    Circle()
+                        .stroke(selected ? Brand.primaryText : Brand.softOutline, lineWidth: 2)
+                        .frame(width: 22, height: 22)
+                    if selected {
+                        Circle()
+                            .fill(Brand.primaryText)
+                            .frame(width: 12, height: 12)
+                    }
+                }
+                .padding(.top, 2)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title)
+                        .font(.system(size: 15.5, weight: .semibold))
+                        .foregroundStyle(Brand.primaryText)
+                    Text(body)
+                        .font(.system(size: 13.5))
+                        .foregroundStyle(Brand.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let explanation, selected {
+                        Text(explanation)
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(Brand.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 2)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Brand.cardBackground,
+                        in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(selected ? Brand.primaryText : Color.clear, lineWidth: 1.25)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func cutoffChip(hours: Int) -> some View {
+        let selected = cutoffHours == hours
+        Button {
+            cutoffHours = hours
+        } label: {
+            Text("\(hours)h")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(selected ? Color.white : Brand.primaryText)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(selected ? Brand.primaryText : Brand.cardBackground)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(selected ? Color.clear : Brand.softOutline, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
 
 struct CancellationPolicyEditView: View {
     @Binding var text: String

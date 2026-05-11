@@ -272,6 +272,11 @@ struct ClubUpgradePaywallView: View {
     @State private var paymentError: String?
     @State private var isProcessingUpgrade = false
     @State private var upgradeSucceeded = false
+    /// Phase 1.6: shown when the post-payment polling window exhausts without seeing the
+    /// subscription flip to `.active`. Not a failure — payment succeeded, the webhook is
+    /// just slow. Existing scenePhase entitlement refresh in `BookADinkApp` will unlock
+    /// features automatically when propagation completes.
+    @State private var pendingVerification = false
     @State private var subscribedPlan: UpgradePlan? = nil
 
     private var currentPlanTier: String {
@@ -291,6 +296,20 @@ struct ClubUpgradePaywallView: View {
         NavigationStack {
             if upgradeSucceeded, let plan = subscribedPlan {
                 successView(plan: plan)
+                    .navigationBarBackButtonHidden(true)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button {
+                                dismiss()
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.title3)
+                                    .foregroundStyle(Brand.secondaryText)
+                            }
+                        }
+                    }
+            } else if pendingVerification {
+                pendingVerificationView(plan: subscribedPlan)
                     .navigationBarBackButtonHidden(true)
                     .toolbar {
                         ToolbarItem(placement: .topBarTrailing) {
@@ -438,6 +457,92 @@ struct ClubUpgradePaywallView: View {
                 }
 
                 // Done button
+                Button {
+                    dismiss()
+                } label: {
+                    Text("Done")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 50)
+                        .background(Brand.primaryText, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 28)
+                .padding(.bottom, 40)
+            }
+        }
+        .background(Color(.systemGroupedBackground))
+    }
+
+    // MARK: - Pending Verification View (Phase 1.6)
+
+    /// Shown when the post-payment polling window exhausted without observing the
+    /// subscription flip to `.active`. Payment succeeded; the webhook is just slow.
+    /// `BookADinkApp` re-fetches entitlements on every foreground, so unlock will
+    /// happen automatically once propagation completes — the user can dismiss safely.
+    private func pendingVerificationView(plan: UpgradePlan?) -> some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                VStack(spacing: 18) {
+                    ZStack {
+                        Circle()
+                            .fill(Brand.softOrangeAccent.opacity(0.15))
+                            .frame(width: 88, height: 88)
+                        Image(systemName: "clock.badge.checkmark.fill")
+                            .font(.system(size: 40, weight: .semibold))
+                            .foregroundStyle(Brand.softOrangeAccent)
+                    }
+                    .padding(.top, 40)
+
+                    VStack(spacing: 8) {
+                        Text("Verifying your upgrade")
+                            .font(.title2.weight(.bold))
+                            .foregroundStyle(Brand.primaryText)
+                        Text(plan.map { "Your \($0.displayName) payment went through. We're confirming it with our payment provider — your features will unlock automatically in a few minutes." }
+                             ?? "Your payment went through. We're confirming it with our payment provider — your features will unlock automatically in a few minutes.")
+                            .font(.subheadline)
+                            .foregroundStyle(Brand.secondaryText)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, 32)
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 14) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundStyle(Brand.accentGreen)
+                        Text("Payment received")
+                            .font(.subheadline)
+                            .foregroundStyle(Brand.primaryText)
+                        Spacer()
+                    }
+                    HStack(spacing: 14) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 18))
+                            .foregroundStyle(Brand.softOrangeAccent)
+                        Text("Activating features")
+                            .font(.subheadline)
+                            .foregroundStyle(Brand.primaryText)
+                        Spacer()
+                    }
+                    HStack(spacing: 14) {
+                        Image(systemName: "bell.fill")
+                            .font(.system(size: 18))
+                            .foregroundStyle(Brand.secondaryText)
+                        Text("We'll unlock your plan as soon as it's ready")
+                            .font(.subheadline)
+                            .foregroundStyle(Brand.secondaryText)
+                        Spacer()
+                    }
+                }
+                .padding(20)
+                .background(Brand.cardBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 16)
+                .padding(.top, 24)
+
                 Button {
                     dismiss()
                 } label: {
@@ -698,20 +803,39 @@ struct ClubUpgradePaywallView: View {
                     paymentError = nil
                     isProcessingUpgrade = true
                     Task {
-                        // Poll up to ~30 seconds for the Stripe webhook to fire and
-                        // update the subscription status to 'active' in the DB.
-                        // Delays: 2s, 3s, 4s, 5s, 7s, 10s = 6 attempts over ~31s.
-                        let pollDelays: [Double] = [2, 3, 4, 5, 7, 10]
+                        // Phase 1.6: Fibonacci-style backoff — ~86s total (2+3+5+8+13+21+34).
+                        // Wider window than the previous 31s catches the long tail of webhook
+                        // propagation (typically <10s, but spikes to 30–60s under load) without
+                        // false-positive "success" when entitlements never propagated.
+                        // Stops immediately on unlock; bounded — no infinite polling.
+                        let pollDelays: [Double] = [2, 3, 5, 8, 13, 21, 34]
+                        var unlocked = false
                         for delay in pollDelays {
                             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                             await appState.fetchClubSubscription(for: club.id)
-                            if appState.subscriptionsByClubID[club.id]?.isActive == true { break }
+                            if appState.subscriptionsByClubID[club.id]?.isActive == true {
+                                unlocked = true
+                                break
+                            }
                         }
-                        // Refresh entitlements regardless — webhook may have already run
+                        // Final entitlement refresh — webhook may have landed between polls.
                         await appState.fetchClubEntitlements(for: club.id)
+                        // Re-check subscription once more in case it flipped concurrently
+                        // with the entitlement fetch.
+                        if !unlocked && appState.subscriptionsByClubID[club.id]?.isActive == true {
+                            unlocked = true
+                        }
                         await MainActor.run {
                             isProcessingUpgrade = false
-                            upgradeSucceeded = true
+                            if unlocked {
+                                upgradeSucceeded = true
+                            } else {
+                                // Payment succeeded; webhook is just slow. Hand the user a
+                                // graceful "still verifying" view rather than a fake success.
+                                // BookADinkApp's scenePhase entitlement refresh will unlock
+                                // features automatically once propagation completes.
+                                pendingVerification = true
+                            }
                         }
                     }
                 case .canceled:
