@@ -1324,6 +1324,47 @@ struct GameAttendee: Identifiable, Hashable {
     let avatarColorKey: String?
 }
 
+/// Display-shaped row returned by the `get_game_partnerships` RPC for partnered
+/// games. Drives the "registered players as pairs" UI. The wire shape includes
+/// only safe display data — names + DUPR ratings (when the game requires DUPR);
+/// no emails, phones, or private profile fields. RLS on `booking_partnerships`
+/// is locked down server-side, so this struct is the only iOS read path.
+struct BookingPartnership: Identifiable, Hashable {
+    let id: UUID
+    /// Server enum value: "pending" | "complete". Cancelled rows are not
+    /// returned by the RPC, so this is always one of the two active states.
+    let status: String
+    let playerABookingID: UUID
+    let playerAUserID: UUID
+    /// May be nil if the profile has no `full_name` set. Caller substitutes
+    /// a generic placeholder ("Player") when rendering.
+    let playerAName: String?
+    /// Populated only when the game has `requires_dupr = true`. NULL'd at
+    /// source for non-DUPR games so the client never has to gate display.
+    let playerADUPRRating: Double?
+    /// nil while the partnership is pending; set once paired.
+    let playerBBookingID: UUID?
+    let playerBUserID: UUID?
+    let playerBName: String?
+    let playerBDUPRRating: Double?
+    /// Set when the requester used `p_partner_user_id` to name a specific
+    /// intended partner. nil for the "allocate me a partner" path.
+    let requestedPartnerUserID: UUID?
+    let requestedPartnerName: String?
+    let createdAt: Date?
+
+    var isComplete: Bool { status == "complete" }
+    var isPending: Bool { status == "pending" }
+
+    /// Booking IDs covered by this partnership. Used by the players list to
+    /// dedupe individual rows that have already been folded into a pair.
+    var bookingIDs: [UUID] {
+        var ids: [UUID] = [playerABookingID]
+        if let b = playerBBookingID { ids.append(b) }
+        return ids
+    }
+}
+
 struct GameReview: Identifiable, Hashable {
     let id: UUID
     let gameID: UUID

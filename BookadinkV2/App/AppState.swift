@@ -86,6 +86,14 @@ final class AppState: ObservableObject {
     @Published var allUpcomingGames: [Game] = []
     @Published var bookings: [BookingWithGame] = []
     @Published var attendeesByGameID: [UUID: [GameAttendee]] = [:]
+    /// Per-game cache of `BookingPartnership` rows. Populated by
+    /// `refreshGamePartnerships` only for partnered games — solo games leave
+    /// the entry absent (and `partnerships(for:)` returns an empty array).
+    /// Drives the "registered players as pairs" rendering in `GameDetailView`.
+    @Published var gamePartnershipsByGameID: [UUID: [BookingPartnership]] = [:]
+    /// Reentrancy guard for `refreshGamePartnerships(for:)` — prevents a
+    /// rapid `.task` re-fire from issuing concurrent identical RPCs.
+    private var loadingPartnershipGameIDs: Set<UUID> = []
     @Published var pinnedClubIDs: [UUID] = []
     @Published var membershipStatesByClubID: [UUID: ClubMembershipState] = [:]
     @Published var ownerJoinRequestsByClubID: [UUID: [ClubJoinRequest]] = [:]
@@ -1718,6 +1726,42 @@ final class AppState: ObservableObject {
             persistCheckedInBookingIDs()
         } catch {
             bookingsErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Convenience accessor for the partnership cache. Returns an empty array
+    /// for solo games and for partnered games that have not yet been loaded.
+    func partnerships(for game: Game) -> [BookingPartnership] {
+        gamePartnershipsByGameID[game.id] ?? []
+    }
+
+    /// Loads the partnership list for a partnered game via the
+    /// `get_game_partnerships` RPC. No-ops for solo games so callers can
+    /// invoke it from a shared `.task` without checking partnership mode
+    /// at every site. Soft-fails on transport error — UI degrades to the
+    /// orphan-rendering fallback path (individual rows for every active
+    /// booking) rather than crashing.
+    func refreshGamePartnerships(for game: Game) async {
+        guard authState == .signedIn else { return }
+        guard game.partnershipMode == "partnered" else { return }
+        guard !loadingPartnershipGameIDs.contains(game.id) else { return }
+
+        loadingPartnershipGameIDs.insert(game.id)
+        defer { loadingPartnershipGameIDs.remove(game.id) }
+
+        do {
+            let rows = try await withAuthRetry {
+                try await self.dataProvider.fetchGamePartnerships(gameID: game.id)
+            }
+            gamePartnershipsByGameID[game.id] = rows
+        } catch {
+            // Soft-fail: keep any cached rows, log for debugging. The players
+            // section falls back to orphan rendering (individual rows for
+            // bookings not yet covered by a partnership), which is correct
+            // when no partnerships have been loaded at all.
+            #if DEBUG
+            print("[AppState] refreshGamePartnerships failed for \(game.id): \(error)")
+            #endif
         }
     }
 
