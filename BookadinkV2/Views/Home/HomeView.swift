@@ -352,18 +352,18 @@ struct HomeView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                 Button { showNearbyDiscovery = true } label: {
-                    ZStack(alignment: .bottomLeading) {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Brand.accentGreen.opacity(0.65))
-                            .frame(height: 9)
-                            .offset(y: -3)
-                        Text(suburb + ".")
-                            .font(.system(size: 42, weight: .bold))
-                            .tracking(-1.5)
-                            .foregroundStyle(Brand.primaryText)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.7)
-                    }
+                    Text(suburb + ".")
+                        .font(.system(size: 42, weight: .bold))
+                        .tracking(-1.5)
+                        .foregroundStyle(Brand.primaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                        .background(alignment: .bottomLeading) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Brand.accentGreen.opacity(0.65))
+                                .frame(height: 9)
+                                .offset(y: -3)
+                        }
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Explore games in \(suburb)")

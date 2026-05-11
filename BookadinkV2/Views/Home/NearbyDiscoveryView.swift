@@ -25,21 +25,29 @@ struct NearbyDiscoveryView: View {
     @State private var distanceFilter: DistanceFilter = .all
     @State private var skillFilter: String? = nil
     @State private var dayFilter: DayFilter = .all
+    @State private var showingFilters: Bool = false
+    @State private var showingLocationDeniedAlert: Bool = false
+
+    /// Driving-distance label keyed by game ID. Empty until each row's `.task`
+    /// resolves a driving ETA — until then the haversine label renders.
+    @State private var drivingLabels: [UUID: String] = [:]
 
     private enum PanelDetent { case minimized, collapsed, expanded }
 
     enum DistanceFilter: String, CaseIterable, Identifiable {
-        case all  = "Any Distance"
-        case km5  = "5 km"
-        case km10 = "10 km"
-        case km25 = "25 km"
+        case all   = "Any Distance"
+        case km25  = "25 km"
+        case km50  = "50 km"
+        case km75  = "75 km"
+        case km100 = "100 km"
         var id: Self { self }
         var meters: Double? {
             switch self {
-            case .all:  return nil
-            case .km5:  return 5_000
-            case .km10: return 10_000
-            case .km25: return 25_000
+            case .all:   return nil
+            case .km25:  return 25_000
+            case .km50:  return 50_000
+            case .km75:  return 75_000
+            case .km100: return 100_000
             }
         }
     }
@@ -145,6 +153,11 @@ struct NearbyDiscoveryView: View {
                 if UIDevice.current.userInterfaceIdiom == .pad {
                     HStack(spacing: 0) {
                         mapLayer
+                            .overlay(alignment: .bottomTrailing) {
+                                locateButton
+                                    .padding(.trailing, 20)
+                                    .padding(.bottom, 20)
+                            }
                         iPadSidePanel
                             .frame(width: 360)
                     }
@@ -152,6 +165,12 @@ struct NearbyDiscoveryView: View {
                     ZStack(alignment: .bottom) {
                         mapLayer
                         bottomPanel
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        locateButton
+                            .padding(.trailing, 14)
+                            .padding(.bottom, panelHeight + 14)
+                            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: panelDetent)
                     }
                     .ignoresSafeArea(edges: .top)
                 }
@@ -181,6 +200,27 @@ struct NearbyDiscoveryView: View {
             }
             .sheet(item: $selectedGameForDetail) { game in
                 NavigationStack { GameDetailView(game: game) }
+            }
+            .sheet(isPresented: $showingFilters) {
+                NearbyFiltersSheet(
+                    dayFilter: $dayFilter,
+                    skillFilter: $skillFilter,
+                    distanceFilter: $distanceFilter,
+                    activeCount: activeFilterCount,
+                    onReset: { clearAllFilters() }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
+            .alert("Location access is off", isPresented: $showingLocationDeniedAlert) {
+                Button("Open Settings") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("Enable location in Settings to centre the map on where you are.")
             }
         }
     }
@@ -338,39 +378,83 @@ struct NearbyDiscoveryView: View {
     }
 
     private var filterRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(DayFilter.allCases) { day in
-                    FilterPill(label: day.rawValue, isActive: dayFilter == day) {
-                        dayFilter = day
+        HStack(spacing: 10) {
+            Button {
+                showingFilters = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "line.3.horizontal.decrease")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Filters")
+                        .font(.system(size: 13, weight: .semibold))
+                    if activeFilterCount > 0 {
+                        Text("\(activeFilterCount)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(Brand.sportPop)
+                            .frame(minWidth: 16, minHeight: 16)
+                            .padding(.horizontal, 4)
+                            .background(Brand.sportStatement, in: Capsule())
                     }
                 }
-
-                Rectangle()
-                    .fill(Brand.softOutline)
-                    .frame(width: 1, height: 20)
-
-                FilterPill(label: "All Levels", isActive: skillFilter == nil) {
-                    skillFilter = nil
-                }
-                ForEach(SkillLevel.allCases.filter { $0 != .all }, id: \.rawValue) { skill in
-                    FilterPill(label: skill.label, isActive: skillFilter == skill.rawValue) {
-                        skillFilter = (skillFilter == skill.rawValue) ? nil : skill.rawValue
-                    }
-                }
-
-                Rectangle()
-                    .fill(Brand.softOutline)
-                    .frame(width: 1, height: 20)
-
-                ForEach(DistanceFilter.allCases.filter { $0 != .all }) { dist in
-                    FilterPill(label: dist.rawValue, isActive: distanceFilter == dist) {
-                        distanceFilter = (distanceFilter == dist) ? .all : dist
-                    }
-                }
+                .foregroundStyle(Brand.ink)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(
+                    activeFilterCount > 0 ? Brand.secondarySurface : Brand.cardBackground,
+                    in: Capsule()
+                )
+                .overlay(
+                    Capsule().stroke(
+                        activeFilterCount > 0 ? Brand.ink.opacity(0.35) : Brand.softOutline,
+                        lineWidth: 1
+                    )
+                )
             }
-            .padding(.horizontal, 16)
+            .buttonStyle(.plain)
+
+            if activeFilterCount > 0 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        if dayFilter != .all {
+                            activeFilterChip(label: dayFilter.rawValue) { dayFilter = .all }
+                        }
+                        if let raw = skillFilter,
+                           let skill = SkillLevel(rawValue: raw) {
+                            activeFilterChip(label: skill.label) { skillFilter = nil }
+                        }
+                        if distanceFilter != .all {
+                            activeFilterChip(label: "≤ \(distanceFilter.rawValue)") {
+                                distanceFilter = .all
+                            }
+                        }
+                    }
+                }
+            } else {
+                Spacer(minLength: 0)
+            }
         }
+        .padding(.horizontal, 16)
+    }
+
+    private func activeFilterChip(label: String, onRemove: @escaping () -> Void) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Brand.ink)
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Brand.secondaryText)
+                    .frame(width: 14, height: 14)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, 6)
+        .padding(.vertical, 5)
+        .background(Brand.cardBackground, in: Capsule())
+        .overlay(Capsule().stroke(Brand.softOutline, lineWidth: 1))
     }
 
     private var gameList: some View {
@@ -441,7 +525,7 @@ struct NearbyDiscoveryView: View {
                     Image(systemName: "mappin.circle.fill")
                         .font(.caption2)
                         .foregroundStyle(Brand.secondaryText.opacity(0.6))
-                    Text(dist)
+                    Text(drivingLabels[game.id] ?? dist)
                         .font(.caption)
                         .foregroundStyle(Brand.secondaryText)
                 }
@@ -449,6 +533,30 @@ struct NearbyDiscoveryView: View {
             }
         }
         .id(game.id)
+        .task(id: game.id) {
+            await resolveDrivingLabelIfEligible(for: game, venues: venues)
+        }
+    }
+
+    /// Lazily upgrades the haversine label on a row to a driving distance + ETA
+    /// when the row's `.task` fires. Silent on failure: the haversine label stays
+    /// in place. Sorting is unaffected — this only mutates `drivingLabels`.
+    private func resolveDrivingLabelIfEligible(for game: Game, venues: [ClubVenue]) async {
+        if drivingLabels[game.id] != nil { return }
+        guard let userLoc = locationManager.userLocation else { return }
+        guard let destLoc = LocationService.location(for: game, venues: venues, clubs: appState.clubs) else { return }
+
+        let haversineMeters = destLoc.distance(from: userLoc)
+        // Under 1 km a driving ETA is awkward (often walkable); over 100 km it
+        // is rarely actionable. Both fall back to the existing haversine label.
+        guard haversineMeters >= 1_000, haversineMeters <= 100_000 else { return }
+
+        let result = await DrivingETAService.shared.resolveETA(
+            from: userLoc.coordinate,
+            to: destLoc.coordinate
+        )
+        guard let result else { return }
+        drivingLabels[game.id] = result.displayLabel
     }
 
     // MARK: - Empty state
@@ -503,6 +611,76 @@ struct NearbyDiscoveryView: View {
                 longitudinalMeters: 50_000
             ))
         }
+    }
+
+    // MARK: - Locate Me
+
+    private var locateButton: some View {
+        Button(action: centerOnUser) {
+            Image(systemName: locateIconName)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(locateIconColor)
+                .frame(width: 44, height: 44)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(Brand.softOutline.opacity(0.6), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Centre map on my location")
+    }
+
+    private var locateIconName: String {
+        switch locationManager.permissionStatus {
+        case .denied, .restricted: return "location.slash.fill"
+        case .authorizedWhenInUse, .authorizedAlways: return "location.fill"
+        case .notDetermined: return "location"
+        }
+    }
+
+    private var locateIconColor: Color {
+        switch locationManager.permissionStatus {
+        case .denied, .restricted: return Brand.secondaryText
+        default: return Brand.ink
+        }
+    }
+
+    private func centerOnUser() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        switch locationManager.permissionStatus {
+        case .denied, .restricted:
+            showingLocationDeniedAlert = true
+        case .notDetermined:
+            locationManager.requestPermissionIfNeeded()
+        case .authorizedWhenInUse, .authorizedAlways:
+            if let userLoc = locationManager.userLocation {
+                withAnimation(.easeInOut(duration: 0.4)) {
+                    cameraPosition = .region(MKCoordinateRegion(
+                        center: userLoc.coordinate,
+                        latitudinalMeters: 15_000,
+                        longitudinalMeters: 15_000
+                    ))
+                }
+            } else {
+                // Authorised but we haven't received a fix yet — ask again.
+                locationManager.requestPermissionIfNeeded()
+            }
+        }
+    }
+
+    // MARK: - Filter helpers
+
+    private var activeFilterCount: Int {
+        var count = 0
+        if dayFilter != .all { count += 1 }
+        if skillFilter != nil { count += 1 }
+        if distanceFilter != .all { count += 1 }
+        return count
+    }
+
+    private func clearAllFilters() {
+        dayFilter = .all
+        skillFilter = nil
+        distanceFilter = .all
     }
 
     // MARK: - Selection helper
@@ -696,5 +874,99 @@ private struct FilterPill: View {
         }
         .buttonStyle(.plain)
         .animation(.easeInOut(duration: 0.15), value: isActive)
+    }
+}
+
+// MARK: - Nearby Filters Sheet
+
+/// Central filter sheet for Explore Nearby. Replaces the legacy swipeable filter row
+/// — same on iPhone and iPad. Bindings flow back to NearbyDiscoveryView so filters
+/// apply as the user toggles them (no Apply step needed).
+private struct NearbyFiltersSheet: View {
+    @Binding var dayFilter: NearbyDiscoveryView.DayFilter
+    @Binding var skillFilter: String?
+    @Binding var distanceFilter: NearbyDiscoveryView.DistanceFilter
+    let activeCount: Int
+    let onReset: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    section(title: "Day") {
+                        wrap {
+                            ForEach(NearbyDiscoveryView.DayFilter.allCases) { day in
+                                FilterPill(label: day.rawValue, isActive: dayFilter == day) {
+                                    dayFilter = day
+                                }
+                            }
+                        }
+                    }
+
+                    section(title: "Skill level") {
+                        wrap {
+                            FilterPill(label: "All Levels", isActive: skillFilter == nil) {
+                                skillFilter = nil
+                            }
+                            ForEach(SkillLevel.allCases.filter { $0 != .all }, id: \.rawValue) { skill in
+                                FilterPill(label: skill.label, isActive: skillFilter == skill.rawValue) {
+                                    skillFilter = (skillFilter == skill.rawValue) ? nil : skill.rawValue
+                                }
+                            }
+                        }
+                    }
+
+                    section(title: "Distance") {
+                        wrap {
+                            FilterPill(label: "Any", isActive: distanceFilter == .all) {
+                                distanceFilter = .all
+                            }
+                            ForEach(NearbyDiscoveryView.DistanceFilter.allCases.filter { $0 != .all }) { dist in
+                                FilterPill(label: dist.rawValue, isActive: distanceFilter == dist) {
+                                    distanceFilter = dist
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 12)
+                .padding(.bottom, 32)
+            }
+            .background(Brand.appBackground)
+            .navigationTitle("Filters")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if activeCount > 0 {
+                        Button("Reset", role: .destructive) { onReset() }
+                            .foregroundStyle(Brand.secondaryText)
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Brand.ink)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func section<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title.uppercased())
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(1.2)
+                .foregroundStyle(Brand.secondaryText)
+            content()
+        }
+    }
+
+    @ViewBuilder
+    private func wrap<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        FlowLayout(spacing: 8) { content() }
     }
 }
