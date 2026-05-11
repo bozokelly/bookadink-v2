@@ -1249,6 +1249,26 @@ struct IPadPagePresentationSizing: ViewModifier {
     }
 }
 
+/// Applies `formStyle(.columns)` on iPad regular-width only (iOS 16+). The
+/// columns style lays out form rows with labels in a left column and
+/// editors in a right column — much better than the phone-first grouped
+/// style on a wide canvas. iPhone (any model, any orientation) and iPad
+/// split-screen narrow (compact) keep the default grouped style so
+/// compact behaviour is untouched.
+struct IPadColumnsFormStyle: ViewModifier {
+    @Environment(\.horizontalSizeClass) private var hSizeClass
+
+    func body(content: Content) -> some View {
+        if #available(iOS 16.0, *),
+           UIDevice.current.userInterfaceIdiom == .pad,
+           hSizeClass == .regular {
+            content.formStyle(.columns)
+        } else {
+            content
+        }
+    }
+}
+
 // MARK: - Sheet View
 
 struct GameScheduleSheet: View {

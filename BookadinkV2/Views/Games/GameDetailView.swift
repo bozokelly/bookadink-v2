@@ -85,20 +85,22 @@ struct GameDetailView: View {
     }
 
     /// Adaptive booking-panel width range. Computed from container width
-    /// (~30% of total, clamped to [320, 420]) so the panel feels right
-    /// across 11" portrait, 11"/13" landscape, and Slide Over wider third
-    /// — no fixed-width sprawl on a 13" canvas.
+    /// (~28% of total, clamped to [320, 400]) so the panel feels docked
+    /// without dominating a 13" canvas. Tighter ratio + lower ceiling
+    /// (vs the previous 0.30 / 420pt) gives the left content more room.
     private static let iPadBookingPanelMinWidth: CGFloat = 320
-    private static let iPadBookingPanelMaxWidth: CGFloat = 420
-    private static let iPadBookingPanelRatio: CGFloat = 0.30
+    private static let iPadBookingPanelMaxWidth: CGFloat = 400
+    private static let iPadBookingPanelRatio: CGFloat = 0.28
 
     private static func iPadBookingPanelWidth(for containerWidth: CGFloat) -> CGFloat {
         min(iPadBookingPanelMaxWidth, max(iPadBookingPanelMinWidth, containerWidth * iPadBookingPanelRatio))
     }
 
-    /// Reading-width cap for the left content column on iPad. Keeps
-    /// section cards comfortable on a 13" canvas instead of sprawling.
-    private static let iPadContentMaxWidth: CGFloat = 760
+    /// Reading-width cap for the left content column on iPad. 840pt
+    /// (vs the previous 760pt) lets section cards fill more of the
+    /// available space so the page no longer reads as a narrow phone
+    /// column floating in a large canvas.
+    private static let iPadContentMaxWidth: CGFloat = 840
 
     // MARK: - Computed Properties
 
@@ -1225,15 +1227,20 @@ struct GameDetailView: View {
             // than "floating in empty space". Soft + small offset keeps
             // it premium without competing with the hero's vignette.
             .shadow(color: .black.opacity(0.08), radius: 14, x: 0, y: 4)
-            .padding(.horizontal, 16)
-            // Lower the panel so its top edge lines up with the metadata
-            // info-grid row in the left column (hero ends at heroHeight,
-            // then top padding 20pt + tagsRowSection ~50pt). Visually
-            // anchors the sidebar to the content, not the hero.
-            // `safeAreaTopPad` cancels the status-bar inset since the
-            // hero ignores safe area; the floor (290) keeps the panel
-            // visible if the safe-area lookup ever returns 0.
-            .padding(.top, max(Self.heroHeight - safeAreaTopPad + 70, 290))
+            // Asymmetric horizontal padding "docks" the card to the right
+            // edge — 20pt leading separates it from the left scroll
+            // column, 12pt trailing pulls it close to the screen edge so
+            // it reads as a structural rail rather than a floating card.
+            .padding(.leading, 20)
+            .padding(.trailing, 12)
+            // Lower the panel another step (~90pt vs heroHeight) so its
+            // top edge sits at the metadata info-grid row in the left
+            // column, not the tags row. Reads as anchored to the content
+            // hierarchy rather than the hero. `safeAreaTopPad` cancels
+            // the status-bar inset since the hero ignores safe area; the
+            // floor (310) keeps the panel visible if the safe-area
+            // lookup ever returns 0.
+            .padding(.top, max(Self.heroHeight - safeAreaTopPad + 90, 310))
             .padding(.bottom, 24)
 
             Spacer(minLength: 0)

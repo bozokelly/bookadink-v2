@@ -123,7 +123,7 @@ struct ClubDashboardView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 14) {
                     if let sub = appState.subscriptionsByClubID[club.id], sub.isPastDue {
                         Label("Payment failed — update your billing details in Plan & Billing to restore access.", systemImage: "exclamationmark.triangle.fill")
                             .font(.footnote)
@@ -140,13 +140,13 @@ struct ClubDashboardView: View {
                 .padding(.horizontal, 18)
                 .padding(.top, 8)
                 .padding(.bottom, 40)
-                // iPad / large phone landscape: cap workspace width so the
-                // dashboard reads as an intentional workspace, not a
-                // centered phone screen. 820pt gives the 2-col nav grid
-                // and primary actions row enough horizontal room to
-                // breathe; tighter section spacing (16pt vs 20pt phone)
-                // increases card density without enlarging the cards.
-                .frame(maxWidth: 820, alignment: .leading)
+                // iPad / large phone landscape: cap workspace width to 880pt
+                // — wide enough that the 2-col nav grid and primary actions
+                // row use horizontal space confidently (workspace feel),
+                // narrow enough that cards stay legible. Section spacing
+                // tightened to 14pt (vs 20pt phone) for higher information
+                // density without enlarging the cards.
+                .frame(maxWidth: 880, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
             .refreshable { await refreshAll() }
