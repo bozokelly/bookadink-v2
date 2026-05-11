@@ -5,8 +5,16 @@ struct ProfileSetupView: View {
 
     @State private var firstName = ""
     @State private var lastName = ""
-    @State private var favoriteClub = ""
-    @State private var skillLevel: SkillLevel = .beginner
+    /// Phase 2A.4: Home Club and Skill Level were removed from onboarding.
+    /// `EditProfileSheet` still exposes both for post-onboarding edits. New
+    /// rows default to `skillLevel = .beginner` (existing server fallback at
+    /// `SupabaseService.swift:1544` and `AppState.swift:4233`) and a nil home
+    /// club, matching the pre-2A.4 server behaviour for empty inputs.
+    /// Escape hatch — without this, a user who signed up with the wrong email
+    /// (or wanted to log into an existing account instead) is trapped on this
+    /// screen with no way back to AuthWelcomeView. Confirmation prevents an
+    /// accidental tap from discarding typed form values.
+    @State private var showSignOutConfirm = false
 
     private var canSubmit: Bool {
         !firstName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
@@ -26,34 +34,19 @@ struct ProfileSetupView: View {
                 VStack(spacing: 14) {
                     inputField("First name", text: $firstName, icon: "person.fill")
                     inputField("Last name", text: $lastName, icon: "person.fill")
-                    inputField("Home club (optional)", text: $favoriteClub, icon: "building.2.fill")
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Skill level")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(Brand.ink)
-
-                        Picker("Skill Level", selection: $skillLevel) {
-                            ForEach(SkillLevel.allCases.filter { $0 != .all }) { level in
-                                Text(level.label).tag(level)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-                    .padding()
-                    .glassCard(cornerRadius: 18, tint: Brand.cardBackground)
 
                     Button {
                         guard canSubmit else { return }
                         let first = firstName.trimmingCharacters(in: .whitespacesAndNewlines)
                         let last = lastName.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let club = favoriteClub.trimmingCharacters(in: .whitespacesAndNewlines)
+                        // Phase 2A.4: server defaults for Home Club + Skill Level.
+                        // Both remain editable in EditProfileSheet post-onboarding.
                         Task {
                             await appState.completeProfile(
                                 firstName: first,
                                 lastName: last,
-                                homeClub: club.isEmpty ? nil : club,
-                                skillLevel: skillLevel
+                                homeClub: nil,
+                                skillLevel: .beginner
                             )
                         }
                     } label: {
@@ -88,6 +81,18 @@ struct ProfileSetupView: View {
                 }
                 .padding(18)
                 .glassCard(cornerRadius: 24, tint: Brand.rosyTaupe.opacity(0.18))
+
+                Button {
+                    showSignOutConfirm = true
+                } label: {
+                    Text("Use a different account")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(Brand.secondaryText)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.plain)
+                .disabled(appState.isSavingProfile)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12)
@@ -96,6 +101,18 @@ struct ProfileSetupView: View {
         }
         .scrollIndicators(.hidden)
         .clipped()
+        .confirmationDialog(
+            "Use a different account?",
+            isPresented: $showSignOutConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Sign out", role: .destructive) {
+                appState.signOut()
+            }
+            Button("Keep setting up", role: .cancel) {}
+        } message: {
+            Text("You'll return to the sign-in screen. Anything you've typed here won't be saved.")
+        }
     }
 
     private func inputField(_ title: String, text: Binding<String>, icon: String) -> some View {
