@@ -35,26 +35,6 @@ struct MainTabView: View {
             }
         }
         .tint(Brand.primaryText)
-        // Floating active-session bar lives globally above the tab bar so admins
-        // can jump back into Generate Play from anywhere. Visibility is purely
-        // derived from `appState.activePlaySessionGame`; the empty branch occupies
-        // zero height so non-active screens look unchanged.
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            Group {
-                if let activeGame = appState.activePlaySessionGame {
-                    // startedAt falls back to game.dateTime for sessions persisted
-                    // before LiveGameSession.startedAt existed.
-                    ActivePlaySessionBar(
-                        game: activeGame,
-                        startedAt: appState.activePlaySessionStartedAt ?? activeGame.dateTime
-                    ) {
-                        schedulingGame = activeGame
-                    }
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-            .animation(.spring(duration: 0.3), value: appState.activePlaySessionGame?.id)
-        }
         .sheet(item: $schedulingGame) { game in
             // Mirror the existing presentation pattern in OwnerManageGamesView so
             // the restored session and confirmedPlayers source remain identical.
@@ -101,6 +81,10 @@ struct MainTabView: View {
     /// `.tabViewStyle(.automatic)` falls back to the platform default;
     /// `DefaultTabViewStyle` is forced so iPad iOS 18+ doesn't replace this
     /// with its built-in sidebar layout (we have our own — see `iPadSidebarLayout`).
+    ///
+    /// `.safeAreaInset(.bottom)` is applied DIRECTLY to TabView (not to a
+    /// parent) so SwiftUI places the active-session bar between the tab
+    /// bar and the content area — never overlapping the tab bar.
     private var tabViewLayout: some View {
         TabView(selection: $appState.selectedTab) {
             destinationView(for: .home)
@@ -126,6 +110,9 @@ struct MainTabView: View {
         }
         .tabViewStyle(DefaultTabViewStyle())
         .toolbarBackground(.visible, for: .tabBar)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            activePlaySessionInset
+        }
     }
 
     /// iPad regular-width: a left-hand floating glass rail replaces the
@@ -133,6 +120,9 @@ struct MainTabView: View {
     /// binding, so deep links / programmatic tab switches continue to
     /// work unchanged. The rail sits near the top safe area; below it the
     /// space is intentionally empty — no full-height desktop sidebar feel.
+    ///
+    /// `.safeAreaInset(.bottom)` floats the active-session bar above the
+    /// home indicator. No tab bar to clear on this layout.
     private var iPadSidebarLayout: some View {
         HStack(alignment: .top, spacing: 0) {
             iPadSidebarRail
@@ -143,6 +133,31 @@ struct MainTabView: View {
             destinationView(for: appState.selectedTab)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            activePlaySessionInset
+        }
+    }
+
+    /// Floating active-session bar surfaced via `safeAreaInset(.bottom)`.
+    /// Shared by both layouts so the bar appears in the same place on
+    /// every device. The empty branch occupies zero height when no
+    /// session is active so non-active screens look unchanged.
+    @ViewBuilder
+    private var activePlaySessionInset: some View {
+        Group {
+            if let activeGame = appState.activePlaySessionGame {
+                // startedAt falls back to game.dateTime for sessions persisted
+                // before LiveGameSession.startedAt existed.
+                ActivePlaySessionBar(
+                    game: activeGame,
+                    startedAt: appState.activePlaySessionStartedAt ?? activeGame.dateTime
+                ) {
+                    schedulingGame = activeGame
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(duration: 0.3), value: appState.activePlaySessionGame?.id)
     }
 
     /// Tab destinations factored out so both `tabViewLayout` and
