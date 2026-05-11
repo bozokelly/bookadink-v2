@@ -73,14 +73,24 @@ struct GameDetailView: View {
 
     // MARK: - Adaptive Layout
 
-    /// Drives the iPad two-column layout. Bound to horizontalSizeClass so
-    /// iPad split-screen narrow (1/3) falls back to the iPhone layout, and
-    /// AND-gated on `userInterfaceIdiom == .pad` so iPhone behaviour
-    /// (including iPhone Pro Max landscape, which reports `.regular`) is
-    /// preserved exactly.
+    /// Two-column iPad layout intentionally disabled — design feedback
+    /// preferred the single-column layout even at page-sized sheet
+    /// presentation. The supporting scaffolding (`iPadWideContentLayer`,
+    /// `iPadBookingSidebar`, `iPadContentMaxWidth`, etc.) is kept in
+    /// place so a future re-enable is a one-line revert here.
+    /// `hSizeClass` is still read so the rest of the body keeps reacting
+    /// to size class for the iPad payment-sheet backdrop dim and any
+    /// future iPad-specific tweaks.
     @Environment(\.horizontalSizeClass) private var hSizeClass
 
     private var isWideLayout: Bool {
+        false
+    }
+
+    /// True when running on iPad regular-width, used for selective iPad
+    /// affordances that should keep firing (e.g. PaymentSheet backdrop
+    /// dim) even though the two-column content layout is disabled.
+    private var isIPadRegular: Bool {
         UIDevice.current.userInterfaceIdiom == .pad && hSizeClass == .regular
     }
 
@@ -324,7 +334,7 @@ struct GameDetailView: View {
         // own backdrop already covers most of the screen there.
         .overlay {
             Color.black
-                .opacity(isShowingPaymentSheet && isWideLayout ? 0.35 : 0)
+                .opacity(isShowingPaymentSheet && isIPadRegular ? 0.35 : 0)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
                 .animation(.easeOut(duration: 0.2), value: isShowingPaymentSheet)
