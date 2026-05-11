@@ -127,6 +127,9 @@ struct OwnerJoinRequestsSheet: View {
                 await appState.refreshOwnerJoinRequests(for: club)
             }
         }
+        // iPad page-sized presentation — same modal language as the
+        // create / edit game sheets so admin flows feel unified.
+        .modifier(IPadPagePresentationSizing())
     }
 }
 
@@ -1156,6 +1159,8 @@ struct OwnerMembersSheet: View {
                     .environmentObject(appState)
             }
         }
+        // iPad page-sized presentation — unifies the admin modal language.
+        .modifier(IPadPagePresentationSizing())
     }
 
     @ViewBuilder
@@ -1600,6 +1605,9 @@ struct OwnerMemberDetailSheet: View {
                 Text("They become the club owner. You stop being owner immediately and can no longer transfer ownership back without the new owner's action.")
             }
         }
+        // iPad page-sized presentation — same modal language as
+        // OwnerMembersSheet and the create / edit game sheets.
+        .modifier(IPadPagePresentationSizing())
     }
 
     private func minimalContactRow(

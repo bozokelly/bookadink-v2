@@ -84,8 +84,21 @@ struct GameDetailView: View {
         UIDevice.current.userInterfaceIdiom == .pad && hSizeClass == .regular
     }
 
-    /// Width of the persistent right-side booking panel on iPad.
-    private static let iPadBookingPanelWidth: CGFloat = 360
+    /// Adaptive booking-panel width range. Computed from container width
+    /// (~30% of total, clamped to [320, 420]) so the panel feels right
+    /// across 11" portrait, 11"/13" landscape, and Slide Over wider third
+    /// — no fixed-width sprawl on a 13" canvas.
+    private static let iPadBookingPanelMinWidth: CGFloat = 320
+    private static let iPadBookingPanelMaxWidth: CGFloat = 420
+    private static let iPadBookingPanelRatio: CGFloat = 0.30
+
+    private static func iPadBookingPanelWidth(for containerWidth: CGFloat) -> CGFloat {
+        min(iPadBookingPanelMaxWidth, max(iPadBookingPanelMinWidth, containerWidth * iPadBookingPanelRatio))
+    }
+
+    /// Reading-width cap for the left content column on iPad. Keeps
+    /// section cards comfortable on a 13" canvas instead of sprawling.
+    private static let iPadContentMaxWidth: CGFloat = 760
 
     // MARK: - Computed Properties
 
@@ -300,6 +313,20 @@ struct GameDetailView: View {
             paymentSheet: paymentSheet,
             onCompletion: handlePaymentCompletion
         )
+        // iPad: dim the app behind the Stripe PaymentSheet. Stripe
+        // presents its sheet as a centered modal card on iPad so the
+        // underlying two-column layout stays highly readable through
+        // Stripe's own backdrop. This overlay sits under the Stripe
+        // modal (Stripe is a UIKit window-level presentation) and only
+        // fires while the sheet is up. iPhone is unaffected — Stripe's
+        // own backdrop already covers most of the screen there.
+        .overlay {
+            Color.black
+                .opacity(isShowingPaymentSheet && isWideLayout ? 0.35 : 0)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+                .animation(.easeOut(duration: 0.2), value: isShowingPaymentSheet)
+        }
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         .task(id: game.id) {
@@ -1063,31 +1090,46 @@ struct GameDetailView: View {
     /// sits below the hero baseline so the hero stays visually intact
     /// across the full screen width above it. The sticky bottom footer
     /// is not rendered here — `iPadBookingSidebar` is its replacement.
+    ///
+    /// Sidebar width is computed from container width via
+    /// `iPadBookingPanelWidth(for:)` so 11" iPad portrait gets the floor
+    /// (320pt), 13" landscape gets the ceiling (420pt), and split-screen
+    /// cases land somewhere in between. Left content is capped at
+    /// `iPadContentMaxWidth` so cards don't sprawl across a 13" canvas.
     private var iPadWideContentLayer: some View {
-        HStack(alignment: .top, spacing: 0) {
-            ScrollView(.vertical) {
-                scrollOffsetProbe
+        GeometryReader { geo in
+            let sidebarWidth = Self.iPadBookingPanelWidth(for: geo.size.width)
+            HStack(alignment: .top, spacing: 0) {
+                ScrollView(.vertical) {
+                    scrollOffsetProbe
 
-                VStack(spacing: 0) {
-                    heroSection
+                    VStack(spacing: 0) {
+                        heroSection
 
-                    VStack(alignment: .leading, spacing: 20) {
-                        gameDetailContent
+                        VStack(alignment: .leading, spacing: 20) {
+                            gameDetailContent
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.top, 20)
+                        // No sticky footer to clear on iPad — bottom padding
+                        // is just breathing room.
+                        .padding(.bottom, 32)
+                        // Cap reading width so section cards stay
+                        // comfortable on a 13" canvas. Centered within the
+                        // remaining left-column space so the empty margins
+                        // read as intentional balance, not abandonment.
+                        .frame(maxWidth: Self.iPadContentMaxWidth)
+                        .frame(maxWidth: .infinity)
                     }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 20)
-                    // No sticky footer to clear on iPad — bottom padding
-                    // is just breathing room.
-                    .padding(.bottom, 32)
                 }
-            }
-            .scrollIndicators(.hidden)
-            .ignoresSafeArea(edges: .top)
-            .frame(maxWidth: .infinity)
+                .scrollIndicators(.hidden)
+                .ignoresSafeArea(edges: .top)
+                .frame(maxWidth: .infinity)
 
-            iPadBookingSidebar
-                .frame(width: Self.iPadBookingPanelWidth)
-                .frame(maxHeight: .infinity, alignment: .top)
+                iPadBookingSidebar
+                    .frame(width: sidebarWidth)
+                    .frame(maxHeight: .infinity, alignment: .top)
+            }
         }
     }
 
@@ -1158,7 +1200,7 @@ struct GameDetailView: View {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 12) {
                     Text("Book this game")
-                        .font(.subheadline.weight(.semibold))
+                        .font(.headline)
                         .foregroundStyle(Brand.primaryText)
                     Spacer(minLength: 0)
                     Button { dismiss() } label: {
@@ -1179,13 +1221,19 @@ struct GameDetailView: View {
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .stroke(Brand.softOutline, lineWidth: 1)
             )
+            // Subtle elevation reads as "anchored deliberately" rather
+            // than "floating in empty space". Soft + small offset keeps
+            // it premium without competing with the hero's vignette.
+            .shadow(color: .black.opacity(0.08), radius: 14, x: 0, y: 4)
             .padding(.horizontal, 16)
-            // Push the panel below the hero so the painted hero stays
-            // visually intact across the full screen width above it.
+            // Lower the panel so its top edge lines up with the metadata
+            // info-grid row in the left column (hero ends at heroHeight,
+            // then top padding 20pt + tagsRowSection ~50pt). Visually
+            // anchors the sidebar to the content, not the hero.
             // `safeAreaTopPad` cancels the status-bar inset since the
-            // hero ignores safe area; the floor (220) keeps the panel
+            // hero ignores safe area; the floor (290) keeps the panel
             // visible if the safe-area lookup ever returns 0.
-            .padding(.top, max(Self.heroHeight - safeAreaTopPad, 220))
+            .padding(.top, max(Self.heroHeight - safeAreaTopPad + 70, 290))
             .padding(.bottom, 24)
 
             Spacer(minLength: 0)

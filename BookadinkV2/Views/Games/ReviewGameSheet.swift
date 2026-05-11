@@ -68,6 +68,10 @@ struct ReviewGameSheet: View {
             // Resolve club in background so the "View Club" button is ready after submit
             resolvedClub = await appState.clubForGame(gameID: gameID)
         }
+        // iPad page-sized presentation — unifies the review sheet with the
+        // other admin / member modals so iPad doesn't render it as a tiny
+        // floating card. iPhone is unaffected.
+        .modifier(IPadPagePresentationSizing())
     }
 
     // MARK: - Rating Stars
