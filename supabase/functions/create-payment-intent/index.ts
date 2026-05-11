@@ -235,7 +235,7 @@ serve(async (req: Request) => {
     gameIDForCheck
       ? supabase
           .from("games")
-          .select("club_id, fee_amount")
+          .select("club_id, fee_amount, publish_at")
           .eq("id", gameIDForCheck)
           .maybeSingle()
       : Promise.resolve({ data: null, error: null }),
@@ -266,6 +266,19 @@ serve(async (req: Request) => {
         JSON.stringify({ error_code: "club_mismatch", error: "Game does not belong to this club." }),
         { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
+    }
+    // Publish gate: a game with a future publish_at is not yet open for bookings.
+    // Mirrors the book_game() RPC gate so a Stripe PaymentIntent is never minted
+    // against a scheduled game, even if a client tries to skip the booking RPC.
+    if (gameRow.publish_at) {
+      const publishAt = new Date(gameRow.publish_at);
+      if (publishAt > new Date()) {
+        console.warn(`[create-payment-intent] Blocked [not_yet_published]: user=${callerID} game=${gameIDForCheck} publish_at=${gameRow.publish_at}`);
+        return new Response(
+          JSON.stringify({ error_code: "not_yet_published", error: "This game isn't open for bookings yet." }),
+          { status: 409, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
     }
     if (!gameRow.fee_amount || gameRow.fee_amount <= 0) {
       console.warn(`[create-payment-intent] Blocked [game_is_free]: user=${callerID} game=${gameIDForCheck} fee_amount=${gameRow.fee_amount}`);
