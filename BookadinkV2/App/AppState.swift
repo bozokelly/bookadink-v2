@@ -62,6 +62,14 @@ final class AppState: ObservableObject {
     @Published var allUpcomingGames: [Game] = []
     @Published var bookings: [BookingWithGame] = []
     @Published var attendeesByGameID: [UUID: [GameAttendee]] = [:]
+    /// Per-game cache of `BookingPartnership` rows. Populated by
+    /// `refreshGamePartnerships` only for partnered games — solo games leave
+    /// the entry absent (and `partnerships(for:)` returns an empty array).
+    /// Drives the "registered players as pairs" rendering in `GameDetailView`.
+    @Published var gamePartnershipsByGameID: [UUID: [BookingPartnership]] = [:]
+    /// Reentrancy guard for `refreshGamePartnerships(for:)` — prevents a
+    /// rapid `.task` re-fire from issuing concurrent identical RPCs.
+    private var loadingPartnershipGameIDs: Set<UUID> = []
     @Published var pinnedClubIDs: [UUID] = []
     @Published var membershipStatesByClubID: [UUID: ClubMembershipState] = [:]
     @Published var ownerJoinRequestsByClubID: [UUID: [ClubJoinRequest]] = [:]
@@ -1594,6 +1602,73 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Convenience accessor for the partnership cache. Returns an empty array
+    /// for solo games and for partnered games that have not yet been loaded.
+    func partnerships(for game: Game) -> [BookingPartnership] {
+        gamePartnershipsByGameID[game.id] ?? []
+    }
+
+    /// P5D: admin-only manual pairing via the `pair_partnered_booking` RPC.
+    /// Throws on failure so the calling sheet can surface the friendly copy
+    /// from `SupabaseServiceError.errorDescription`. On success refreshes
+    /// the game cache, bookings, and partnership list so the BOOKED section
+    /// reflects the new complete pair immediately.
+    func pairPartneredBooking(
+        gameID: UUID,
+        bookingID: UUID,
+        partnerBookingID: UUID
+    ) async throws {
+        try await withAuthRetry {
+            try await self.dataProvider.pairPartneredBooking(
+                gameID: gameID,
+                bookingID: bookingID,
+                partnerBookingID: partnerBookingID
+            )
+        }
+        // Refresh in the order the UI cares about: bookings (so attendee
+        // counts update), game (so the players section re-evaluates state),
+        // and partnerships (so the BOOKED list re-renders pairs).
+        await refreshBookings(silent: true)
+        if let game = allUpcomingGames.first(where: { $0.id == gameID })
+            ?? gamesByClubID.values.flatMap({ $0 }).first(where: { $0.id == gameID }) {
+            if let club = clubs.first(where: { $0.id == game.clubID }) {
+                await refreshGames(for: club)
+            }
+            await refreshAttendees(for: game)
+            await refreshGamePartnerships(for: game)
+        }
+    }
+
+    /// Loads the partnership list for a partnered game via the
+    /// `get_game_partnerships` RPC. No-ops for solo games so callers can
+    /// invoke it from a shared `.task` without checking partnership mode
+    /// at every site. Soft-fails on transport error — UI degrades to the
+    /// orphan-rendering fallback path (individual rows for every active
+    /// booking) rather than crashing.
+    func refreshGamePartnerships(for game: Game) async {
+        guard authState == .signedIn else { return }
+        guard game.partnershipMode == "partnered" else { return }
+        guard !loadingPartnershipGameIDs.contains(game.id) else { return }
+
+        loadingPartnershipGameIDs.insert(game.id)
+        defer { loadingPartnershipGameIDs.remove(game.id) }
+
+        do {
+            let rows = try await withAuthRetry {
+                try await self.dataProvider.fetchGamePartnerships(gameID: game.id)
+            }
+            gamePartnershipsByGameID[game.id] = rows
+        } catch {
+            // Soft-fail: keep any cached rows, log for debugging. The players
+            // section falls back to orphan rendering (individual rows for
+            // bookings not yet covered by a partnership), which is correct
+            // when no partnerships have been loaded at all.
+            #if DEBUG
+            print("[AppState] refreshGamePartnerships failed for \(game.id): \(error)")
+            #endif
+        }
+    }
+
     func refreshBookings(silent: Bool = false) async {
         guard authState == .signedIn, let userID = authUserID else { return }
 
@@ -1981,6 +2056,10 @@ final class AppState: ObservableObject {
                 if let club = clubs.first(where: { $0.id == game.clubID }) {
                     await refreshGames(for: club)
                 }
+                // P5B: pull partnerships so the now-confirmed pair shows up in
+                // the BOOKED list. No-op for solo games (the wrapper bails out
+                // early when partnership_mode != 'partnered').
+                await refreshGamePartnerships(for: game)
             }
         } catch SupabaseServiceError.holdExpired {
             // Hold expired between client check and server PATCH — refresh to show correct state.
@@ -3291,7 +3370,12 @@ final class AppState: ObservableObject {
     /// Returns the booking record so the caller can set `pendingBookingIDForConfirm`.
     /// Throws `SupabaseServiceError.duplicateMembership` when the user already has an active
     /// booking for this game — callers should fall back to the existing pending_payment booking.
-    func reservePaidBooking(for game: Game, creditsAppliedCents: Int?) async throws -> BookingRecord {
+    func reservePaidBooking(
+        for game: Game,
+        creditsAppliedCents: Int?,
+        partnerUserID: UUID? = nil,
+        allocatePartner: Bool = false
+    ) async throws -> BookingRecord {
         guard let userID = authUserID else { throw SupabaseServiceError.authenticationRequired }
         let created = try await withAuthRetry {
             try await self.dataProvider.bookGame(
@@ -3303,7 +3387,9 @@ final class AppState: ObservableObject {
                 paymentMethod: nil,
                 platformFeeCents: nil,
                 clubPayoutCents: nil,
-                creditsAppliedCents: creditsAppliedCents
+                creditsAppliedCents: creditsAppliedCents,
+                partnerUserID: partnerUserID,
+                allocatePartner: allocatePartner
             )
         }
         // Update local cache so bookingState(for:) reflects pending_payment immediately.
@@ -3315,7 +3401,15 @@ final class AppState: ObservableObject {
         return created
     }
 
-    func requestBooking(for game: Game, stripePaymentIntentID: String? = nil, platformFeeCents: Int? = nil, clubPayoutCents: Int? = nil, creditsAppliedCents: Int? = nil) async {
+    func requestBooking(
+        for game: Game,
+        stripePaymentIntentID: String? = nil,
+        platformFeeCents: Int? = nil,
+        clubPayoutCents: Int? = nil,
+        creditsAppliedCents: Int? = nil,
+        partnerUserID: UUID? = nil,
+        allocatePartner: Bool = false
+    ) async {
         bookingsErrorMessage = nil
         bookingInfoMessage = nil
         guard !game.startsInPast else {
@@ -3389,7 +3483,9 @@ final class AppState: ObservableObject {
                     paymentMethod: stripePaymentIntentID != nil ? "stripe" : (creditsAppliedCents != nil ? "credits" : nil),
                     platformFeeCents: platformFeeCents,
                     clubPayoutCents: clubPayoutCents,
-                    creditsAppliedCents: creditsAppliedCents
+                    creditsAppliedCents: creditsAppliedCents,
+                    partnerUserID: partnerUserID,
+                    allocatePartner: allocatePartner
                 )
             }
 
@@ -3478,6 +3574,10 @@ final class AppState: ObservableObject {
                 await refreshGames(for: club)
             }
             await refreshAttendees(for: game)
+            // P5B: refresh partnerships so the new pending/complete row shows
+            // up in GameDetailView's BOOKED list immediately after a partnered
+            // booking. No-op on solo games.
+            await refreshGamePartnerships(for: game)
         } catch let serviceError as SupabaseServiceError {
             switch serviceError {
             case .duplicateMembership:
@@ -3497,6 +3597,19 @@ final class AppState: ObservableObject {
                 if let club = clubs.first(where: { $0.id == game.clubID }) {
                     await refreshGames(for: club)
                 }
+            // P5B: partnered-flow errors. Surface each with the friendly copy
+            // from SupabaseServiceError.errorDescription so the user knows
+            // exactly which gate fired.
+            case .partnerRequired,
+                 .partnerChoiceConflict,
+                 .partnerIsSelf,
+                 .partnerNotFound,
+                 .partnerDUPRRequired,
+                 .partnerAlreadyInGame,
+                 .partnerAlreadyInCompletePartnership,
+                 .partnerIntentAlreadyReserved,
+                 .partnerNotSupportedForSoloGame:
+                bookingsErrorMessage = serviceError.errorDescription ?? "Couldn't complete partnered booking."
             default:
                 bookingsErrorMessage = serviceError.localizedDescription
             }
@@ -4353,7 +4466,12 @@ final class AppState: ObservableObject {
             // 403 is a permission/eligibility error — a refreshed token cannot fix it.
             // Only 401 (genuine auth expiry) should trigger a session refresh.
             return code == 401
-        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notYetPublished, .notAuthorized, .invalidPayload, .rateLimited:
+        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notYetPublished, .notAuthorized, .invalidPayload, .rateLimited,
+             .partnerRequired, .partnerChoiceConflict, .partnerIsSelf, .partnerNotFound,
+             .partnerDUPRRequired, .partnerAlreadyInGame, .partnerAlreadyInCompletePartnership,
+             .partnerIntentAlreadyReserved, .partnerNotSupportedForSoloGame,
+             .pairForbiddenAdminOnly, .notAPartneredGame, .bookingNotActive,
+             .bookingPaymentPending, .partnerIntentAlreadyReservedByOther:
             return false
         }
     }
@@ -4404,7 +4522,12 @@ final class AppState: ObservableObject {
             return true
         case let .httpStatus(code, _):
             return code == 400 || code == 401 || code == 403
-        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notYetPublished, .notAuthorized, .invalidPayload, .rateLimited:
+        case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notYetPublished, .notAuthorized, .invalidPayload, .rateLimited,
+             .partnerRequired, .partnerChoiceConflict, .partnerIsSelf, .partnerNotFound,
+             .partnerDUPRRequired, .partnerAlreadyInGame, .partnerAlreadyInCompletePartnership,
+             .partnerIntentAlreadyReserved, .partnerNotSupportedForSoloGame,
+             .pairForbiddenAdminOnly, .notAPartneredGame, .bookingNotActive,
+             .bookingPaymentPending, .partnerIntentAlreadyReservedByOther:
             return false
         }
     }

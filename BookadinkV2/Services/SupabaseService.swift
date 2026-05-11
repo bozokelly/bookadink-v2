@@ -38,6 +38,17 @@ protocol ClubDataProviding {
     func fetchGames(clubID: UUID) async throws -> [Game]
     func fetchGamesInSeries(recurrenceGroupID: UUID) async throws -> [Game]
     func fetchGameAttendees(gameID: UUID) async throws -> [GameAttendee]
+    /// Display-shaped partnership rows for a partnered game. Calls the
+    /// `get_game_partnerships` SECURITY DEFINER RPC; booking_partnerships
+    /// RLS is locked down so this is the only authenticated read path.
+    /// Returns an empty array when the game is solo or has no active
+    /// partnerships yet.
+    func fetchGamePartnerships(gameID: UUID) async throws -> [BookingPartnership]
+    /// Admin-only manual pairing via the `pair_partnered_booking` RPC. The
+    /// server enforces owner/admin role + bookings/partnership invariants.
+    /// On success the partnership row is materialised (UPDATE-or-INSERT)
+    /// with status='complete'.
+    func pairPartneredBooking(gameID: UUID, bookingID: UUID, partnerBookingID: UUID) async throws
     /// Returns attendance and payment records for all game_attendance rows for this game.
     func fetchAttendanceRecords(gameID: UUID) async throws -> AttendanceRecords
     func updateAttendancePaymentStatus(bookingID: UUID, status: String) async throws
@@ -85,7 +96,7 @@ protocol ClubDataProviding {
     /// Atomically books a game, letting the server determine confirmed vs waitlisted status.
     /// Pass `holdForPayment: true` for paid fresh bookings — creates a `pending_payment`
     /// booking with a 30-min hold so `create-payment-intent` can scope the PI to this booking_id.
-    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord
+    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?, partnerUserID: UUID?, allocatePartner: Bool) async throws -> BookingRecord
     /// Transitions a `pending_payment` booking to `confirmed` after successful Stripe payment.
     func confirmPendingBooking(bookingID: UUID, stripePaymentIntentID: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord
     func ownerCreateBooking(gameID: UUID, userID: UUID, status: String, waitlistPosition: Int?) async throws -> BookingRecord
@@ -225,6 +236,24 @@ enum SupabaseServiceError: LocalizedError {
     case membershipRequired
     case duprRequired
     case notYetPublished
+    // ── Partnered booking (P2 / P2.1 / P3) ────────────────────────────────
+    // Raised by book_game() and pair_partnered_booking() when partnered
+    // gating fails. iOS maps each to a friendly message in AppState.
+    case partnerRequired
+    case partnerChoiceConflict
+    case partnerIsSelf
+    case partnerNotFound
+    case partnerDUPRRequired
+    case partnerAlreadyInGame
+    case partnerAlreadyInCompletePartnership
+    case partnerIntentAlreadyReserved
+    case partnerNotSupportedForSoloGame
+    // ── Partnered manual pair (P3 RPC: pair_partnered_booking) ────────────
+    case pairForbiddenAdminOnly
+    case notAPartneredGame
+    case bookingNotActive
+    case bookingPaymentPending
+    case partnerIntentAlreadyReservedByOther
     case missingSession
     case notAuthorized
     case invalidPayload
@@ -253,6 +282,34 @@ enum SupabaseServiceError: LocalizedError {
             return "A valid DUPR ID is required to book this game."
         case .notYetPublished:
             return "This game isn't open for bookings yet."
+        case .partnerRequired:
+            return "Choose a partner or select allocate me a partner."
+        case .partnerChoiceConflict:
+            return "Choose one partner option only."
+        case .partnerIsSelf:
+            return "You can't select yourself as your partner."
+        case .partnerNotFound:
+            return "We couldn't find that partner's profile."
+        case .partnerDUPRRequired:
+            return "Your selected partner needs a DUPR ID before joining this game."
+        case .partnerAlreadyInGame:
+            return "That player is already registered for this game."
+        case .partnerAlreadyInCompletePartnership:
+            return "That player is already paired for this game."
+        case .partnerIntentAlreadyReserved:
+            return "That player has already been requested as a partner."
+        case .partnerNotSupportedForSoloGame:
+            return "Partner selection is not supported for this game."
+        case .pairForbiddenAdminOnly:
+            return "Only club admins can pair players."
+        case .notAPartneredGame:
+            return "This game is not using partnered registration."
+        case .bookingNotActive:
+            return "One of these players is no longer active in the game."
+        case .bookingPaymentPending:
+            return "Both players must complete payment before pairing."
+        case .partnerIntentAlreadyReservedByOther:
+            return "This pairing conflicts with another pending partner request."
         case .missingSession:
             return "No authenticated session is available."
         case .notAuthorized:
@@ -267,6 +324,24 @@ enum SupabaseServiceError: LocalizedError {
             return "Failed to decode Supabase response: \(message)"
         case let .network(message):
             return "Network error: \(message)"
+        }
+    }
+
+    /// True when `self` is one of the partnered-flow errors raised by
+    /// book_game() / pair_partnered_booking(). Lets callers route ALL
+    /// partner errors through the user-friendly `errorDescription` copy
+    /// without re-enumerating the cases at every catch site.
+    var isPartneredError: Bool {
+        switch self {
+        case .partnerRequired, .partnerChoiceConflict, .partnerIsSelf,
+             .partnerNotFound, .partnerDUPRRequired, .partnerAlreadyInGame,
+             .partnerAlreadyInCompletePartnership, .partnerIntentAlreadyReserved,
+             .partnerNotSupportedForSoloGame,
+             .pairForbiddenAdminOnly, .notAPartneredGame, .bookingNotActive,
+             .bookingPaymentPending, .partnerIntentAlreadyReservedByOther:
+            return true
+        default:
+            return false
         }
     }
 }
@@ -453,7 +528,7 @@ final class SupabaseService: ClubDataProviding {
         let gameRows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key"),
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode"),
                 .init(name: "club_id", value: "eq.\(clubID.uuidString)"),
                 .init(name: "archived_at", value: "is.null"),  // exclude archived games
                 .init(name: "order", value: "date_time.asc")
@@ -493,7 +568,7 @@ final class SupabaseService: ClubDataProviding {
         let gameRows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select",       value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,latitude,longitude,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key"),
+                .init(name: "select",       value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,latitude,longitude,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode"),
                 .init(name: "date_time",    value: "gte.\(nowStr)"),
                 .init(name: "date_time",    value: "lte.\(windowEndStr)"),
                 .init(name: "archived_at",  value: "is.null"),
@@ -531,7 +606,7 @@ final class SupabaseService: ClubDataProviding {
         let gameRows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key"),
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode"),
                 .init(name: "recurrence_group_id", value: "eq.\(recurrenceGroupID.uuidString)"),
                 .init(name: "order", value: "date_time.asc")
             ],
@@ -549,7 +624,7 @@ final class SupabaseService: ClubDataProviding {
         let bookingRows: [BookingRow] = try await send(
             path: "bookings",
             queryItems: [
-                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at,games(id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key)"),
+                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at,games(id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode)"),
                 .init(name: "user_id", value: "eq.\(userID.uuidString)"),
                 .init(name: "order", value: "created_at.desc")
             ],
@@ -612,6 +687,92 @@ final class SupabaseService: ClubDataProviding {
             .sorted { lhs, rhs in
                 self.attendeeComparator(lhs: lhs, rhs: rhs)
             }
+    }
+
+    func fetchGamePartnerships(gameID: UUID) async throws -> [BookingPartnership] {
+        guard SupabaseConfig.isConfigured else { return [] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pGameId: UUID
+            enum CodingKeys: String, CodingKey { case pGameId = "p_game_id" }
+        }
+
+        let rows: [BookingPartnershipRow] = try await send(
+            path: "rpc/get_game_partnerships",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pGameId: gameID)),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        return rows.compactMap { $0.toPartnership() }
+    }
+
+    func pairPartneredBooking(
+        gameID: UUID,
+        bookingID: UUID,
+        partnerBookingID: UUID
+    ) async throws {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pGameId: UUID
+            let pBookingId: UUID
+            let pPartnerBookingId: UUID
+            enum CodingKeys: String, CodingKey {
+                case pGameId = "p_game_id"
+                case pBookingId = "p_booking_id"
+                case pPartnerBookingId = "p_partner_booking_id"
+            }
+        }
+
+        do {
+            // The RPC returns a partnership row; we don't currently decode it
+            // here — AppState refreshes via fetchGamePartnerships after success,
+            // which is the source of truth for the UI.
+            let _: [BookingPartnershipRow] = try await send(
+                path: "rpc/pair_partnered_booking",
+                queryItems: [],
+                method: "POST",
+                body: try JSONEncoder().encode(Params(
+                    pGameId: gameID,
+                    pBookingId: bookingID,
+                    pPartnerBookingId: partnerBookingID
+                )),
+                authBearerToken: authToken,
+                extraHeaders: ["Content-Type": "application/json"]
+            )
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(_, body) = error {
+                // Order matters: longer / more specific substrings first so a
+                // generic "dupr_required" doesn't preempt "partner_dupr_required",
+                // and "..._reserved_by_other" doesn't get caught by "..._reserved".
+                if body.contains("partner_dupr_required") { throw SupabaseServiceError.partnerDUPRRequired }
+                if body.contains("partner_booking_payment_pending") { throw SupabaseServiceError.bookingPaymentPending }
+                if body.contains("partner_booking_not_active") { throw SupabaseServiceError.bookingNotActive }
+                if body.contains("partner_intent_already_reserved_by_other") { throw SupabaseServiceError.partnerIntentAlreadyReservedByOther }
+                if body.contains("partner_booking_not_found") { throw SupabaseServiceError.notFound }
+                if body.contains("booking_already_in_complete_partnership") { throw SupabaseServiceError.partnerAlreadyInCompletePartnership }
+                if body.contains("booking_payment_pending") { throw SupabaseServiceError.bookingPaymentPending }
+                if body.contains("booking_not_active") { throw SupabaseServiceError.bookingNotActive }
+                if body.contains("booking_not_found") { throw SupabaseServiceError.notFound }
+                if body.contains("bookings_game_mismatch") { throw SupabaseServiceError.notFound }
+                if body.contains("not_a_partnered_game") { throw SupabaseServiceError.notAPartneredGame }
+                if body.contains("forbidden_owner_or_admin_only") { throw SupabaseServiceError.pairForbiddenAdminOnly }
+                if body.contains("same_booking_not_allowed") { throw SupabaseServiceError.invalidPayload }
+                if body.contains("partner_is_self") { throw SupabaseServiceError.partnerIsSelf }
+                if body.contains("authentication_required") { throw SupabaseServiceError.authenticationRequired }
+                if body.contains("dupr_required") { throw SupabaseServiceError.duprRequired }
+            }
+            throw error
+        }
     }
 
     func fetchAttendanceRecords(gameID: UUID) async throws -> AttendanceRecords {
@@ -1997,7 +2158,7 @@ final class SupabaseService: ClubDataProviding {
         let rows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,appearance_palette_key,appearance_pattern_key")
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode")
             ],
             method: "POST",
             body: try JSONEncoder().encode([payload]),
@@ -2055,7 +2216,7 @@ final class SupabaseService: ClubDataProviding {
             path: "games",
             queryItems: [
                 .init(name: "id", value: "eq.\(gameID.uuidString)"),
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,appearance_palette_key,appearance_pattern_key")
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode")
             ],
             method: "PATCH",
             body: try JSONEncoder().encode(payload),
@@ -2080,7 +2241,7 @@ final class SupabaseService: ClubDataProviding {
             path: "games",
             queryItems: [
                 .init(name: "id", value: "eq.\(gameID.uuidString)"),
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key")
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode")
             ],
             method: "DELETE",
             body: nil,
@@ -2103,7 +2264,7 @@ final class SupabaseService: ClubDataProviding {
             path: "games",
             queryItems: [
                 .init(name: "id", value: "eq.\(gameID.uuidString)"),
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key")
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode")
             ],
             method: "PATCH",
             body: payload,
@@ -2296,7 +2457,7 @@ final class SupabaseService: ClubDataProviding {
         }
     }
 
-    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool = false, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?) async throws -> BookingRecord {
+    func bookGame(gameID: UUID, userID: UUID, feePaid: Bool, holdForPayment: Bool = false, stripePaymentIntentID: String?, paymentMethod: String?, platformFeeCents: Int?, clubPayoutCents: Int?, creditsAppliedCents: Int?, partnerUserID: UUID? = nil, allocatePartner: Bool = false) async throws -> BookingRecord {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
             throw SupabaseServiceError.authenticationRequired
@@ -2312,6 +2473,8 @@ final class SupabaseService: ClubDataProviding {
             let pPlatformFeeCents: Int?
             let pClubPayoutCents: Int?
             let pCreditsAppliedCents: Int?
+            let pPartnerUserId: UUID?
+            let pAllocatePartner: Bool
             enum CodingKeys: String, CodingKey {
                 case pGameId = "p_game_id"
                 case pUserId = "p_user_id"
@@ -2322,6 +2485,8 @@ final class SupabaseService: ClubDataProviding {
                 case pPlatformFeeCents = "p_platform_fee_cents"
                 case pClubPayoutCents = "p_club_payout_cents"
                 case pCreditsAppliedCents = "p_credits_applied_cents"
+                case pPartnerUserId = "p_partner_user_id"
+                case pAllocatePartner = "p_allocate_partner"
             }
             func encode(to encoder: Encoder) throws {
                 var c = encoder.container(keyedBy: CodingKeys.self)
@@ -2334,6 +2499,8 @@ final class SupabaseService: ClubDataProviding {
                 try c.encodeIfPresent(pPlatformFeeCents,     forKey: .pPlatformFeeCents)
                 try c.encodeIfPresent(pClubPayoutCents,      forKey: .pClubPayoutCents)
                 try c.encodeIfPresent(pCreditsAppliedCents,  forKey: .pCreditsAppliedCents)
+                try c.encodeIfPresent(pPartnerUserId,        forKey: .pPartnerUserId)
+                try c.encode(pAllocatePartner, forKey: .pAllocatePartner)
             }
         }
 
@@ -2346,7 +2513,9 @@ final class SupabaseService: ClubDataProviding {
             pPaymentMethod: paymentMethod,
             pPlatformFeeCents: platformFeeCents,
             pClubPayoutCents: clubPayoutCents,
-            pCreditsAppliedCents: creditsAppliedCents
+            pCreditsAppliedCents: creditsAppliedCents,
+            pPartnerUserId: partnerUserID,
+            pAllocatePartner: allocatePartner
         )
 
         do {
@@ -2366,6 +2535,18 @@ final class SupabaseService: ClubDataProviding {
                 if code == 409 { throw SupabaseServiceError.duplicateMembership }
                 if body.contains("game_not_found") { throw SupabaseServiceError.notFound }
                 if body.contains("membership_required") { throw SupabaseServiceError.membershipRequired }
+                // Partnered error mapping (P2 / P2.1). Order matters: longer / more
+                // specific substrings must be checked before shorter ones so
+                // "partner_dupr_required" doesn't get caught by "dupr_required".
+                if body.contains("partner_dupr_required") { throw SupabaseServiceError.partnerDUPRRequired }
+                if body.contains("partner_already_in_complete_partnership") { throw SupabaseServiceError.partnerAlreadyInCompletePartnership }
+                if body.contains("partner_intent_already_reserved") { throw SupabaseServiceError.partnerIntentAlreadyReserved }
+                if body.contains("partner_already_in_game") { throw SupabaseServiceError.partnerAlreadyInGame }
+                if body.contains("partner_not_supported_for_solo_game") { throw SupabaseServiceError.partnerNotSupportedForSoloGame }
+                if body.contains("partner_choice_conflict") { throw SupabaseServiceError.partnerChoiceConflict }
+                if body.contains("partner_is_self") { throw SupabaseServiceError.partnerIsSelf }
+                if body.contains("partner_not_found") { throw SupabaseServiceError.partnerNotFound }
+                if body.contains("partner_required") { throw SupabaseServiceError.partnerRequired }
                 if body.contains("dupr_required") { throw SupabaseServiceError.duprRequired }
                 if body.contains("not_yet_published") { throw SupabaseServiceError.notYetPublished }
             }
@@ -3746,7 +3927,7 @@ final class SupabaseService: ClubDataProviding {
         let rows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key"),
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode"),
                 .init(name: "id", value: "eq.\(gameID.uuidString.lowercased())"),
                 .init(name: "limit", value: "1")
             ],
@@ -5515,6 +5696,7 @@ private struct GameRow: Decodable {
     let publishAtRaw: String?
     let appearancePaletteKey: String?
     let appearancePatternKey: String?
+    let partnershipModeRaw: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -5543,6 +5725,7 @@ private struct GameRow: Decodable {
         case publishAtRaw = "publish_at"
         case appearancePaletteKey = "appearance_palette_key"
         case appearancePatternKey = "appearance_pattern_key"
+        case partnershipModeRaw = "partnership_mode"
     }
 
     func toGame(confirmedCount: Int?, waitlistCount: Int?) -> Game {
@@ -5574,7 +5757,8 @@ private struct GameRow: Decodable {
             waitlistCount: waitlistCount,
             publishAt: publishAtRaw.flatMap { SupabaseDateParser.parse($0) },
             appearancePaletteKey: appearancePaletteKey,
-            appearancePatternKey: appearancePatternKey
+            appearancePatternKey: appearancePatternKey,
+            partnershipMode: partnershipModeRaw ?? "solo"
         )
     }
 }
@@ -5877,6 +6061,66 @@ private struct GameAttendanceRow: Decodable {
         case bookingID = "booking_id"
         case paymentStatus = "payment_status"
         case attendanceStatus = "attendance_status"
+    }
+}
+
+/// Wire shape returned by the `get_game_partnerships` RPC (one row per
+/// active partnership in a game). All fields except `partnershipID` /
+/// `status` / `playerABookingID` are optional because pending partnerships
+/// leave player B + intent fields nil, and non-DUPR games leave the rating
+/// fields nil at source.
+private struct BookingPartnershipRow: Decodable {
+    let partnershipID: UUID
+    let status: String
+    let playerABookingID: UUID
+    let playerAUserID: UUID?
+    let playerAName: String?
+    let playerADUPRRating: Double?
+    let playerBBookingID: UUID?
+    let playerBUserID: UUID?
+    let playerBName: String?
+    let playerBDUPRRating: Double?
+    let requestedPartnerUserID: UUID?
+    let requestedPartnerName: String?
+    let createdAtRaw: String?
+
+    enum CodingKeys: String, CodingKey {
+        case partnershipID = "partnership_id"
+        case status
+        case playerABookingID = "player_a_booking_id"
+        case playerAUserID = "player_a_user_id"
+        case playerAName = "player_a_name"
+        case playerADUPRRating = "player_a_dupr_rating"
+        case playerBBookingID = "player_b_booking_id"
+        case playerBUserID = "player_b_user_id"
+        case playerBName = "player_b_name"
+        case playerBDUPRRating = "player_b_dupr_rating"
+        case requestedPartnerUserID = "requested_partner_user_id"
+        case requestedPartnerName = "requested_partner_name"
+        case createdAtRaw = "created_at"
+    }
+
+    /// Returns nil only when the partnership row is malformed (no player A
+    /// user id). The RPC's server-side LEFT JOINs guarantee a player A
+    /// booking always points at a real booking → real user, but the
+    /// defensive nil-check keeps a degraded DB from crashing the client.
+    func toPartnership() -> BookingPartnership? {
+        guard let playerAUserID else { return nil }
+        return BookingPartnership(
+            id: partnershipID,
+            status: status,
+            playerABookingID: playerABookingID,
+            playerAUserID: playerAUserID,
+            playerAName: playerAName,
+            playerADUPRRating: playerADUPRRating,
+            playerBBookingID: playerBBookingID,
+            playerBUserID: playerBUserID,
+            playerBName: playerBName,
+            playerBDUPRRating: playerBDUPRRating,
+            requestedPartnerUserID: requestedPartnerUserID,
+            requestedPartnerName: requestedPartnerName,
+            createdAt: createdAtRaw.flatMap { SupabaseDateParser.parse($0) }
+        )
     }
 }
 

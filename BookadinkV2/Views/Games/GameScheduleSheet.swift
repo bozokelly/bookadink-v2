@@ -423,6 +423,285 @@ enum ScheduleEngine {
     private static func pairKey(_ a: GameAttendee, _ b: GameAttendee) -> String {
         let ids = [a.id.uuidString, b.id.uuidString].sorted(); return "\(ids[0])-\(ids[1])"
     }
+
+    // ── Partnered Scheduling (P5C) ─────────────────────────────────────────
+    //
+    // When a game's `partnership_mode == 'partnered'`, generation runs over
+    // `PartneredTeam` units (2 players who must sit on the same side of the
+    // net on the same court) rather than individual `GameAttendee`s. Each
+    // court holds exactly 2 teams; teams never split across courts and never
+    // get separated within a court.
+    //
+    // Sit-out rotation: when there are more teams than courts*2, the
+    // surplus teams sit out in rotation. Sit-outs always come in whole
+    // pairs — never half a partnership.
+
+    static func generate(
+        teams: [PartneredTeam],
+        courtCount: Int,
+        roundCount: Int,
+        method: ScheduleAllocationMethod
+    ) -> GeneratedSchedule {
+        guard teams.count >= 2, courtCount > 0, roundCount > 0 else {
+            return GeneratedSchedule(rounds: [], method: method, courtCount: courtCount)
+        }
+        let teamsPerCourt = 2
+        let teamSitPerRound = max(0, teams.count - courtCount * teamsPerCourt)
+
+        switch method {
+        case .random:
+            var rounds: [ScheduledRound] = []
+            for r in 0..<roundCount {
+                let (sitOutTeams, activeTeams) = rotatingTeamSitOuts(
+                    teams: teams, round: r, sitPerRound: teamSitPerRound
+                )
+                var shuffled = activeTeams
+                shuffled.shuffle()
+                rounds.append(ScheduledRound(
+                    number: r + 1,
+                    courts: buildPartneredCourts(from: shuffled, courtCount: courtCount),
+                    sitOuts: sitOutTeams.flatMap { [$0.playerA, $0.playerB] }
+                ))
+            }
+            return GeneratedSchedule(rounds: rounds, method: .random, courtCount: courtCount)
+
+        case .roundRobin:
+            // Rotate teams so each pair sees different opponents across rounds.
+            // Pairs stay intact — only the team-vs-team matchups vary.
+            var rounds: [ScheduledRound] = []
+            for r in 0..<roundCount {
+                let (sitOutTeams, activeTeams) = rotatingTeamSitOuts(
+                    teams: teams, round: r, sitPerRound: teamSitPerRound
+                )
+                let offset = r % max(activeTeams.count, 1)
+                let rotated = Array(activeTeams[offset...] + activeTeams[..<offset])
+                rounds.append(ScheduledRound(
+                    number: r + 1,
+                    courts: buildPartneredCourts(from: rotated, courtCount: courtCount),
+                    sitOuts: sitOutTeams.flatMap { [$0.playerA, $0.playerB] }
+                ))
+            }
+            return GeneratedSchedule(rounds: rounds, method: .roundRobin, courtCount: courtCount)
+
+        case .kingOfCourt, .duprKingOfCourt:
+            // Both KotC variants only generate round 1 here. Subsequent rounds
+            // are produced via partneredKOTCNextRound() from the UI layer.
+            // For DUPR KOTC partnered: seed by combined DUPR descending so the
+            // highest-rated pair lands on Court 1. From round 2 onwards the
+            // movement is plain KOTC (per-pair winner/loser rotation). There
+            // is no "cycle of 3 within a court" — partners stay together so
+            // the cycle concept doesn't apply.
+            let seeded: [PartneredTeam]
+            if method == .duprKingOfCourt {
+                seeded = teams.sorted { ($0.combinedDUPRRating ?? -1) > ($1.combinedDUPRRating ?? -1) }
+            } else {
+                seeded = teams
+            }
+            return GeneratedSchedule(
+                rounds: [partneredKOTCFirstRound(teams: seeded, courtCount: courtCount)],
+                method: method,
+                courtCount: courtCount
+            )
+        }
+    }
+
+    /// First round of a partnered KOTC session — top `courtCount * 2` teams
+    /// land on courts (one team per side); the rest sit out.
+    static func partneredKOTCFirstRound(
+        teams: [PartneredTeam],
+        courtCount: Int
+    ) -> ScheduledRound {
+        let activeTeams = Array(teams.prefix(courtCount * 2))
+        let sitOutTeams = Array(teams.dropFirst(courtCount * 2))
+        return ScheduledRound(
+            number: 1,
+            courts: buildPartneredCourts(from: activeTeams, courtCount: courtCount),
+            sitOuts: sitOutTeams.flatMap { [$0.playerA, $0.playerB] }
+        )
+    }
+
+    /// Generate the next partnered-KOTC round given confirmed results.
+    /// Movement rules mirror solo KOTC but operate per-pair:
+    ///   • Court 1 winning pair → stays Court 1
+    ///   • Court 1 losing pair  → goes to Court 2
+    ///   • Court K (K>1) winning pair → Court K-1
+    ///   • Court K (K>1) losing pair  → Court K+1 (capped at last court)
+    /// Pairs are never split. Sit-out teams are rotated in to fill any court
+    /// that ends up with fewer than 2 teams (rare — only when an upstream
+    /// court has no result confirmed).
+    static func partneredKOTCNextRound(
+        previousRound: ScheduledRound,
+        results: [UUID: CourtResult],
+        allTeams: [PartneredTeam],
+        roundNumber: Int
+    ) -> ScheduledRound {
+        let courts = previousRound.courts.sorted { $0.number < $1.number }
+        let courtCount = courts.count
+        let maxCourt = courtCount
+
+        // For each destination court, accumulate the teams that land there.
+        // A "team" is preserved as the original [GameAttendee] pair from the
+        // previous round's teamA/teamB — pairs are never re-shuffled.
+        var courtTeams: [Int: [[GameAttendee]]] = [:]
+
+        for court in courts {
+            let teamA = court.teamA
+            let teamB = court.teamB
+
+            guard let result = results[court.id], result.isConfirmed, let winner = result.winner else {
+                // No confirmed result — both teams hold on the same court.
+                courtTeams[court.number, default: []].append(teamA)
+                courtTeams[court.number, default: []].append(teamB)
+                continue
+            }
+
+            let winningTeam = winner == .teamA ? teamA : teamB
+            let losingTeam  = winner == .teamA ? teamB : teamA
+
+            let winnerCourt: Int
+            let loserCourt: Int
+            if court.number == 1 {
+                winnerCourt = 1
+                loserCourt  = min(2, maxCourt)
+            } else {
+                winnerCourt = court.number - 1
+                loserCourt  = min(court.number + 1, maxCourt)
+            }
+
+            courtTeams[winnerCourt, default: []].append(winningTeam)
+            courtTeams[loserCourt,  default: []].append(losingTeam)
+        }
+
+        // Identify which teams sat out last round (not on any court).
+        let onCourtAttendeeIDs: Set<UUID> = Set(
+            courts.flatMap { $0.teamA + $0.teamB }.map(\.id)
+        )
+        var sitOutPool: [PartneredTeam] = allTeams.filter { team in
+            !onCourtAttendeeIDs.contains(team.playerA.id) &&
+            !onCourtAttendeeIDs.contains(team.playerB.id)
+        }
+
+        var orderedCourts: [ScheduledCourt] = []
+        var newSitOutAttendees: [GameAttendee] = []
+
+        for courtNum in 1...max(courtCount, 1) {
+            var teamsHere = courtTeams[courtNum] ?? []
+
+            // Fill empty slots from sit-out pool (always whole pairs).
+            while teamsHere.count < 2, !sitOutPool.isEmpty {
+                let team = sitOutPool.removeFirst()
+                teamsHere.append([team.playerA, team.playerB])
+            }
+
+            if teamsHere.count >= 2 {
+                orderedCourts.append(ScheduledCourt(
+                    number: courtNum,
+                    teamA: teamsHere[0],
+                    teamB: teamsHere[1]
+                ))
+                // Excess teams (rare — only when both sides of a duplicate
+                // result reached this court) overflow to sit-outs.
+                for extra in teamsHere.dropFirst(2) {
+                    newSitOutAttendees.append(contentsOf: extra)
+                }
+            } else {
+                // Partially filled court → its single team sits out this round.
+                for team in teamsHere {
+                    newSitOutAttendees.append(contentsOf: team)
+                }
+            }
+        }
+
+        // Whatever remains in the pool sits out this round.
+        for team in sitOutPool {
+            newSitOutAttendees.append(contentsOf: [team.playerA, team.playerB])
+        }
+
+        return ScheduledRound(
+            number: roundNumber,
+            courts: orderedCourts,
+            sitOuts: newSitOutAttendees
+        )
+    }
+
+    // MARK: Partnered helpers
+
+    /// Assigns 2 teams per court, in order. Used by random / round-robin /
+    /// KOTC-first-round. Solo's `buildCourts` shape (4 attendees → court)
+    /// is preserved at the boundary so downstream views are unchanged.
+    private static func buildPartneredCourts(
+        from teams: [PartneredTeam],
+        courtCount: Int
+    ) -> [ScheduledCourt] {
+        (0..<courtCount).compactMap { i in
+            let s = i * 2
+            guard s + 1 < teams.count else { return nil }
+            return ScheduledCourt(
+                number: i + 1,
+                teamA: [teams[s].playerA, teams[s].playerB],
+                teamB: [teams[s+1].playerA, teams[s+1].playerB]
+            )
+        }
+    }
+
+    /// Rotates whole teams through the sit-out slots so over multiple rounds
+    /// every team gets approximately equal play time. Mirrors the solo
+    /// `rotatingSitOuts` algorithm but with `PartneredTeam` as the unit.
+    static func rotatingTeamSitOuts(
+        teams: [PartneredTeam],
+        round: Int,
+        sitPerRound: Int
+    ) -> (sitOuts: [PartneredTeam], active: [PartneredTeam]) {
+        guard sitPerRound > 0 else { return ([], teams) }
+        let n = teams.count
+        var sitOuts: [PartneredTeam] = []
+        var sitOutIDs = Set<UUID>()
+        for i in 0..<sitPerRound {
+            let t = teams[(round * sitPerRound + i) % n]
+            if !sitOutIDs.contains(t.id) {
+                sitOuts.append(t)
+                sitOutIDs.insert(t.id)
+            }
+        }
+        if sitOuts.count < sitPerRound {
+            for t in teams where !sitOutIDs.contains(t.id) {
+                sitOuts.append(t); sitOutIDs.insert(t.id)
+                if sitOuts.count == sitPerRound { break }
+            }
+        }
+        let active = teams.filter { !sitOutIDs.contains($0.id) }
+        return (sitOuts, active)
+    }
+}
+
+// MARK: - Partnered Team
+
+/// Pair of GameAttendees that must remain on the same side of the net on the
+/// same court for the duration of a partnered Generate Play session. Built
+/// from `BookingPartnership` rows where `status == 'complete'`. The
+/// scheduling engine treats this as the atomic scheduling unit for partnered
+/// games — pairs are never split, neither across courts nor within a court.
+struct PartneredTeam: Identifiable, Hashable {
+    /// Partnership row id (used for stable sort + sit-out rotation). Distinct
+    /// from the players' booking/user ids.
+    let id: UUID
+    let playerA: GameAttendee
+    let playerB: GameAttendee
+
+    /// Combined DUPR rating (sum) used for DUPR KOTC seeding. Returns nil if
+    /// either player has no DUPR rating, in which case DUPR-KOTC seeding
+    /// falls back to ordering by `combinedDUPR ?? -1` so unrated teams sit
+    /// at the bottom rather than crashing the sort.
+    var combinedDUPRRating: Double? {
+        guard let a = playerA.duprRating, let b = playerB.duprRating else { return nil }
+        return a + b
+    }
+
+    /// Average DUPR — surfaced for display contexts that prefer mean over sum.
+    var averageDUPRRating: Double? {
+        guard let combined = combinedDUPRRating else { return nil }
+        return combined / 2.0
+    }
 }
 
 // MARK: - DUPR King of the Court Engine
@@ -1332,21 +1611,95 @@ struct GameScheduleSheet: View {
 
     private var hasDUPRData: Bool { !duprRatings.isEmpty }
 
+    // ── Partnered Generate Play helpers (P5C) ──────────────────────────────
+
+    private var isPartneredGame: Bool {
+        game.partnershipMode == "partnered"
+    }
+
+    /// Pair units derived from `appState.partnerships(for: game)` for complete
+    /// partnerships only, cross-referenced against `confirmedPlayers` so a
+    /// row with a stale booking (e.g. partner cancelled between fetches) is
+    /// dropped rather than crashing the engine. Empty for solo games.
+    private var partneredTeams: [PartneredTeam] {
+        guard isPartneredGame else { return [] }
+        let byBookingID = Dictionary(
+            uniqueKeysWithValues: confirmedPlayers.map { ($0.booking.id, $0) }
+        )
+        return appState.partnerships(for: game)
+            .filter { $0.isComplete }
+            .compactMap { partnership in
+                guard let bID = partnership.playerBBookingID,
+                      let a = byBookingID[partnership.playerABookingID],
+                      let b = byBookingID[bID] else { return nil }
+                return PartneredTeam(id: partnership.id, playerA: a, playerB: b)
+            }
+    }
+
+    /// Friendly message explaining why the partnered game can't yet generate
+    /// play. Returns nil when the partnered state is clean OR when the game
+    /// is solo (so the existing solo enable logic flows through unchanged).
+    private var partneredValidationError: String? {
+        guard isPartneredGame else { return nil }
+
+        let allPartnerships = appState.partnerships(for: game)
+
+        // Any pending row → admin must pair (or someone must cancel) before
+        // generating. Allocate-me rows are also pending.
+        if allPartnerships.contains(where: { $0.isPending }) {
+            return "Some players are not paired yet. Pair them before generating play."
+        }
+
+        // Orphan check: every confirmed player must be covered by a complete
+        // partnership. Bookings created via owner_create_booking bypass
+        // book_game() and don't create partnership rows — those are the
+        // typical orphans that block partnered generation today.
+        let coveredBookingIDs = Set(
+            allPartnerships
+                .filter { $0.isComplete }
+                .flatMap { $0.bookingIDs }
+        )
+        let orphans = confirmedPlayers.filter {
+            !coveredBookingIDs.contains($0.booking.id)
+        }
+        if !orphans.isEmpty {
+            return "Some players are not paired yet. Pair them before generating play."
+        }
+
+        // Minimum of 2 complete pairs to play.
+        if partneredTeams.count < 2 {
+            return "Need at least 2 complete pairs to start partnered play."
+        }
+
+        return nil
+    }
+
+    /// True when the partnered state is clean OR the game is solo. Used by
+    /// the Start Session button's `enabled` flag and the next-round gates.
+    private var partneredCanGenerate: Bool { partneredValidationError == nil }
+
     // Active rounds to display (both KotC variants use kotcRounds, others use schedule.rounds)
     private var activeRounds: [ScheduledRound] {
         if method.isKingOfCourt { return kotcRounds }
         return schedule?.rounds ?? []
     }
 
-    // Standard KotC: can generate next round when all courts in the last round have confirmed results
+    // Standard KotC: can generate next round when all courts in the last round have confirmed results.
+    // P5C: partnered DUPR KOTC also flows through this gate — partnered games don't use the 3-round
+    // "cycle" concept (partners stay together; no within-court rotation), so DUPR KOTC partnered
+    // behaves as plain KOTC with combined-DUPR seeding.
     private var kotcCanGenerateNextRound: Bool {
-        guard method == .kingOfCourt, let lastRound = kotcRounds.last else { return false }
+        let isKOTCFlow = method == .kingOfCourt
+            || (method == .duprKingOfCourt && isPartneredGame)
+        guard isKOTCFlow, let lastRound = kotcRounds.last else { return false }
         return lastRound.courts.allSatisfy { courtResults[$0.id]?.isConfirmed == true }
     }
 
-    // DUPR KotC: can generate next cycle when all 3 rounds of the current cycle are fully confirmed
+    // DUPR KotC (solo): can generate next cycle when all 3 rounds of the current cycle are fully confirmed.
+    // P5C: gated on !isPartneredGame so the partnered path doesn't double-fire next-round via this gate.
     private var duprKotcCanGenerateNextCycle: Bool {
-        guard method == .duprKingOfCourt, !kotcRounds.isEmpty, kotcRounds.count % 3 == 0 else { return false }
+        guard method == .duprKingOfCourt, !isPartneredGame,
+              !kotcRounds.isEmpty, kotcRounds.count % 3 == 0 else { return false }
         return kotcRounds.suffix(3).allSatisfy { round in
             round.courts.allSatisfy { courtResults[$0.id]?.isConfirmed == true }
         }
@@ -1464,17 +1817,58 @@ struct GameScheduleSheet: View {
 
     private var primaryActionLabel: String {
         if settingsExpanded { return "Start Session" }
-        return method.isDUPRKotC ? "Next Cycle" : "Next Round"
+        // P5C: partnered DUPR KOTC uses per-round movement, so its CTA reads
+        // "Next Round" (matching the partnered KOTC flow) rather than the
+        // solo "Next Cycle" label that implies the 3-round mini-cycle.
+        if method.isDUPRKotC && !isPartneredGame { return "Next Cycle" }
+        return "Next Round"
     }
 
     private var primaryActionEnabled: Bool {
-        settingsExpanded || kotcCanGenerateNextRound || duprKotcCanGenerateNextCycle
+        // P5C: in settings-expanded (generation) state, also gate on
+        // partnered validation passing so the CTA is disabled when there
+        // are pending pairs or orphan bookings.
+        if settingsExpanded { return partneredCanGenerate }
+        return kotcCanGenerateNextRound || duprKotcCanGenerateNextCycle
     }
 
     private func handlePrimaryAction() {
         if settingsExpanded {
+            // P5C: partnered validation must clear before anything is generated.
+            // The CTA is also gated on `partneredCanGenerate` upstream, but this
+            // is the belt-and-braces guard for any path that bypasses it.
+            if isPartneredGame, partneredValidationError != nil { return }
+
             // ── Generate / Start ────────────────────────────────────────────
-            if method == .kingOfCourt {
+            if isPartneredGame {
+                // Partnered: route every method through the partnered engine.
+                // KOTC variants emit a single-round seed; random/round-robin
+                // emit roundCount rounds.
+                courtResults = [:]
+                if method.isKingOfCourt {
+                    kotcRounds = []
+                    let result = ScheduleEngine.generate(
+                        teams: partneredTeams,
+                        courtCount: courts,
+                        roundCount: 1,
+                        method: method
+                    )
+                    if let round1 = result.rounds.first {
+                        kotcRounds = [round1]
+                        expandedRounds = [round1.id]
+                    }
+                } else {
+                    schedule = ScheduleEngine.generate(
+                        teams: partneredTeams,
+                        courtCount: courts,
+                        roundCount: rounds,
+                        method: method
+                    )
+                    if let firstRound = schedule?.rounds.first {
+                        expandedRounds = [firstRound.id]
+                    }
+                }
+            } else if method == .kingOfCourt {
                 kotcRounds = []
                 courtResults = [:]
                 let round1 = ScheduleEngine.kotcFirstRound(
@@ -1510,20 +1904,38 @@ struct GameScheduleSheet: View {
                 settingsExpanded = false
             }
             saveSession()
-        } else if method == .kingOfCourt {
-            // ── KotC: Generate Next Round ────────────────────────────────────
+        } else if method == .kingOfCourt
+                  || (method == .duprKingOfCourt && isPartneredGame) {
+            // ── KotC (or partnered DUPR KOTC): Generate Next Round ─────────
+            // P5C: partnered games route through partneredKOTCNextRound so
+            // pairs stay intact across rounds. Solo KOTC keeps the existing
+            // per-player rotation. Partnered DUPR KOTC also flows here
+            // because there are no within-court cycles to run when partners
+            // are fixed.
             guard let lastRound = kotcRounds.last else { return }
             let lastRoundID = lastRound.id
             withAnimation(.easeInOut(duration: 0.25)) {
                 expandedRounds.remove(lastRoundID)
             }
+            let isPartnered = isPartneredGame
+            let teamsSnapshot = partneredTeams
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                let nextRound = ScheduleEngine.kotcNextRound(
-                    previousRound: lastRound,
-                    results: courtResults,
-                    previousSitOuts: lastRound.sitOuts,
-                    roundNumber: lastRound.number + 1
-                )
+                let nextRound: ScheduledRound
+                if isPartnered {
+                    nextRound = ScheduleEngine.partneredKOTCNextRound(
+                        previousRound: lastRound,
+                        results: courtResults,
+                        allTeams: teamsSnapshot,
+                        roundNumber: lastRound.number + 1
+                    )
+                } else {
+                    nextRound = ScheduleEngine.kotcNextRound(
+                        previousRound: lastRound,
+                        results: courtResults,
+                        previousSitOuts: lastRound.sitOuts,
+                        roundNumber: lastRound.number + 1
+                    )
+                }
                 kotcRounds.append(nextRound)
                 withAnimation(.easeInOut(duration: 0.25)) {
                     expandedRounds.insert(nextRound.id)
@@ -1671,6 +2083,10 @@ struct GameScheduleSheet: View {
                     showResumePrompt = true
                 }
             }
+            // P5C: refresh partnerships so the validation banner + partneredTeams
+            // computed property reflect the current server state. No-op on solo
+            // games (refreshGamePartnerships short-circuits on partnership_mode).
+            await appState.refreshGamePartnerships(for: game)
         }
         .task(id: makeShareTaskID()) {
             guard hasActiveSession else { resultShareImage = nil; return }
@@ -1807,6 +2223,10 @@ struct GameScheduleSheet: View {
                     .buttonStyle(.plain)
                 }
 
+                // P5C: partnered-state warning shown inline above the primary
+                // action so the admin sees exactly why generation is blocked.
+                partneredValidationBanner
+
                 if showPrimaryAction {
                     Button { handlePrimaryAction() } label: {
                         Text(primaryActionLabel)
@@ -1828,6 +2248,40 @@ struct GameScheduleSheet: View {
         }
         .scrollIndicators(.hidden)
         .background(Brand.cardBackground)
+    }
+
+    /// P5C: inline banner explaining why partnered generation is blocked.
+    /// Renders nothing on solo games or when the partnered state is clean.
+    /// Visible in both iPhone and iPad layouts via the shared settings card.
+    @ViewBuilder
+    private var partneredValidationBanner: some View {
+        if settingsExpanded, let message = partneredValidationError {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Brand.spicyOrange)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Partnered play paused")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Brand.primaryText)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(Brand.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                Brand.spicyOrange.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Brand.spicyOrange.opacity(0.30), lineWidth: 1)
+            )
+        }
     }
 
     @ViewBuilder
