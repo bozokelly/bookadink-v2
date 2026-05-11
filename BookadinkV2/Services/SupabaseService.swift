@@ -48,6 +48,11 @@ protocol ClubDataProviding {
     /// Returns an empty array when the game is solo or has no active
     /// partnerships yet.
     func fetchGamePartnerships(gameID: UUID) async throws -> [BookingPartnership]
+    /// Admin-only manual pairing via the `pair_partnered_booking` RPC. The
+    /// server enforces owner/admin role + bookings/partnership invariants.
+    /// On success the partnership row is materialised (UPDATE-or-INSERT)
+    /// with status='complete'.
+    func pairPartneredBooking(gameID: UUID, bookingID: UUID, partnerBookingID: UUID) async throws
     /// Returns attendance and payment records for all game_attendance rows for this game.
     func fetchAttendanceRecords(gameID: UUID) async throws -> AttendanceRecords
     func updateAttendancePaymentStatus(bookingID: UUID, status: String) async throws
@@ -247,6 +252,12 @@ enum SupabaseServiceError: LocalizedError {
     case partnerAlreadyInCompletePartnership
     case partnerIntentAlreadyReserved
     case partnerNotSupportedForSoloGame
+    // ── Partnered manual pair (P3 RPC: pair_partnered_booking) ────────────
+    case pairForbiddenAdminOnly
+    case notAPartneredGame
+    case bookingNotActive
+    case bookingPaymentPending
+    case partnerIntentAlreadyReservedByOther
     case missingSession
     case notAuthorized
     case invalidPayload
@@ -293,6 +304,16 @@ enum SupabaseServiceError: LocalizedError {
             return "That player has already been requested as a partner."
         case .partnerNotSupportedForSoloGame:
             return "Partner selection is not supported for this game."
+        case .pairForbiddenAdminOnly:
+            return "Only club admins can pair players."
+        case .notAPartneredGame:
+            return "This game is not using partnered registration."
+        case .bookingNotActive:
+            return "One of these players is no longer active in the game."
+        case .bookingPaymentPending:
+            return "Both players must complete payment before pairing."
+        case .partnerIntentAlreadyReservedByOther:
+            return "This pairing conflicts with another pending partner request."
         case .missingSession:
             return "No authenticated session is available."
         case .notAuthorized:
@@ -319,7 +340,9 @@ enum SupabaseServiceError: LocalizedError {
         case .partnerRequired, .partnerChoiceConflict, .partnerIsSelf,
              .partnerNotFound, .partnerDUPRRequired, .partnerAlreadyInGame,
              .partnerAlreadyInCompletePartnership, .partnerIntentAlreadyReserved,
-             .partnerNotSupportedForSoloGame:
+             .partnerNotSupportedForSoloGame,
+             .pairForbiddenAdminOnly, .notAPartneredGame, .bookingNotActive,
+             .bookingPaymentPending, .partnerIntentAlreadyReservedByOther:
             return true
         default:
             return false
@@ -721,6 +744,69 @@ final class SupabaseService: ClubDataProviding {
         )
 
         return rows.compactMap { $0.toPartnership() }
+    }
+
+    func pairPartneredBooking(
+        gameID: UUID,
+        bookingID: UUID,
+        partnerBookingID: UUID
+    ) async throws {
+        guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pGameId: UUID
+            let pBookingId: UUID
+            let pPartnerBookingId: UUID
+            enum CodingKeys: String, CodingKey {
+                case pGameId = "p_game_id"
+                case pBookingId = "p_booking_id"
+                case pPartnerBookingId = "p_partner_booking_id"
+            }
+        }
+
+        do {
+            // The RPC returns a partnership row; we don't currently decode it
+            // here — AppState refreshes via fetchGamePartnerships after success,
+            // which is the source of truth for the UI.
+            let _: [BookingPartnershipRow] = try await send(
+                path: "rpc/pair_partnered_booking",
+                queryItems: [],
+                method: "POST",
+                body: try JSONEncoder().encode(Params(
+                    pGameId: gameID,
+                    pBookingId: bookingID,
+                    pPartnerBookingId: partnerBookingID
+                )),
+                authBearerToken: authToken,
+                extraHeaders: ["Content-Type": "application/json"]
+            )
+        } catch let error as SupabaseServiceError {
+            if case let .httpStatus(_, body) = error {
+                // Order matters: longer / more specific substrings first so a
+                // generic "dupr_required" doesn't preempt "partner_dupr_required",
+                // and "..._reserved_by_other" doesn't get caught by "..._reserved".
+                if body.contains("partner_dupr_required") { throw SupabaseServiceError.partnerDUPRRequired }
+                if body.contains("partner_booking_payment_pending") { throw SupabaseServiceError.bookingPaymentPending }
+                if body.contains("partner_booking_not_active") { throw SupabaseServiceError.bookingNotActive }
+                if body.contains("partner_intent_already_reserved_by_other") { throw SupabaseServiceError.partnerIntentAlreadyReservedByOther }
+                if body.contains("partner_booking_not_found") { throw SupabaseServiceError.notFound }
+                if body.contains("booking_already_in_complete_partnership") { throw SupabaseServiceError.partnerAlreadyInCompletePartnership }
+                if body.contains("booking_payment_pending") { throw SupabaseServiceError.bookingPaymentPending }
+                if body.contains("booking_not_active") { throw SupabaseServiceError.bookingNotActive }
+                if body.contains("booking_not_found") { throw SupabaseServiceError.notFound }
+                if body.contains("bookings_game_mismatch") { throw SupabaseServiceError.notFound }
+                if body.contains("not_a_partnered_game") { throw SupabaseServiceError.notAPartneredGame }
+                if body.contains("forbidden_owner_or_admin_only") { throw SupabaseServiceError.pairForbiddenAdminOnly }
+                if body.contains("same_booking_not_allowed") { throw SupabaseServiceError.invalidPayload }
+                if body.contains("partner_is_self") { throw SupabaseServiceError.partnerIsSelf }
+                if body.contains("authentication_required") { throw SupabaseServiceError.authenticationRequired }
+                if body.contains("dupr_required") { throw SupabaseServiceError.duprRequired }
+            }
+            throw error
+        }
     }
 
     func fetchAttendanceRecords(gameID: UUID) async throws -> AttendanceRecords {
