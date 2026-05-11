@@ -1608,6 +1608,37 @@ final class AppState: ObservableObject {
         gamePartnershipsByGameID[game.id] ?? []
     }
 
+    /// P5D: admin-only manual pairing via the `pair_partnered_booking` RPC.
+    /// Throws on failure so the calling sheet can surface the friendly copy
+    /// from `SupabaseServiceError.errorDescription`. On success refreshes
+    /// the game cache, bookings, and partnership list so the BOOKED section
+    /// reflects the new complete pair immediately.
+    func pairPartneredBooking(
+        gameID: UUID,
+        bookingID: UUID,
+        partnerBookingID: UUID
+    ) async throws {
+        try await withAuthRetry {
+            try await self.dataProvider.pairPartneredBooking(
+                gameID: gameID,
+                bookingID: bookingID,
+                partnerBookingID: partnerBookingID
+            )
+        }
+        // Refresh in the order the UI cares about: bookings (so attendee
+        // counts update), game (so the players section re-evaluates state),
+        // and partnerships (so the BOOKED list re-renders pairs).
+        await refreshBookings(silent: true)
+        if let game = allUpcomingGames.first(where: { $0.id == gameID })
+            ?? gamesByClubID.values.flatMap({ $0 }).first(where: { $0.id == gameID }) {
+            if let club = clubs.first(where: { $0.id == game.clubID }) {
+                await refreshGames(for: club)
+            }
+            await refreshAttendees(for: game)
+            await refreshGamePartnerships(for: game)
+        }
+    }
+
     /// Loads the partnership list for a partnered game via the
     /// `get_game_partnerships` RPC. No-ops for solo games so callers can
     /// invoke it from a shared `.task` without checking partnership mode
@@ -4438,7 +4469,9 @@ final class AppState: ObservableObject {
         case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notYetPublished, .notAuthorized, .invalidPayload, .rateLimited,
              .partnerRequired, .partnerChoiceConflict, .partnerIsSelf, .partnerNotFound,
              .partnerDUPRRequired, .partnerAlreadyInGame, .partnerAlreadyInCompletePartnership,
-             .partnerIntentAlreadyReserved, .partnerNotSupportedForSoloGame:
+             .partnerIntentAlreadyReserved, .partnerNotSupportedForSoloGame,
+             .pairForbiddenAdminOnly, .notAPartneredGame, .bookingNotActive,
+             .bookingPaymentPending, .partnerIntentAlreadyReservedByOther:
             return false
         }
     }
@@ -4492,7 +4525,9 @@ final class AppState: ObservableObject {
         case .missingConfiguration, .invalidURL, .duplicateMembership, .notFound, .decoding, .network, .holdExpired, .membershipRequired, .duprRequired, .notYetPublished, .notAuthorized, .invalidPayload, .rateLimited,
              .partnerRequired, .partnerChoiceConflict, .partnerIsSelf, .partnerNotFound,
              .partnerDUPRRequired, .partnerAlreadyInGame, .partnerAlreadyInCompletePartnership,
-             .partnerIntentAlreadyReserved, .partnerNotSupportedForSoloGame:
+             .partnerIntentAlreadyReserved, .partnerNotSupportedForSoloGame,
+             .pairForbiddenAdminOnly, .notAPartneredGame, .bookingNotActive,
+             .bookingPaymentPending, .partnerIntentAlreadyReservedByOther:
             return false
         }
     }

@@ -50,6 +50,12 @@ struct GameDetailView: View {
     @State private var selectedPartnerName: String? = nil
     @State private var showPartnerPicker = false
 
+    // ── Admin manual pairing (P5D) ─────────────────────────────────────────
+    // Drives the "Pair players" sheet for owner/admin on partnered games
+    // where at least one active booking is unpaired (orphan + allocate +
+    // selected-but-not-yet-confirmed).
+    @State private var showPairPlayersSheet = false
+
     /// Drives the "Open in Apple Maps / Google Maps" confirmation dialog
     /// triggered by tapping the VENUE info card.
     @State private var showOpenInMapsPrompt = false
@@ -205,6 +211,36 @@ struct GameDetailView: View {
         let pool = appState.clubDirectoryMembersByClubID[game.clubID] ?? []
         guard let me = appState.authUserID else { return pool }
         return pool.filter { $0.id != me }
+    }
+
+    // ── Admin pairing helpers (P5D) ────────────────────────────────────────
+
+    /// True when the admin "Pair players" surface should appear. Gated on:
+    ///   • partnered game,
+    ///   • current user is club owner/admin,
+    ///   • at least one active booking is not yet in a complete partnership.
+    /// The third clause means the action vanishes as soon as every player
+    /// is paired — keeps the admin surface free of dead controls.
+    private var shouldShowPairAction: Bool {
+        guard isPartneredGame, isClubAdminUser else { return false }
+        let partnerships = appState.partnerships(for: game).filter { $0.isComplete }
+        let pairedIDs = Set(partnerships.flatMap { $0.bookingIDs })
+        return (confirmedAttendees + pendingPaymentAttendees).contains {
+            !pairedIDs.contains($0.booking.id)
+        }
+    }
+
+    /// Bookings the admin can choose from in the pair sheet. Excludes any
+    /// booking already in a complete partnership (P3 RPC rejects them); both
+    /// confirmed and pending_payment are listed so the admin sees the full
+    /// roster, with pending_payment rows disabled per the RPC's payment rule.
+    private var pairableBookings: [GameAttendee] {
+        guard isPartneredGame else { return [] }
+        let partnerships = appState.partnerships(for: game).filter { $0.isComplete }
+        let pairedIDs = Set(partnerships.flatMap { $0.bookingIDs })
+        return (confirmedAttendees + pendingPaymentAttendees).filter {
+            !pairedIDs.contains($0.booking.id)
+        }
     }
 
     private var bookingMembershipRequirementMessage: String? {
@@ -457,6 +493,20 @@ struct GameDetailView: View {
                     selectedPartnerUserID = member.id
                     selectedPartnerName   = member.name
                     partnerMode           = .choose
+                }
+            )
+        }
+        .sheet(isPresented: $showPairPlayersSheet) {
+            PairPlayersSheet(
+                bookings: pairableBookings,
+                partnerships: appState.partnerships(for: game),
+                requiresDUPR: currentGame.requiresDUPR,
+                onPair: { bookingID, partnerBookingID in
+                    try await appState.pairPartneredBooking(
+                        gameID: game.id,
+                        bookingID: bookingID,
+                        partnerBookingID: partnerBookingID
+                    )
                 }
             )
         }
@@ -1124,9 +1174,47 @@ struct GameDetailView: View {
                     .font(.system(size: 13))
                     .foregroundStyle(isFull || remaining <= 2 ? Brand.errorRed : Brand.secondaryText)
 
+                // P5D: admin-only "Pair players" action. Hidden on solo games,
+                // hidden for non-admins, hidden once every active booking is
+                // covered by a complete partnership.
+                if shouldShowPairAction {
+                    pairPlayersButton
+                }
+
                 playersCard
             }
         }
+    }
+
+    /// P5D: subtle admin button to open the manual pair sheet.
+    private var pairPlayersButton: some View {
+        Button {
+            showPairPlayersSheet = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "person.2.crop.square.stack.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Brand.pineTeal)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Pair players")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Brand.primaryText)
+                    Text("Pair two registered players into a team for this partnered game.")
+                        .font(.caption)
+                        .foregroundStyle(Brand.secondaryText)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.mutedText)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Brand.secondarySurface, in: RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Sticky Footer
@@ -3791,6 +3879,248 @@ private struct PartnerPickerSheet: View {
             .foregroundStyle(Brand.errorRed)
         } else {
             EmptyView()
+        }
+    }
+
+    private func initials(_ name: String) -> String {
+        let parts = name.split(separator: " ").prefix(2)
+        return parts.compactMap { $0.first }
+            .map { String($0).uppercased() }
+            .joined()
+    }
+}
+
+// MARK: - Pair Players Sheet (P5D)
+
+/// Admin manual-pair sheet. Lists every active booking that is not yet in
+/// a complete partnership; admin taps two players, hits Pair. The submit
+/// goes through `pair_partnered_booking` so server validation is the
+/// source of truth — UI restrictions are display hints, not authoritative.
+///
+/// Behaviour:
+///   • Confirmed bookings are tappable.
+///   • Pending-payment bookings render with an "Awaiting payment" badge
+///     and are not selectable (matches the RPC's payment rule).
+///   • Selecting more than 2 deselects the oldest pick (FIFO replacement)
+///     so users can quickly swap a wrong choice without an extra step.
+///   • DUPR warning surfaces on rows that lack a DUPR id when the game
+///     requires DUPR, mirroring `PartnerPickerSheet`.
+///   • The Pair button is enabled only when exactly two CONFIRMED rows
+///     are selected; pending-payment selections can't satisfy the count.
+private struct PairPlayersSheet: View {
+    let bookings: [GameAttendee]
+    let partnerships: [BookingPartnership]
+    let requiresDUPR: Bool
+    let onPair: (UUID, UUID) async throws -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectionOrder: [UUID] = []  // ordered by tap; max 2 elements
+    @State private var isSubmitting = false
+    @State private var errorMessage: String? = nil
+
+    /// Pending partnership rows the sheet can surface for context — e.g.,
+    /// "intended partner pending" so the admin sees what the player wanted.
+    private func intentLabel(for bookingID: UUID) -> String? {
+        for p in partnerships where p.isPending && p.playerABookingID == bookingID {
+            if let name = p.requestedPartnerName, !name.isEmpty {
+                return "Wants: \(name)"
+            }
+            return "Open to any partner"
+        }
+        return nil
+    }
+
+    private func isConfirmed(_ attendee: GameAttendee) -> Bool {
+        if case .confirmed = attendee.booking.state { return true }
+        return false
+    }
+
+    private func toggle(_ bookingID: UUID) {
+        if let idx = selectionOrder.firstIndex(of: bookingID) {
+            selectionOrder.remove(at: idx)
+        } else if selectionOrder.count < 2 {
+            selectionOrder.append(bookingID)
+        } else {
+            // FIFO replacement so a quick re-tap on a third player swaps in.
+            selectionOrder.removeFirst()
+            selectionOrder.append(bookingID)
+        }
+    }
+
+    private var canSubmit: Bool {
+        selectionOrder.count == 2 && !isSubmitting
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if bookings.isEmpty {
+                    emptyState
+                } else {
+                    List {
+                        Section {
+                            ForEach(bookings, id: \.id) { attendee in
+                                pairRow(attendee)
+                            }
+                        } header: {
+                            Text("Select two players to pair")
+                                .font(.footnote)
+                                .foregroundStyle(Brand.secondaryText)
+                                .textCase(nil)
+                        } footer: {
+                            if let err = errorMessage {
+                                Text(err)
+                                    .font(.footnote)
+                                    .foregroundStyle(Brand.errorRed)
+                            }
+                        }
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("Pair Players")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(isSubmitting)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        Task { await submit() }
+                    } label: {
+                        if isSubmitting {
+                            ProgressView().tint(Brand.pineTeal)
+                        } else {
+                            Text("Pair")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(canSubmit ? Brand.pineTeal : Brand.mutedText)
+                        }
+                    }
+                    .disabled(!canSubmit)
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+        .interactiveDismissDisabled(isSubmitting)
+    }
+
+    @ViewBuilder
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "person.2.crop.square.stack")
+                .font(.system(size: 36, weight: .light))
+                .foregroundStyle(Brand.secondaryText)
+            Text("No players to pair")
+                .font(.headline)
+                .foregroundStyle(Brand.primaryText)
+            Text("Every active player is already in a complete pair.")
+                .font(.subheadline)
+                .foregroundStyle(Brand.secondaryText)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private func pairRow(_ attendee: GameAttendee) -> some View {
+        let selectionIndex = selectionOrder.firstIndex(of: attendee.booking.id)
+        let isSelected = selectionIndex != nil
+        let isPending = !isConfirmed(attendee)
+        let hasDUPR = attendee.duprRating != nil
+
+        Button {
+            guard !isPending else { return }
+            toggle(attendee.booking.id)
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(AvatarGradients.resolveGradient(forKey: attendee.avatarColorKey))
+                        .frame(width: 38, height: 38)
+                    Text(initials(attendee.userName))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(attendee.userName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Brand.primaryText)
+                        .lineLimit(1)
+                    pairRowSubline(attendee: attendee, isPending: isPending, hasDUPR: hasDUPR)
+                }
+
+                Spacer(minLength: 0)
+
+                if isPending {
+                    Text("Awaiting payment")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Brand.spicyOrange)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Brand.spicyOrange.opacity(0.12), in: Capsule())
+                } else if isSelected {
+                    ZStack {
+                        Circle().fill(Brand.pineTeal).frame(width: 22, height: 22)
+                        Text("\((selectionIndex ?? 0) + 1)")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white)
+                    }
+                } else {
+                    Circle()
+                        .strokeBorder(Brand.softOutline, lineWidth: 1.5)
+                        .frame(width: 22, height: 22)
+                }
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 4)
+            .opacity(isPending ? 0.55 : 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(isPending || isSubmitting)
+    }
+
+    @ViewBuilder
+    private func pairRowSubline(
+        attendee: GameAttendee, isPending: Bool, hasDUPR: Bool
+    ) -> some View {
+        if let dupr = attendee.duprRating {
+            Text("DUPR \(String(format: "%.3f", dupr))")
+                .font(.caption)
+                .foregroundStyle(Brand.mutedText)
+        } else if requiresDUPR, !isPending {
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.caption2)
+                Text("No DUPR ID (required)")
+                    .font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(Brand.errorRed)
+        } else if let intent = intentLabel(for: attendee.booking.id) {
+            Text(intent)
+                .font(.caption)
+                .foregroundStyle(Brand.mutedText)
+        }
+    }
+
+    private func submit() async {
+        guard selectionOrder.count == 2 else { return }
+        let bookingID = selectionOrder[0]
+        let partnerBookingID = selectionOrder[1]
+        isSubmitting = true
+        errorMessage = nil
+        defer { isSubmitting = false }
+        do {
+            try await onPair(bookingID, partnerBookingID)
+            dismiss()
+        } catch let serviceError as SupabaseServiceError {
+            errorMessage = serviceError.errorDescription
+                ?? "Couldn't pair these players. Please try again."
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
