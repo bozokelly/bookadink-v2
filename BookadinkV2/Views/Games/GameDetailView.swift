@@ -346,6 +346,9 @@ struct GameDetailView: View {
             appState.bookingInfoMessage = nil
             await appState.refreshBookings(silent: true)
             if canViewAttendees { await appState.refreshAttendees(for: game) }
+            // P5A: load partnership rows for partnered games so the BOOKED
+            // section can render pairs. No-op on solo games.
+            await appState.refreshGamePartnerships(for: currentGame)
             if let club = clubForGame, appState.authState == .signedIn {
                 if appState.gamesByClubID[club.id]?.contains(where: { $0.id == game.id }) != true {
                     await appState.refreshGames(for: club)
@@ -1984,6 +1987,32 @@ struct GameDetailView: View {
                         .foregroundStyle(Brand.mutedText)
                         .padding(.horizontal, 16)
                         .padding(.bottom, 12)
+                } else if currentGame.partnershipMode == "partnered" {
+                    // P5A: partnered games render BOOKED entries as pair rows
+                    // sourced from `appState.partnerships(for:)`. Any active
+                    // booking not yet covered by a partnership row (e.g. legacy
+                    // rows, or admin-added bookings via owner_create_booking
+                    // which bypasses book_game) renders as an "orphan" solo row
+                    // below — keeping the section accurate while the backend
+                    // catches up.
+                    let partnerships = appState.partnerships(for: currentGame)
+                    let coveredIDs   = Set(partnerships.flatMap(\.bookingIDs))
+                    let orphans      = confirmedAttendees.filter { !coveredIDs.contains($0.booking.id) }
+                    let totalRows    = partnerships.count + orphans.count
+
+                    ForEach(Array(partnerships.enumerated()), id: \.element.id) { index, partnership in
+                        partneredPairRow(partnership)
+                        if index < totalRows - 1 {
+                            Divider().overlay(Color(hex: "E5E5E5")).padding(.leading, 16)
+                        }
+                    }
+
+                    ForEach(Array(orphans.enumerated()), id: \.element.id) { index, attendee in
+                        attendeeRow(attendee)
+                        if partnerships.count + index < totalRows - 1 {
+                            Divider().overlay(Color(hex: "E5E5E5")).padding(.leading, 64)
+                        }
+                    }
                 } else {
                     ForEach(Array(confirmedAttendees.enumerated()), id: \.element.id) { index, attendee in
                         attendeeRow(attendee)
@@ -2044,7 +2073,13 @@ struct GameDetailView: View {
                 HStack {
                     Spacer()
                     Button {
-                        Task { await appState.refreshAttendees(for: game) }
+                        Task {
+                            await appState.refreshAttendees(for: game)
+                            // P5A: refresh pair data alongside attendees so
+                            // the partnered view stays in sync after manual
+                            // refresh. No-op on solo games.
+                            await appState.refreshGamePartnerships(for: currentGame)
+                        }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                             .font(.caption)
@@ -2150,6 +2185,64 @@ struct GameDetailView: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 4)
             .background(fill, in: Capsule())
+    }
+
+    // MARK: - Partnered Pair Row (P5A)
+
+    /// Single row used for partnered games. Renders the pair on one line as
+    /// "Alice + Bob" (complete), "Alice + Sara (pending)" (selected partner
+    /// not yet booked), or "Alice + Partner needed" (allocate-me path). The
+    /// DUPR sub-line only appears for DUPR-required games (the RPC zeros
+    /// out the rating fields otherwise, so the client need not gate).
+    private func partneredPairRow(_ partnership: BookingPartnership) -> some View {
+        let leftName  = shortName(partnership.playerAName ?? "Player")
+        let rightName: String = {
+            if let bName = partnership.playerBName, !bName.isEmpty {
+                return shortName(bName)
+            }
+            if let intent = partnership.requestedPartnerName, !intent.isEmpty {
+                return "\(shortName(intent)) (pending)"
+            }
+            return "Partner needed"
+        }()
+
+        let duprText: String? = {
+            switch (partnership.playerADUPRRating, partnership.playerBDUPRRating) {
+            case let (a?, b?):
+                return "DUPR \(String(format: "%.3f", a)) / \(String(format: "%.3f", b))"
+            case let (a?, nil):
+                return "DUPR \(String(format: "%.3f", a)) / —"
+            case let (nil, b?):
+                return "DUPR — / \(String(format: "%.3f", b))"
+            case (nil, nil):
+                return nil
+            }
+        }()
+
+        return HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(leftName)  +  \(rightName)")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Brand.ink)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                if let duprText {
+                    Text(duprText)
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedText)
+                }
+            }
+            Spacer(minLength: 0)
+            if partnership.isComplete {
+                attendeeBadge("Pair", fill: Brand.primaryText, text: .white)
+            } else {
+                attendeeBadge("Partner pending",
+                              fill: Brand.secondarySurface,
+                              text: Brand.mutedText)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
     }
 
     // MARK: - Section Header

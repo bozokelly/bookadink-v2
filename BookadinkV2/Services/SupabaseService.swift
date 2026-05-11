@@ -38,6 +38,12 @@ protocol ClubDataProviding {
     func fetchGames(clubID: UUID) async throws -> [Game]
     func fetchGamesInSeries(recurrenceGroupID: UUID) async throws -> [Game]
     func fetchGameAttendees(gameID: UUID) async throws -> [GameAttendee]
+    /// Display-shaped partnership rows for a partnered game. Calls the
+    /// `get_game_partnerships` SECURITY DEFINER RPC; booking_partnerships
+    /// RLS is locked down so this is the only authenticated read path.
+    /// Returns an empty array when the game is solo or has no active
+    /// partnerships yet.
+    func fetchGamePartnerships(gameID: UUID) async throws -> [BookingPartnership]
     /// Returns attendance and payment records for all game_attendance rows for this game.
     func fetchAttendanceRecords(gameID: UUID) async throws -> AttendanceRecords
     func updateAttendancePaymentStatus(bookingID: UUID, status: String) async throws
@@ -612,6 +618,29 @@ final class SupabaseService: ClubDataProviding {
             .sorted { lhs, rhs in
                 self.attendeeComparator(lhs: lhs, rhs: rhs)
             }
+    }
+
+    func fetchGamePartnerships(gameID: UUID) async throws -> [BookingPartnership] {
+        guard SupabaseConfig.isConfigured else { return [] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Params: Encodable {
+            let pGameId: UUID
+            enum CodingKeys: String, CodingKey { case pGameId = "p_game_id" }
+        }
+
+        let rows: [BookingPartnershipRow] = try await send(
+            path: "rpc/get_game_partnerships",
+            queryItems: [],
+            method: "POST",
+            body: try JSONEncoder().encode(Params(pGameId: gameID)),
+            authBearerToken: authToken,
+            extraHeaders: ["Content-Type": "application/json"]
+        )
+
+        return rows.compactMap { $0.toPartnership() }
     }
 
     func fetchAttendanceRecords(gameID: UUID) async throws -> AttendanceRecords {
@@ -5880,6 +5909,66 @@ private struct GameAttendanceRow: Decodable {
         case bookingID = "booking_id"
         case paymentStatus = "payment_status"
         case attendanceStatus = "attendance_status"
+    }
+}
+
+/// Wire shape returned by the `get_game_partnerships` RPC (one row per
+/// active partnership in a game). All fields except `partnershipID` /
+/// `status` / `playerABookingID` are optional because pending partnerships
+/// leave player B + intent fields nil, and non-DUPR games leave the rating
+/// fields nil at source.
+private struct BookingPartnershipRow: Decodable {
+    let partnershipID: UUID
+    let status: String
+    let playerABookingID: UUID
+    let playerAUserID: UUID?
+    let playerAName: String?
+    let playerADUPRRating: Double?
+    let playerBBookingID: UUID?
+    let playerBUserID: UUID?
+    let playerBName: String?
+    let playerBDUPRRating: Double?
+    let requestedPartnerUserID: UUID?
+    let requestedPartnerName: String?
+    let createdAtRaw: String?
+
+    enum CodingKeys: String, CodingKey {
+        case partnershipID = "partnership_id"
+        case status
+        case playerABookingID = "player_a_booking_id"
+        case playerAUserID = "player_a_user_id"
+        case playerAName = "player_a_name"
+        case playerADUPRRating = "player_a_dupr_rating"
+        case playerBBookingID = "player_b_booking_id"
+        case playerBUserID = "player_b_user_id"
+        case playerBName = "player_b_name"
+        case playerBDUPRRating = "player_b_dupr_rating"
+        case requestedPartnerUserID = "requested_partner_user_id"
+        case requestedPartnerName = "requested_partner_name"
+        case createdAtRaw = "created_at"
+    }
+
+    /// Returns nil only when the partnership row is malformed (no player A
+    /// user id). The RPC's server-side LEFT JOINs guarantee a player A
+    /// booking always points at a real booking → real user, but the
+    /// defensive nil-check keeps a degraded DB from crashing the client.
+    func toPartnership() -> BookingPartnership? {
+        guard let playerAUserID else { return nil }
+        return BookingPartnership(
+            id: partnershipID,
+            status: status,
+            playerABookingID: playerABookingID,
+            playerAUserID: playerAUserID,
+            playerAName: playerAName,
+            playerADUPRRating: playerADUPRRating,
+            playerBBookingID: playerBBookingID,
+            playerBUserID: playerBUserID,
+            playerBName: playerBName,
+            playerBDUPRRating: playerBDUPRRating,
+            requestedPartnerUserID: requestedPartnerUserID,
+            requestedPartnerName: requestedPartnerName,
+            createdAt: createdAtRaw.flatMap { SupabaseDateParser.parse($0) }
+        )
     }
 }
 
