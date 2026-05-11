@@ -5,6 +5,11 @@ struct ProfileDashboardView: View {
     @State private var showEditProfile = false
     @State private var showSignOutAlert = false
     @State private var appeared = false
+    /// Phase: simulator-freeze investigation. `.task` re-fires on every view appearance
+    /// (rapid tab toggling → Home → Profile → Home → Profile spawns a fresh task group
+    /// each time). Guard ensures the credit-refresh fan-out runs once per
+    /// view-lifetime; pull-to-refresh still forces a re-run via `.refreshable`.
+    @State private var creditRefreshFired = false
 #if DEBUG
     @State private var jwtCopied = false
 #endif
@@ -22,7 +27,10 @@ struct ProfileDashboardView: View {
     }
 
     var body: some View {
-        ZStack {
+#if DEBUG
+        let _ = traceBodyRender()
+#endif
+        return ZStack {
             Brand.pageGradient.ignoresSafeArea()
 
             ScrollView {
@@ -66,6 +74,7 @@ struct ProfileDashboardView: View {
             }
             .scrollIndicators(.hidden)
             .refreshable {
+                profileTrace("refreshable START")
                 await appState.refreshProfile()
                 await appState.refreshBookings(silent: true)
                 await appState.refreshMemberships()
@@ -75,18 +84,31 @@ struct ProfileDashboardView: View {
                         group.addTask { await appState.refreshCreditBalance(for: clubID) }
                     }
                 }
+                // Pull-to-refresh is an explicit user request — allow .task's fan-out
+                // to refire on next view appearance if needed.
+                await MainActor.run { creditRefreshFired = false }
+                profileTrace("refreshable END")
             }
         }
         .task {
+            profileTrace("task START auth=\(appState.authState) profile=\(appState.profile != nil ? "set" : "nil") bookings=\(appState.bookings.count) fired=\(creditRefreshFired)")
+            guard !creditRefreshFired else {
+                profileTrace("task SKIP — already fired this appearance")
+                return
+            }
+            creditRefreshFired = true
             let clubIDs = Set(appState.bookings.compactMap { $0.game?.clubID })
+            profileTrace("task fan-out for \(clubIDs.count) club(s)")
             await withTaskGroup(of: Void.self) { group in
                 for clubID in clubIDs {
                     group.addTask { await appState.refreshCreditBalance(for: clubID) }
                 }
             }
+            profileTrace("task END")
         }
         .onChange(of: appState.lastCancellationCredit) { _, result in
             guard let clubID = result?.clubID else { return }
+            profileTrace("onChange lastCancellationCredit club=\(clubID)")
             Task { await appState.refreshCreditBalance(for: clubID) }
         }
         .toolbar(.hidden, for: .navigationBar)
@@ -100,11 +122,34 @@ struct ProfileDashboardView: View {
             Text("Are you sure you want to sign out?")
         }
         .onAppear {
+            profileTrace("onAppear")
             withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
                 appeared = true
             }
         }
+        .onDisappear {
+            profileTrace("onDisappear")
+        }
     }
+
+    // MARK: - Diagnostics (DEBUG only)
+
+    private func profileTrace(_ message: String) {
+#if DEBUG
+        print("[ProfileTab \(Date().formatted(.iso8601.dateSeparator(.dash).timeSeparator(.colon).timeZoneSeparator(.colon))) main=\(Thread.isMainThread)] \(message)")
+#endif
+    }
+
+#if DEBUG
+    /// Static counter — survives view-value rebuilds (struct is recreated on every
+    /// body re-eval). Avoids mutating @State during body which would loop forever.
+    nonisolated(unsafe) private static var bodyRenderCount = 0
+
+    private func traceBodyRender() {
+        Self.bodyRenderCount += 1
+        print("[ProfileTab body#\(Self.bodyRenderCount) \(Date().formatted(.iso8601.timeSeparator(.colon))) main=\(Thread.isMainThread)] appeared=\(appeared) creditRefreshFired=\(creditRefreshFired) auth=\(appState.authState) profile=\(appState.profile != nil ? "set" : "nil")")
+    }
+#endif
 
     // MARK: - Profile Header
 
