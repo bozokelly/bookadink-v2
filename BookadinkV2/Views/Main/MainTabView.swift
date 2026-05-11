@@ -119,22 +119,42 @@ struct MainTabView: View {
     /// bottom TabView. Selection state is the same `appState.selectedTab`
     /// binding, so deep links / programmatic tab switches continue to
     /// work unchanged. The rail sits near the top safe area; below it the
-    /// space is intentionally empty — no full-height desktop sidebar feel.
-    ///
-    /// `.safeAreaInset(.bottom)` floats the active-session bar above the
-    /// home indicator. No tab bar to clear on this layout.
+    /// active-session pill (when present) anchors under the rail so a
+    /// live game is always one tap away without floating over the page
+    /// content. `.safeAreaInset(.bottom)` is intentionally NOT applied
+    /// on this layout — the rail pill is the iPad-equivalent surface.
     private var iPadSidebarLayout: some View {
         HStack(alignment: .top, spacing: 0) {
-            iPadSidebarRail
-                .padding(.leading, 16)
-                .padding(.top, 16)
-                .padding(.trailing, 8)
+            VStack(alignment: .leading, spacing: 12) {
+                iPadSidebarRail
+                iPadActivePlaySessionPill
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 16)
+            .padding(.top, 16)
+            .padding(.trailing, 8)
 
             destinationView(for: appState.selectedTab)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            activePlaySessionInset
+    }
+
+    /// Compact black pill that sits under the iPad sidebar rail when a
+    /// play session is active. Vertical layout (LIVE chip, game title up
+    /// to two lines, monospaced timer) sized to roughly the rail width
+    /// so it tucks neatly into the same left column. The action mirrors
+    /// the iPhone bottom bar — tap to re-present `GameScheduleSheet`.
+    @ViewBuilder
+    private var iPadActivePlaySessionPill: some View {
+        if let activeGame = appState.activePlaySessionGame {
+            ActivePlaySessionRailPill(
+                game: activeGame,
+                startedAt: appState.activePlaySessionStartedAt ?? activeGame.dateTime
+            ) {
+                schedulingGame = activeGame
+            }
+            .transition(.opacity.combined(with: .scale(scale: 0.92)))
+            .animation(.spring(duration: 0.3), value: appState.activePlaySessionGame?.id)
         }
     }
 
@@ -413,6 +433,76 @@ private struct ActivePlaySessionBar: View {
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 6)
+    }
+}
+
+/// Compact vertical variant of `ActivePlaySessionBar` for the iPad rail
+/// column. Sized to roughly match the rail width (~80pt) so the pill
+/// tucks under the rail without floating over page content. Layout is
+/// LIVE chip (red pulse + label) / game title / monospaced timer
+/// stacked vertically — the title is allowed up to two lines so longer
+/// game names stay readable. Tapping the pill mirrors the iPhone bar's
+/// behaviour: re-present `GameScheduleSheet` for the active game.
+private struct ActivePlaySessionRailPill: View {
+    let game: Game
+    let startedAt: Date
+    let onTap: () -> Void
+
+    private func elapsedText(_ now: Date) -> String {
+        let elapsed = max(0, Int(now.timeIntervalSince(startedAt)))
+        let h = elapsed / 3600
+        let m = (elapsed % 3600) / 60
+        let s = elapsed % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%02d:%02d", m, s)
+    }
+
+    var body: some View {
+        // Same TimelineView pattern as ActivePlaySessionBar for stable
+        // per-second redraw without the Timer.publish flap risk.
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Button(action: onTap) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 5) {
+                        ZStack {
+                            Circle().fill(Color.red.opacity(0.22)).frame(width: 14, height: 14)
+                            Circle().fill(Color.red).frame(width: 6, height: 6)
+                        }
+                        Text("LIVE")
+                            .font(.system(size: 9, weight: .heavy))
+                            .tracking(0.8)
+                            .foregroundStyle(Color.white.opacity(0.7))
+                    }
+                    Text(game.title)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(elapsedText(context.date))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 10)
+                .background(Color.black.opacity(0.92), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.18), radius: 10, x: 0, y: 4)
+            }
+            .buttonStyle(.plain)
+        }
+        // Match the rail's outer width (~80pt — `iPadSidebarRail` is the
+        // VStack of 68pt-wide buttons + 6pt horizontal padding) so the
+        // pill aligns visually as a continuation of the rail column.
+        .frame(width: 80)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Live session: \(game.title)")
+        .accessibilityAddTraits(.isButton)
     }
 }
 
