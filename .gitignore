@@ -34,3 +34,6 @@ BookadinkV2/Services/SupabaseConfig.swift
 supabase/.branches/
 supabase/.temp/
 .claude/worktrees/
+
+# Local UX audit artifacts (binary screenshots, not versioned)
+screenshot-audit/
