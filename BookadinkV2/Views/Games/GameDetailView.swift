@@ -448,6 +448,14 @@ struct GameDetailView: View {
                 .allowsHitTesting(false)
         )
         .animation(.easeInOut(duration: 0.32), value: showBookingSuccess)
+        // iPad: when presented as a `.sheet` from HomeView / NearbyGamesView /
+        // BookingsListView / NotificationsView, present at page size (iOS 18+)
+        // so the game card fills the iPad canvas — matches the page-sized
+        // OwnerEditGameSheet and lets the Phase B two-column iPad layout
+        // fire (form-sheet presentation reports compact hSizeClass and
+        // would otherwise force the iPhone single-column layout). iPhone is
+        // unaffected; `.page` is the default full sheet there.
+        .modifier(IPadPagePresentationSizing())
     }
 
     // MARK: - Hero Helpers
