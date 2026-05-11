@@ -453,7 +453,7 @@ final class SupabaseService: ClubDataProviding {
         let gameRows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key"),
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode"),
                 .init(name: "club_id", value: "eq.\(clubID.uuidString)"),
                 .init(name: "archived_at", value: "is.null"),  // exclude archived games
                 .init(name: "order", value: "date_time.asc")
@@ -493,7 +493,7 @@ final class SupabaseService: ClubDataProviding {
         let gameRows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select",       value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,latitude,longitude,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key"),
+                .init(name: "select",       value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,latitude,longitude,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode"),
                 .init(name: "date_time",    value: "gte.\(nowStr)"),
                 .init(name: "date_time",    value: "lte.\(windowEndStr)"),
                 .init(name: "archived_at",  value: "is.null"),
@@ -531,7 +531,7 @@ final class SupabaseService: ClubDataProviding {
         let gameRows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key"),
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode"),
                 .init(name: "recurrence_group_id", value: "eq.\(recurrenceGroupID.uuidString)"),
                 .init(name: "order", value: "date_time.asc")
             ],
@@ -549,7 +549,7 @@ final class SupabaseService: ClubDataProviding {
         let bookingRows: [BookingRow] = try await send(
             path: "bookings",
             queryItems: [
-                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at,games(id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key)"),
+                .init(name: "select", value: "id,game_id,user_id,status,waitlist_position,created_at,fee_paid,paid_at,stripe_payment_intent_id,payment_method,platform_fee_cents,club_payout_cents,credits_applied_cents,hold_expires_at,games(id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode)"),
                 .init(name: "user_id", value: "eq.\(userID.uuidString)"),
                 .init(name: "order", value: "created_at.desc")
             ],
@@ -1997,7 +1997,7 @@ final class SupabaseService: ClubDataProviding {
         let rows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,appearance_palette_key,appearance_pattern_key")
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode")
             ],
             method: "POST",
             body: try JSONEncoder().encode([payload]),
@@ -2055,7 +2055,7 @@ final class SupabaseService: ClubDataProviding {
             path: "games",
             queryItems: [
                 .init(name: "id", value: "eq.\(gameID.uuidString)"),
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,appearance_palette_key,appearance_pattern_key")
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode")
             ],
             method: "PATCH",
             body: try JSONEncoder().encode(payload),
@@ -2080,7 +2080,7 @@ final class SupabaseService: ClubDataProviding {
             path: "games",
             queryItems: [
                 .init(name: "id", value: "eq.\(gameID.uuidString)"),
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key")
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode")
             ],
             method: "DELETE",
             body: nil,
@@ -2103,7 +2103,7 @@ final class SupabaseService: ClubDataProviding {
             path: "games",
             queryItems: [
                 .init(name: "id", value: "eq.\(gameID.uuidString)"),
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key")
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode")
             ],
             method: "PATCH",
             body: payload,
@@ -3746,7 +3746,7 @@ final class SupabaseService: ClubDataProviding {
         let rows: [GameRow] = try await send(
             path: "games",
             queryItems: [
-                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key"),
+                .init(name: "select", value: "id,club_id,title,description,date_time,duration_minutes,skill_level,game_format,game_type,max_spots,court_count,fee_amount,fee_currency,is_free,venue_id,venue_name,location,status,notes,requires_dupr,recurrence_group_id,publish_at,appearance_palette_key,appearance_pattern_key,partnership_mode"),
                 .init(name: "id", value: "eq.\(gameID.uuidString.lowercased())"),
                 .init(name: "limit", value: "1")
             ],
@@ -5515,6 +5515,7 @@ private struct GameRow: Decodable {
     let publishAtRaw: String?
     let appearancePaletteKey: String?
     let appearancePatternKey: String?
+    let partnershipModeRaw: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -5543,6 +5544,7 @@ private struct GameRow: Decodable {
         case publishAtRaw = "publish_at"
         case appearancePaletteKey = "appearance_palette_key"
         case appearancePatternKey = "appearance_pattern_key"
+        case partnershipModeRaw = "partnership_mode"
     }
 
     func toGame(confirmedCount: Int?, waitlistCount: Int?) -> Game {
@@ -5574,7 +5576,8 @@ private struct GameRow: Decodable {
             waitlistCount: waitlistCount,
             publishAt: publishAtRaw.flatMap { SupabaseDateParser.parse($0) },
             appearancePaletteKey: appearancePaletteKey,
-            appearancePatternKey: appearancePatternKey
+            appearancePatternKey: appearancePatternKey,
+            partnershipMode: partnershipModeRaw ?? "solo"
         )
     }
 }

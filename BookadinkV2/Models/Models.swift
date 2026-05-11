@@ -833,6 +833,12 @@ struct Game: Identifiable, Hashable {
     /// `games.appearance_pattern_key`. The `court` pattern is intentionally
     /// excluded from selection and from automatic rotation.
     var appearancePatternKey: String? = nil
+    /// Registration style. Mirrors `games.partnership_mode`. Allowed wire
+    /// values: `"solo"` (default — current behaviour) and `"partnered"`
+    /// (Phase 1+: pair-based registration). Server is authoritative for
+    /// every booking decision — the value is display-only on the client
+    /// until partnered booking flows ship.
+    var partnershipMode: String = "solo"
 
     /// True when the game has a future publish date — it exists in the DB but is not yet visible to members.
     var isScheduled: Bool {
