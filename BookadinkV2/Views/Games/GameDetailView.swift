@@ -59,11 +59,23 @@ struct GameDetailView: View {
     /// triggered by tapping the VENUE info card.
     @State private var showOpenInMapsPrompt = false
 
+    /// Raw scroll offset captured from the underlying UIScrollView:
+    ///   + N → user scrolled up by N (content rising past the hero)
+    ///   − N → user pulled past rest by N (pull-to-refresh region)
+    ///     0 → at rest
+    /// Single source of truth — `pullDownAmount` and
+    /// `heroParallaxOffset` are pure functions of this. The reader
+    /// write is dispatched async to main so it cannot land during a
+    /// SwiftUI view update (KVO `.initial` can fire mid-render commit).
+    @State private var scrollOffset: CGFloat = 0
+
     /// Positive distance the user has pulled the ScrollView down past
     /// rest. Drives the fixed HeroSurface's height so the hero paint
     /// stretches with the pull instead of detaching from the top of
     /// the screen — matches the `ClubDetailView` morphing feel.
-    @State private var pullDownAmount: CGFloat = 0
+    private var pullDownAmount: CGFloat {
+        max(-scrollOffset, 0)
+    }
 
     /// Vertical offset applied to the fixed HeroSurface as the user
     /// scrolls upward (content rising). Without this, the painted hero
@@ -76,7 +88,10 @@ struct GameDetailView: View {
     /// masks the hero behind it; GameDetailView's content is a
     /// transparent VStack of individual cards, so any partially-visible
     /// hero would bleed through the gaps. 1:1 keeps the seam clean.)
-    @State private var heroParallaxOffset: CGFloat = 0
+    private var heroParallaxOffset: CGFloat {
+        let upward = max(scrollOffset, 0)
+        return -min(upward, Self.heroHeight)
+    }
 
     /// Baseline hero height. The fixed background is at least this
     /// tall, plus `pullDownAmount` while the user is pulling down.
@@ -1191,13 +1206,28 @@ struct GameDetailView: View {
     }
 
     /// Live scroll-offset probe that drives `pullDownAmount` and
-    /// `heroParallaxOffset`. Extracted so iPhone and iPad layers share
-    /// the same parallax / pull-to-refresh feel without duplication.
+    /// `heroParallaxOffset` via the shared `scrollOffset` @State.
+    /// Extracted so iPhone and iPad layers share the same parallax /
+    /// pull-to-refresh feel without duplication.
+    ///
+    /// The KVO observation inside `ScrollOffsetReader` can fire
+    /// synchronously during the UIView's `didMoveToSuperview` /
+    /// `didMoveToWindow` callbacks (notably with `options: .initial`),
+    /// which happen during SwiftUI's render commit. Writing @State
+    /// synchronously here would land mid-render and produce
+    /// "Modifying state during view update" warnings. Dispatching
+    /// async to main pushes the write past the current render pass;
+    /// subsequent scroll-driven firings are already off the render
+    /// pass so the dispatch is a one-tick no-op for the common case.
+    /// The equality guard prevents redundant publishes when the KVO
+    /// observer reports the same value.
     private var scrollOffsetProbe: some View {
         ScrollOffsetReader { offset in
-            pullDownAmount = max(-offset, 0)
-            let upward = max(offset, 0)
-            heroParallaxOffset = -min(upward, Self.heroHeight)
+            DispatchQueue.main.async {
+                if scrollOffset != offset {
+                    scrollOffset = offset
+                }
+            }
         }
         .frame(height: 0)
     }
