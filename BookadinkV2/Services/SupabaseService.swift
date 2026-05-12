@@ -83,6 +83,12 @@ protocol ClubDataProviding {
     /// via get_club_role_change_summary. Caller must be owner or admin.
     func fetchClubRoleChangeSummary(clubID: UUID, days: Int) async throws -> [ClubRoleChangeSummary]
     func adminUpdateMemberDUPR(memberUserID: UUID, rating: Double) async throws
+    /// Server-authoritative DUPR rating history for a single user. RLS allows
+    /// self-reads and club-owner/admin reads for approved members; any other
+    /// caller receives an empty array.
+    /// Results are ordered by `recorded_at` ascending so the chart can render
+    /// directly without re-sorting.
+    func fetchDUPRHistory(userID: UUID, limit: Int) async throws -> [DUPREntry]
     func createClub(createdBy: UUID, draft: ClubOwnerEditDraft) async throws -> Club
     func createGame(for clubID: UUID, createdBy: UUID, draft: ClubOwnerGameDraft, recurrenceGroupID: UUID?) async throws -> Game
     func updateGame(gameID: UUID, draft: ClubOwnerGameDraft) async throws -> Game
@@ -165,9 +171,20 @@ protocol ClubDataProviding {
     func fetchGame(gameID: UUID) async throws -> Game?
     func fetchGameClubID(gameID: UUID) async throws -> UUID?
     func updateProfilePushToken(userID: UUID, pushToken: String?) async throws
+    /// Sign-out push token cleanup. Takes the JWT explicitly so it survives
+    /// the synchronous AppState.signOut() clearing authAccessToken before the
+    /// Task body runs. DELETEs the matching push_tokens row (multi-device
+    /// source of truth) and NULLs profiles.push_token only when it equals
+    /// the supplied token. No-ops cleanly when token is nil.
+    func clearPushTokenForSignOut(userID: UUID, currentToken: String?, authBearerToken: String) async throws
     func upsertProfile(_ profile: UserProfile) async throws -> UserProfile
     func patchProfile(_ profile: UserProfile) async throws -> UserProfile
     func updatePassword(_ newPassword: String) async throws
+    /// Pushes display-name fields into Supabase Auth `user.user_metadata` so the
+    /// Dashboard "Display name" column reflects the user. Mirrors `updatePassword`
+    /// (PUT /auth/v1/user) but uses `{"data": {...}}` instead of `{"password": ...}`.
+    /// `profiles` remains the app source of truth — this is best-effort sync.
+    func updateAuthUserMetadata(fullName: String, firstName: String?, lastName: String?) async throws
 
     /// Fetches all active, upcoming games within a bounded time window across all clubs.
     /// Used to power the "Games Near You" home section and nearby games discovery screen.
@@ -2064,6 +2081,51 @@ final class SupabaseService: ClubDataProviding {
         )
     }
 
+    func fetchDUPRHistory(userID: UUID, limit: Int) async throws -> [DUPREntry] {
+        guard SupabaseConfig.isConfigured else { return [] }
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        struct Row: Decodable {
+            let id: UUID
+            let rating: Double
+            let recordedAtRaw: String?
+            let source: String?
+            let updatedByName: String?
+            enum CodingKeys: String, CodingKey {
+                case id
+                case rating
+                case recordedAtRaw  = "recorded_at"
+                case source
+                case updatedByName  = "updated_by_name"
+            }
+        }
+
+        let rows: [Row] = try await send(
+            path: "dupr_rating_history",
+            queryItems: [
+                .init(name: "select", value: "id,rating,recorded_at,source,updated_by_name"),
+                .init(name: "user_id", value: "eq.\(userID.uuidString.lowercased())"),
+                .init(name: "order", value: "recorded_at.asc"),
+                .init(name: "limit", value: String(limit))
+            ],
+            method: "GET",
+            body: nil,
+            authBearerToken: authToken
+        )
+
+        return rows.compactMap { row in
+            guard let recordedAt = row.recordedAtRaw.flatMap(SupabaseDateParser.parse) else { return nil }
+            return DUPREntry(
+                id: row.id,
+                rating: row.rating,
+                recordedAt: recordedAt,
+                context: row.source
+            )
+        }
+    }
+
     func createClub(createdBy: UUID, draft: ClubOwnerEditDraft) async throws -> Club {
         guard SupabaseConfig.isConfigured else { throw SupabaseServiceError.missingConfiguration }
         guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
@@ -2188,7 +2250,8 @@ final class SupabaseService: ClubDataProviding {
             recurrenceGroupID: recurrenceGroupID,
             publishAt: draft.publishAt.map { SupabaseDateWriter.string(from: $0) },
             appearancePaletteKey: draft.appearancePaletteKey,
-            appearancePatternKey: draft.appearancePatternKey
+            appearancePatternKey: draft.appearancePatternKey,
+            partnershipMode: draft.partnershipMode
         )
 
         let rows: [GameRow] = try await send(
@@ -2245,7 +2308,8 @@ final class SupabaseService: ClubDataProviding {
             longitude: draft.venueLongitude,
             publishAt: draft.publishAt.map { SupabaseDateWriter.string(from: $0) },
             appearancePaletteKey: draft.appearancePaletteKey,
-            appearancePatternKey: draft.appearancePatternKey
+            appearancePatternKey: draft.appearancePatternKey,
+            partnershipMode: draft.partnershipMode
         )
 
         let rows: [GameRow] = try await send(
@@ -3003,6 +3067,36 @@ final class SupabaseService: ClubDataProviding {
         }
     }
 
+    func updateAuthUserMetadata(fullName: String, firstName: String?, lastName: String?) async throws {
+        guard let authToken = resolvedAccessToken(), !authToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+        guard let baseURL = URL(string: SupabaseConfig.urlString) else {
+            throw SupabaseServiceError.invalidURL
+        }
+        let url = baseURL.appendingPathComponent("auth").appendingPathComponent("v1").appendingPathComponent("user")
+
+        // GoTrue dashboard reads "Display name" from `user_metadata.full_name` first,
+        // falling back to `user_metadata.name`. Setting both plus first/last keeps the
+        // metadata useful for any other consumer (analytics, third-party integrations).
+        var data: [String: String] = ["full_name": fullName, "name": fullName]
+        if let firstName, !firstName.isEmpty { data["first_name"] = firstName }
+        if let lastName, !lastName.isEmpty { data["last_name"] = lastName }
+
+        let body = try JSONSerialization.data(withJSONObject: ["data": data])
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.httpBody = body
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(SupabaseConfig.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (responseData, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let msg = String(data: responseData, encoding: .utf8) ?? "Unknown error"
+            throw SupabaseServiceError.httpStatus((response as? HTTPURLResponse)?.statusCode ?? 0, msg)
+        }
+    }
+
     private static let isoDateFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withFullDate]
@@ -3091,6 +3185,87 @@ final class SupabaseService: ClubDataProviding {
             // still runs.
             print("[push] profiles.push_token patch FAIL user=\(userID.uuidString) token=\(summary) error=\(error)")
             throw error
+        }
+    }
+
+    /// Sign-out push token cleanup. Authoritatively removes this device's
+    /// APNs token from both `push_tokens` (multi-device source of truth) and
+    /// `profiles.push_token` (legacy single column) for the signing-out user.
+    ///
+    /// The auth bearer is passed explicitly because `AppState.signOut()`
+    /// clears the in-memory access token synchronously moments after spawning
+    /// the cleanup Task — `resolvedAccessToken()` would race and the request
+    /// would degrade to the anon key, which RLS rejects. Capturing the JWT
+    /// up-front avoids that.
+    ///
+    /// Both writes are scoped by the supplied token: the `push_tokens` DELETE
+    /// filters on `token=eq.{token}` so a stale row owned by a different user
+    /// on this device is left for that user's own sign-out to clean up
+    /// (server-side `ON CONFLICT (token) DO UPDATE` already rebinds on
+    /// re-register), and the `profiles.push_token` NULL only fires when the
+    /// column currently equals the supplied token, preserving a still-valid
+    /// legacy value from another device.
+    func clearPushTokenForSignOut(userID: UUID, currentToken: String?, authBearerToken: String) async throws {
+        guard !authBearerToken.isEmpty else {
+            throw SupabaseServiceError.authenticationRequired
+        }
+
+        let summary: String = {
+            guard let t = currentToken, !t.isEmpty else { return "<nil>" }
+            if t.count <= 8 { return "\(t.prefix(4))…\(t.suffix(2))" }
+            return "\(t.prefix(6))…\(t.suffix(4))"
+        }()
+
+        // 1. DELETE the push_tokens row for (user_id, token). RLS policy
+        //    "Users can delete own push tokens" requires `auth.uid() = user_id`,
+        //    which is satisfied by the supplied JWT.
+        if let token = currentToken, !token.isEmpty {
+            do {
+                try await sendVoid(
+                    path: "push_tokens",
+                    queryItems: [
+                        .init(name: "user_id", value: "eq.\(userID.uuidString.lowercased())"),
+                        .init(name: "token", value: "eq.\(token)")
+                    ],
+                    method: "DELETE",
+                    body: nil,
+                    authBearerToken: authBearerToken,
+                    extraHeaders: ["Prefer": "return=minimal"]
+                )
+                print("[push] signOut push_tokens delete ok user=\(userID.uuidString) token=\(summary)")
+            } catch {
+                // Non-fatal: log and continue to the legacy column. A failed
+                // DELETE here just leaves a stale row that the next user's
+                // register_push_token will rebind via ON CONFLICT.
+                print("[push] signOut push_tokens delete FAIL user=\(userID.uuidString) token=\(summary) error=\(error)")
+            }
+        }
+
+        // 2. NULL profiles.push_token ONLY when it equals the supplied token.
+        //    The `push_token=eq.{token}` filter prevents clobbering a token
+        //    written by a still-active device for the same account.
+        if let token = currentToken, !token.isEmpty {
+            let payload: [String: Any] = ["push_token": NSNull()]
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            do {
+                try await sendVoid(
+                    path: "profiles",
+                    queryItems: [
+                        .init(name: "id", value: "eq.\(userID.uuidString.lowercased())"),
+                        .init(name: "push_token", value: "eq.\(token)")
+                    ],
+                    method: "PATCH",
+                    body: body,
+                    authBearerToken: authBearerToken,
+                    extraHeaders: [
+                        "Prefer": "return=minimal",
+                        "Content-Type": "application/json"
+                    ]
+                )
+                print("[push] signOut profiles.push_token null ok user=\(userID.uuidString) token=\(summary)")
+            } catch {
+                print("[push] signOut profiles.push_token null FAIL user=\(userID.uuidString) token=\(summary) error=\(error)")
+            }
         }
     }
 
@@ -5851,6 +6026,7 @@ private struct GameInsertRow: Encodable {
     let publishAt: String?
     let appearancePaletteKey: String?
     let appearancePatternKey: String?
+    let partnershipMode: String
     let status: String = "upcoming"
 
     enum CodingKeys: String, CodingKey {
@@ -5878,6 +6054,7 @@ private struct GameInsertRow: Encodable {
         case publishAt = "publish_at"
         case appearancePaletteKey = "appearance_palette_key"
         case appearancePatternKey = "appearance_pattern_key"
+        case partnershipMode = "partnership_mode"
         case status
     }
 }
@@ -5908,6 +6085,10 @@ private struct GameOwnerUpdateRow: Encodable {
     let publishAt: String?
     let appearancePaletteKey: String?
     let appearancePatternKey: String?
+    /// When non-nil, `partnership_mode` is included in the PATCH. Pass `nil`
+    /// to omit the field (preserves the DB value — used when bookings exist
+    /// and the form locked the toggle).
+    let partnershipMode: String?
 
     enum CodingKeys: String, CodingKey {
         case title
@@ -5931,6 +6112,7 @@ private struct GameOwnerUpdateRow: Encodable {
         case publishAt = "publish_at"
         case appearancePaletteKey = "appearance_palette_key"
         case appearancePatternKey = "appearance_pattern_key"
+        case partnershipMode = "partnership_mode"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -5955,6 +6137,9 @@ private struct GameOwnerUpdateRow: Encodable {
         try c.encode(publishAt,      forKey: .publishAt)
         try c.encode(appearancePaletteKey, forKey: .appearancePaletteKey)
         try c.encode(appearancePatternKey, forKey: .appearancePatternKey)
+        if let partnershipMode {
+            try c.encode(partnershipMode, forKey: .partnershipMode)
+        }
         if updateCoordinates {
             try c.encode(latitude,   forKey: .latitude)
             try c.encode(longitude,  forKey: .longitude)

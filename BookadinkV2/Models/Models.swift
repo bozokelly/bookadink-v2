@@ -1433,6 +1433,10 @@ struct ClubOwnerGameDraft {
     /// Pinned `HeroPattern` rawValue. `nil` ⇒ automatic. Mirrors
     /// `Game.appearancePatternKey`; persisted on save.
     var appearancePatternKey: String? = nil
+    /// Registration style. Mirrors `games.partnership_mode`. Allowed wire
+    /// values: `"solo"` (default) and `"partnered"`. Editable only before
+    /// any bookings exist for the game.
+    var partnershipMode: String = "solo"
 
     /// True when a venue is selected from saved venues or a custom name has been entered.
     var hasVenue: Bool {
@@ -1484,6 +1488,7 @@ struct ClubOwnerGameDraft {
         skillLevelRaw = game.skillLevel
         gameTypeRaw = game.gameType
         gameFormatRaw = game.gameFormat
+        partnershipMode = game.partnershipMode
         repeatWeekly = false
         repeatCount = 1
     }

@@ -188,6 +188,29 @@ private func pricingFooterText(isFree: Bool, feeText: String) -> String {
     return "Pay on arrival — players book without paying online; the club collects payment at the venue."
 }
 
+/// Footer for the Registration Style section. Shared by Create and Edit sheets.
+/// - When `lockReason` is non-nil, shows that text (used by Edit once bookings exist).
+/// - Otherwise, shows the partnered explainer when partnered is selected.
+/// - Adds an inline odd-capacity warning when partnered + odd max spots.
+@ViewBuilder
+private func registrationStyleFooter(mode: String, maxSpots: Int, lockReason: String?) -> some View {
+    let isPartnered = mode == "partnered"
+    let showOddWarning = isPartnered && (maxSpots % 2 != 0)
+    VStack(alignment: .leading, spacing: 4) {
+        if let lockReason {
+            Text(lockReason).foregroundStyle(.secondary)
+        } else if isPartnered {
+            Text("Partnered games keep selected partners together during play generation.")
+                .foregroundStyle(.secondary)
+        }
+        if showOddWarning {
+            Text("Odd player counts may leave one team without a partner.")
+                .foregroundStyle(Brand.spicyOrange)
+        }
+    }
+    .font(.caption)
+}
+
 struct OwnerCreateGameSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -346,6 +369,22 @@ struct OwnerCreateGameSheet: View {
                         }
                     }
                     Toggle("Requires DUPR", isOn: $draft.requiresDUPR)
+                }
+
+                Section {
+                    Picker("Registration Style", selection: $draft.partnershipMode) {
+                        Text("Solo").tag("solo")
+                        Text("Partnered").tag("partnered")
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Registration Style")
+                } footer: {
+                    registrationStyleFooter(
+                        mode: draft.partnershipMode,
+                        maxSpots: draft.maxSpots,
+                        lockReason: nil
+                    )
                 }
 
                 Section("Schedule") {
@@ -566,6 +605,16 @@ struct OwnerEditGameSheet: View {
         FeatureGateService.canUseDelayedPublishing(appState.entitlementsByClubID[club.id])
     }
 
+    /// True when the game has at least one booking (confirmed or waitlisted),
+    /// which locks the Registration Style picker. Counts come from the cached
+    /// `Game` row; conservative — if either count is nil we treat as no bookings.
+    private var hasExistingBookings: Bool {
+        let liveGame = appState.gamesByClubID[club.id]?.first(where: { $0.id == game.id }) ?? game
+        let confirmed = liveGame.confirmedCount ?? 0
+        let waitlisted = liveGame.waitlistCount ?? 0
+        return (confirmed + waitlisted) > 0
+    }
+
     private let gameTypeOptions: [(value: String, label: String)] = [
         ("doubles", "Doubles"),
         ("singles", "Singles")
@@ -648,6 +697,25 @@ struct OwnerEditGameSheet: View {
                         }
                     }
                     Toggle("Requires DUPR", isOn: $draft.requiresDUPR)
+                }
+
+                Section {
+                    Picker("Registration Style", selection: $draft.partnershipMode) {
+                        Text("Solo").tag("solo")
+                        Text("Partnered").tag("partnered")
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(hasExistingBookings)
+                } header: {
+                    Text("Registration Style")
+                } footer: {
+                    registrationStyleFooter(
+                        mode: draft.partnershipMode,
+                        maxSpots: draft.maxSpots,
+                        lockReason: hasExistingBookings
+                            ? "Registration style can’t be changed after players have booked."
+                            : nil
+                    )
                 }
 
                 Section {
