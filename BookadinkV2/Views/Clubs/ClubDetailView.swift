@@ -111,19 +111,35 @@ struct ClubDetailView: View {
     @State private var now = Date()
     private let minuteTick = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
+    /// Raw scroll offset captured from the underlying UIScrollView:
+    ///   + N → user scrolled up by N (collapse / parallax region)
+    ///   − N → user pulled past rest by N (pull-to-refresh region)
+    ///     0 → at rest
+    /// Single source of truth — all derived values below
+    /// (`collapseProgress`, `heroParallaxOffset`, `pullDownAmount`)
+    /// are pure functions of this. The reader writes are dispatched
+    /// async to main so the assignment cannot land during a SwiftUI
+    /// view update (KVO `.initial` can fire mid-render commit).
+    @State private var scrollOffset: CGFloat = 0
+
     /// Normalised hero collapse progress driven by scroll offset.
-    /// 0 = fully expanded, 1 = fully collapsed. Single source of truth —
-    /// every animation curve below is derived from this value via
-    /// `interp(_:start:end:)`. No threshold booleans, no separate
-    /// expanded/collapsed state.
-    @State private var collapseProgress: CGFloat = 0
+    /// 0 = fully expanded, 1 = fully collapsed. Every animation curve
+    /// below is derived from this value via `interp(_:start:end:)`. No
+    /// threshold booleans, no separate expanded/collapsed state.
+    private var collapseProgress: CGFloat {
+        let upward = max(scrollOffset, 0)
+        return min(upward / Self.collapseDistance, 1)
+    }
 
     /// Vertical offset applied to `fixedHeroBackground` for parallax.
-    /// Updated in lockstep with `collapseProgress` from the same scroll
+    /// Locked in lockstep with `collapseProgress` from the same scroll
     /// reading, so the hero drifts upward at ~30% of scroll speed (capped
     /// at `heroHeight`) — feels attached to the page, never pinned to
     /// the screen, never bouncy on pull-to-refresh (clamps to 0).
-    @State private var heroParallaxOffset: CGFloat = 0
+    private var heroParallaxOffset: CGFloat {
+        let upward = max(scrollOffset, 0)
+        return -min(upward, Self.heroHeight) * 0.30
+    }
 
     /// Positive distance the user has pulled the ScrollView down past
     /// its rest position (pull-to-refresh region). Drives two coordinated
@@ -134,7 +150,9 @@ struct ClubDetailView: View {
     ///   • `fixedHeroBackground` stretches downward by the matching 20%
     ///     so the hero ↔ sheet seam stays continuous (no appBackground
     ///     gap opens between the hero bottom and the sheet top).
-    @State private var pullDownAmount: CGFloat = 0
+    private var pullDownAmount: CGFloat {
+        max(-scrollOffset, 0)
+    }
 
     /// Transient acknowledgement shown briefly after a pull-to-refresh
     /// completes. Drives the "Games up-to-date" pill in the upcoming
@@ -274,10 +292,24 @@ struct ClubDetailView: View {
                 //   + N → user scrolled up by N (collapse / parallax)
                 //   − N → user pulled past rest by N (pull-to-refresh)
                 //     0 → at rest
-                let upward = max(offset, 0)
-                collapseProgress = min(upward / Self.collapseDistance, 1)
-                heroParallaxOffset = -min(upward, Self.heroHeight) * 0.30
-                pullDownAmount = max(-offset, 0)
+                //
+                // The KVO observation inside `ScrollOffsetReader` can fire
+                // synchronously during the UIView's `didMoveToSuperview` /
+                // `didMoveToWindow` callbacks (notably with `options: .initial`),
+                // which happen during SwiftUI's render commit. Writing
+                // @State synchronously here would land mid-render and
+                // produce "Modifying state during view update" warnings.
+                // Dispatching async to main pushes the write past the
+                // current render pass; subsequent scroll-driven firings are
+                // already off the render pass so the dispatch is a one-tick
+                // no-op for the common case. The equality guard prevents
+                // redundant publishes when the KVO observer reports the
+                // same value (e.g. settling at rest).
+                DispatchQueue.main.async {
+                    if scrollOffset != offset {
+                        scrollOffset = offset
+                    }
+                }
             }
             .frame(height: 0)
 
